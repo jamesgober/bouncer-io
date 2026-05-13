@@ -1,0 +1,47 @@
+[package]
+name = "bouncer-io"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+readme = "README.md"
+license = "Apache-2.0"
+
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+description = "Network access gate for Rust. Rate limiting, throttling, suspicious-activity detection, and active connection termination in one IO filter. Token bucket / leaky bucket / sliding window limiters, per-key / per-IP / global, with a hook to forcibly cut connections of misbehaving peers already past the gate."
+
+keywords = [
+    "ratelimit",
+    "throttle",
+    "gate",
+    "firewall",
+    "io"
+]
+
+categories = [
+    "network-programming",
+    "authentication",
+    "asynchronous"
+]
+
+documentation = "https://docs.rs/bouncer-io"
+repository    = "https://github.com/jamesgober/bouncer-io"
+homepage      = "https://github.com/jamesgober/bouncer-io"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+
+[dev-dependencies]
+
+[features]
+default = ["std"]
+std = []
+
+[profile.release]
+opt-level = 3
+lto = "thin"
