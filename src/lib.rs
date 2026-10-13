@@ -1,16 +1,29 @@
-//! Network access gate for Rust. Rate limiting, throttling, suspicious-activity detection, and active connection termination in one IO filter. Token bucket / leaky bucket / sliding window limiters, per-key / per-IP / global, with a hook to forcibly cut connections of misbehaving peers already past the gate.
+//! # bouncer_io
 //!
-//! # Status
+//! Connection gate for Rust services: admission by address, prefix, fingerprint, session, and account; in-flight revocation through cheap checkpoints; wipe, replace, and eject of revoked requests; ban memory with prefix escalation. Protocol-free.
 //!
-//! This crate is in early scaffolding. The public API is not yet
-//! defined. See [the repository](https://github.com/jamesgober/bouncer-io)
-//! and `.dev/ROADMAP.md` for the milestone plan.
+//! ## Status
+//!
+//! Scaffold. The design is written down in `dev/PLAN.md` and the milestone
+//! schedule in `dev/ROADMAP.md` (both in the
+//! [repository](https://github.com/jamesgober/bouncer-io)); the public API
+//! begins with `0.2.0`.
 
 #![doc(html_root_url = "https://docs.rs/bouncer-io")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 /// Crate version string, populated by Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod tests {
+    use super::VERSION;
+
+    #[test]
+    fn version_matches_manifest() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+        assert_eq!(VERSION.split('.').count(), 3, "expected MAJOR.MINOR.PATCH");
+    }
+}
