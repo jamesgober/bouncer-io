@@ -22,6 +22,8 @@ The plan, and the move to the portfolio template. No functional code yet.
   ecosystem, open decisions, and the decision log.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md`.
 - `deny.toml`, `.gitattributes`, `LICENSE-MIT`, `docs/release/v0.1.0.md`.
+- Session revocations from gate-net, and tombstone, decoy, and binding
+  signals as strikes (`dev/PLAN.md` section 4).
 
 ### Changed
 

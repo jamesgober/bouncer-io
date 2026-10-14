@@ -90,6 +90,8 @@ Every connection and every request carries a ticket. It is created at accept and
 
 A revocation can target any of these keys. Revoking a session or an account reaches every in-flight request that carries it, on every connection.
 
+**Sessions** (designed in `gate-net/dev/SESSIONS.md`): gate-net tells bouncer about logouts, revocations, password resets, and account suspensions; bouncer revokes the session and account keys, so requests already in flight are stopped at their next checkpoint. Reuse of a revoked (tombstoned) token, use of a decoy session token, and binding mismatches arrive as strikes; a decoy token is definitive.
+
 ---
 
 ## 5. The door: admission
