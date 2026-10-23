@@ -105,3 +105,18 @@ jobs:
         run: cargo fuzz run --target x86_64-unknown-linux-gnu directive_sequence -- -max_total_time=60
         env:
           RUSTFLAGS: ""
+      - name: Run snapshot_decode for 60 seconds
+        working-directory: fuzz
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu snapshot_decode -- -max_total_time=60
+        env:
+          RUSTFLAGS: ""
+      - name: Run journal_replay for 60 seconds
+        working-directory: fuzz
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu journal_replay -- -max_total_time=60
+        env:
+          RUSTFLAGS: ""
+      - name: Run delta_decode for 60 seconds
+        working-directory: fuzz
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu delta_decode -- -max_total_time=60
+        env:
+          RUSTFLAGS: ""

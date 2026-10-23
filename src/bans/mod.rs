@@ -1049,6 +1049,14 @@ impl BanMemory {
             Placement::Dynamic(tkey) => match self.table.remove(&mut writer.table, &tkey) {
                 Some(_) => {
                     self.count(writer, &tkey, false);
+                    if let Some(child) = view::cidr_of(&tkey) {
+                        let parent = Tracker::parent_of(&self.escalation, &child, |l| {
+                            self.is_auto(child.family(), l)
+                        });
+                        if let Some(parent) = parent {
+                            writer.tracker.forget(&parent, &child);
+                        }
+                    }
                     1
                 }
                 None => 0,

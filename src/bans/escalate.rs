@@ -232,6 +232,17 @@ impl Tracker {
         None
     }
 
+    /// Forgets a lifted child: a ban that was lifted does not count toward
+    /// its parent's escalation.
+    pub(crate) fn forget(&mut self, parent: &Cidr, child: &Cidr) {
+        if let Some(children) = self.parents.get_mut(parent) {
+            children.retain(|(c, _)| c != child);
+            if children.is_empty() {
+                self.parents.remove(parent);
+            }
+        }
+    }
+
     /// Puts a parent's children back (its escalation was refused), keeping at
     /// most the quota, newest first.
     pub(crate) fn restore(

@@ -28,3 +28,24 @@ path = "fuzz_targets/directive_sequence.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "snapshot_decode"
+path = "fuzz_targets/snapshot_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_replay"
+path = "fuzz_targets/journal_replay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "delta_decode"
+path = "fuzz_targets/delta_decode.rs"
+test = false
+doc = false
+bench = false

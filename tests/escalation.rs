@@ -343,3 +343,17 @@ fn test_datagram_bans_and_budgets() {
         DatagramVerdict::Accept
     );
 }
+
+#[test]
+fn test_lifted_children_do_not_count_toward_escalation() {
+    let b = Bouncer::new();
+    for i in 1..=20u8 {
+        let addr = IpAddr::from([198, 51, 100, i]);
+        b.ban(local(addr)).unwrap();
+        b.lift(addr).unwrap();
+    }
+    assert!(
+        b.door(ip("198.51.100.200")).is_ok(),
+        "never more than one banned at a time"
+    );
+}
