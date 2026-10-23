@@ -4,7 +4,7 @@
 >
 > **Read order:** [`../REPS.md`](../REPS.md) &rarr; [`DIRECTIVES.md`](./DIRECTIVES.md) &rarr; **this file** &rarr; [`ROADMAP.md`](./ROADMAP.md) &rarr; [`../docs/API.md`](../docs/API.md).
 >
-> **Status:** `0.2.0` design lock. Rewritten on 2026-10-22 from the crate's full specification; where the 2026-10-13 plan differed, the specification won and the change is in the decision log (D-009 onward).
+> **Status:** `0.3.0` core: keys, ban memory, the door, tickets, and the epoch are built. Design lock was `0.2.0`. Rewritten on 2026-10-22 from the crate's full specification; where the 2026-10-13 plan differed, the specification won and the change is in the decision log (D-009 onward).
 
 ---
 
@@ -325,13 +325,13 @@ Cell (two cache lines, 128 B, align 64)
 
 The exact layout is fixed by measurement at 0.3; the 128-byte budget is a requirement.
 
-The handle callers hold: `Ticket { shard: Arc<Shard>, index: u32, generation: u32, seen: u64, kind }`. A `Shard` holds `Arc<Shared>` (epoch, tables, configuration, sink, ejector), so there is no reference cycle and reference-count traffic is spread over shards (O-5).
+The handle callers hold: `Ticket { shard: Arc<Shard>, index: u32, generation: u32, seen: u64, kind }`. A `Shard` is a small handle holding the epoch and `Arc<Shared>`; `Shared` holds every cell, one free list per shard, the tables, and the configuration. There is no reference cycle, and reference-count traffic is spread over shards (O-5). All cells live in one array partitioned into shards by index range, so a request can take a cell from another shard when its connection's shard is full (D-039).
 
 - **Issue:** pop from the shard's free list, a Treiber stack whose head packs `index (32) | tag (32)`; the tag changes on every pop and push, so no ABA. Lock-free; loom L-2.
 - **Shard choice:** a thread-local hint (the worker index, or a hash of the thread id). Request tickets are issued from their connection's shard.
 - **Release:** `Drop` clears `LIVE`, advances the generation, clears `present`, returns budget slots, pushes the index. Dropping a connection ticket while its requests are live marks them `REVOKED` with reason `CONNECTION_CLOSED`. Release on any thread is allowed.
 - **Generation wrap:** a cell whose generation reaches `u32::MAX` is retired, never reused.
-- **Tags:** `TicketTag` packs shard, index, and generation into 64 bits (net-io's `GateTag`). `into_tag` marks the cell `DETACHED` and gives up the handle; `Bouncer::release(tag)` releases it. Stale tags fail closed.
+- **Tags:** `TicketTag` packs the cell index and the generation into 64 bits (net-io's `GateTag`). `into_tag` marks the cell `DETACHED` and gives up the handle; `Bouncer::release(tag)` releases it. Stale tags fail closed.
 - **Registry full:** `door` refuses with `RegistryFull`; `request` returns `Err(RegistryFull)`. Fail closed, sampled event.
 
 ### 7.5 Revocation: epoch, tables, ordering
@@ -428,9 +428,9 @@ pub fn door_at(&self, conn: ConnId, peer: IpAddr, provenance: Provenance, now: N
 | dynamic table | automatic and directive bans at the configured lengths, identity bans, compound fingerprint keys | often | one keyed-hash probe per length in use |
 | compiled set | administrator lists of any length, imported feeds, the allow list | rarely | one multibit-trie walk; rebuilt and swapped whole |
 
-**Dynamic table.** One open-addressing table per (family, length) sharing one entry arena; a 128-bit mask per family records which lengths hold entries, so a lookup probes only those (typically 2 for IPv4, 3 for IPv6). Keys up to /64 stored in 8 bytes. Versioned slots for lock-free reads; one writer lock per family. Expired entries read as absent. Probe length bounded at 32; exceeding it rebuilds with a fresh seed and an event (T-9).
+**Dynamic table (as built at 0.3, D-036).** One open-addressing table for every kind and length (the kind and length are part of the key); a mask per family records which lengths hold entries, so a lookup probes only those (typically 2 for IPv4, 3 for IPv6), and the probes for all lengths are prepared first so their cache misses overlap. Slots are grouped by eight with one tag word per group (a byte per slot: seven bits of the key's hash, empty, or deleted), probed with triangular steps over groups, at most 32 groups: a miss reads a few tag words from one contiguous array and touches no slot. Each 48-byte slot is a sequence lock, so readers never wait on the writer. Expired entries read as absent. When an insert finds no room within the bound, it fails as `BanTableFull`; rebuilding with a fresh seed moves to 0.6 with O-8 (D-038).
 
-**Compiled set.** A multibit trie with population-count bitmaps in the style of Poptrie (Asai and Ohara, SIGCOMM 2015), built off the hot path and published by swapping an `Arc` behind a version word, with per-shard reader caches.
+**Compiled set (as built at 0.3, D-037).** A multibit trie with a six-bit stride and population-count bitmaps in the style of Poptrie (Asai and Ohara, SIGCOMM 2015): each node has a child mask and a leaf mask, children and leaves stored contiguously, and each leaf slot holds a chain of every prefix ending there that covers the slot, longest first. IPv4 lookups visit at most 6 nodes and IPv6 at most 22, whatever the number of prefixes or lengths. Built off the hot path and published by swapping an `Arc` behind a version word, read through a per-thread cache, so readers take no lock in the steady state.
 
 | Approach | Lookup | Memory per prefix | Update | Fit |
 |---|---|---|---|---|
@@ -614,6 +614,22 @@ Sources: fail2ban `jail.conf`; nginx `ngx_http_limit_req_module` and `ngx_http_l
 | `revoke_storm` | checkpoints under 100,000 revocations/s | none exists |
 | `wipe_16k` | `Collected::wipe` | `zeroize` on a `Vec<u8>` |
 | `memory` | bytes per ban | nginx, HAProxy documented figures |
+
+### 11.1 Measured at 0.3 (first measurement)
+
+Host: AMD Ryzen 9 9950X3D (16 cores, 128 MiB L3), Windows 11, Rust stable, release profile (fat LTO). The machine was running other build jobs, so runs varied by up to half; `Instant` on Windows resolves to 100 ns, so per-call percentiles below that are not meaningful. Method: `examples/door_p99.rs` (fixture of 1,000,000 bans over /32, /24, /64, /56, /48 plus 10,000 administrator prefixes at other lengths; 1,000,000 distinct random peers; door samples include ticket issue and release) and a per-case breakdown run.
+
+| Path | Measured | Target |
+|---|---|---|
+| `checkpoint`, nothing revoked | 1.1 ns per call (mean of batches of 1,000) | 2 ns median |
+| door, no bans (ticket issue and release only) | 66-120 ns per call | part of 100 ns |
+| door, 500 bans (cache resident), IPv4 | 117-197 ns per call | |
+| door, 1,000,000 bans, IPv4, random peers | 231-347 ns per call | 100 ns p99 |
+| door, 1,000,000 bans, IPv6, random peers | 312-358 ns per call | 100 ns p99 |
+| door, full fixture, p50 / p99 (100 ns timer) | 300 / 1,000 ns admitted; 400 / 900 ns banned | 100 ns p99 |
+| memory, full fixture | 63 MiB for every table | 45-48 B per ban |
+
+The door target is not met at 0.3. Where the time goes: about 70 ns of ticket issue and release (four atomic read-modify-writes and the reference count), about 30 ns per probe of hashing, and the misses of random access into a 60 MiB table (mostly TLB misses with 4 KiB pages). The plan for 0.6, recorded in ROADMAP: 8-byte keys and 32-byte slots (the table halves), the keyed-hash decision O-8, fewer atomic operations per ticket (O-5 measured), and measurement on a quiet reference machine with percentiles from a nanosecond timer. With realistic traffic the probed tag words of recurring clients stay in cache, which the cache-resident row shows.
 
 NFR-10 is judged on `door_1m` and `budget_check`. Numbers are published in `docs/PERFORMANCE.md` with host, OS, CPU, Rust version, and profile; p99 and p99.9 from a harness over 10^7 operations; baselines committed; a regression over 5% blocks the change.
 
@@ -852,4 +868,13 @@ Every decision from the specification is answered below (and logged in section 1
 | D-032 | 2026-10-22 | `Collected` keeps the spec's shape and adds `Default`; `Ejected` reports `wiped` as well | the caller can assert each step |
 | D-033 | 2026-10-22 | A forwarded-header client is bound per request ticket; a PROXY-protocol client on the connection ticket. Requests under a trusted proxy hop with no client bound deny every checkpoint | a proxy can pool many clients over one connection; fail closed until the real client is known |
 | D-034 | 2026-10-22 | `Verdict::Challenge` and `Action::Challenge` are left out until after 1.0 instead of being cfg-gated variants | the enums are non-exhaustive, so adding them later is not breaking; feature-gated variants break under feature unification |
+| D-036 | 2026-10-23 | The dynamic ban table groups slots by eight with one tag word per group and probes groups with triangular steps (the SwissTable layout), instead of plain linear probing | at 7/8 load, linear probing averages about 32 probes on a miss and its tail runs to hundreds of slots, which broke the 32-probe bound in the first fill test; with tags a miss reads only tag words (1 byte per slot, contiguous) and the bound holds |
+| D-037 | 2026-10-23 | The compiled set is a six-bit-stride multibit trie with popcount masks and per-slot chains (Poptrie style), built at 0.3 instead of a per-length sorted array | the per-length layout cost one probe per distinct length, about 100 for a realistic IPv6 administrator list, and measured several times the door budget; the trie's cost does not depend on the number of lengths |
+| D-038 | 2026-10-23 | Tables hash with SipHash-1-3 under a per-bouncer random key until O-8 is decided at 0.6; rebuilding a table with a fresh seed when the probe bound is reached moves to 0.6 | a keyed PRF means colliding keys can only be chosen by someone who knows the key (the T-9 test floods a known-key table and shows the same keys fit under a random key); a rebuild needs a lock-free whole-table swap, which belongs with the hash decision; until then an insert past the bound fails cleanly as `BanTableFull` |
+| D-039 | 2026-10-23 | All ticket cells live in one array in the shared state, partitioned into shards by index range with one free list each; tickets hold a small per-shard handle; `TicketId` and `TicketTag` are `index (32) | generation (32)` | requests could otherwise be refused while other shards had room (found by the proxy test with many shards); the per-shard handle keeps reference-count traffic spread out |
+| D-040 | 2026-10-23 | The loom models build under `--cfg bouncer_loom`, not `--cfg loom` | a global `--cfg loom` also reaches dependencies, and the published clock-lib 1.1.0 then fails to build |
+| D-041 | 2026-10-23 | Administrator prefixes at non-automatic lengths are kept in a list and the compiled set is rebuilt on every change (about a millisecond with 10,000 prefixes); bulk loading arrives with persistence and import at 0.5 | administrator changes are rare and cold; the readers never wait |
+| D-042 | 2026-10-23 | If a ban slot on the probe path is being rewritten for longer than the spin bound, the door refuses with `Refusal::Banned` and a reference of zero | fail closed; a writer holds a slot for a handful of stores, so this happens only if the writer thread is descheduled mid-write |
+| D-043 | 2026-10-23 | `BanRecord.actor` is an `ActorKind`; the full `Actor` (with its id) goes to events | compact records: the ban entry keeps four bits for the actor |
+| D-044 | 2026-10-23 | A ticket that revokes itself (its own failed `bind_client`, or finding its connection gone) forces its own slow path from then on | such a revocation does not move the epoch, so the fast path alone would have passed it |
 | D-035 | 2026-10-22 | Posture: `strict_budget_divisor` (default 2) and `strict_revokes_unauthenticated` replace the spec's "refuses guests on admin listeners" | listeners are the transport's concept; net-io already refuses listeners not marked for lockdown |

@@ -8,7 +8,7 @@
 ## v0.1.0 - Scaffold (DONE, 2026-10-13)
 - [x] Manifest, README, CHANGELOG, REPS, dual license, CI, deny, clippy, rustfmt, DIRECTIVES, ROADMAP, PLAN.
 
-## v0.2.0 - Design lock
+## v0.2.0 - Design lock (DONE, 2026-10-22)
 Exit: James approves `docs/API.md`; net-io's plan references the same hook shapes; every open decision has an answer or a recorded owner.
 - [x] Every public item written in `docs/API.md` with tier, grade, version, cost, errors, and examples.
 - [x] `dev/PLAN.md` rewritten from the specification; decisions D-009 to D-035 logged; open decisions answered (PLAN section 15).
@@ -16,24 +16,25 @@ Exit: James approves `docs/API.md`; net-io's plan references the same hook shape
 - [x] Cell and ban-entry layouts with computed sizes (PLAN 7.4, 7.8); loom model plan (PLAN 12.4).
 - [x] net-io hook shape proposed for net-io's 0.2 (D-015).
 - [x] README: Tier 1 example, `&mdash;` entities removed; DIRECTIVES aligned.
-- [ ] James's approval of the API.
+- [x] James's approval of the API (2026-10-22).
 - [x] Hook shape agreed with net-io's 0.2: the `Gate` trait (D-015, 2026-10-23).
 - [ ] net-io confirms the two additions (`GateTag` in `Admitted` and `ConnectionInfo`; `WriteCheck.response`), or the gap is recorded here with its reason.
-- [ ] Release: version 0.2.0, CHANGELOG, `docs/release/v0.2.0.md`, CI, tag, GitHub release, publish (O-16).
+- [x] Release: version 0.2.0, CHANGELOG, `docs/release/v0.2.0.md`, CI, tag, GitHub release, publish (O-16).
 
 ## v0.3.0 - Core: keys, ban memory, the door, tickets, the epoch
-Items: constants; `Bouncer::new`, `builder`, `door`, `door_at`, `ban`, `lift`, `now`, `capacity`; builder capacity, lengths, durations, allow list, trusted proxies, clock, seed, `try_build`; every key type; `Refusal`, `Provenance`; `Ticket` issue, accessors, `request`, `checkpoint` (epoch and direct flags), `bind_client`, release on drop, `tag`; `TicketId`, `TicketKind`, `TicketTag`; `Verdict`; `BanSpec`, `LiftSpec`, `BanDuration`, `BanRecord`, `DurationPolicy` with jitter, `AllowList`; `Actor`, `Reason`, `Evidence`; dynamic ban table and compiled prefix set; `BouncerError`, `ConfigError`.
+Items: constants; `Bouncer::new`, `builder`, `door`, `door_at`, `ban`, `lift`, `now`, `capacity`; builder capacity, lengths, durations, allow list, trusted proxies, clock, seed, `try_build`; every key type; `Refusal`, `Provenance`; `Ticket` issue, accessors, `request`, `checkpoint` (epoch and direct flags), `bind_client`, release on drop, `tag`; `TicketId`, `TicketKind`, `TicketTag`; `Verdict`, `Denial`, `DenialCode`, `Reference`; `BanSpec`, `LiftSpec`, `BanDuration`, `BanId`, `Lifted`, `DurationPolicy` with jitter, `AllowList`; `Actor`, `ActorKind`, `Reason`, `Evidence`; dynamic ban table and compiled prefix set; `BouncerError`, `ConfigError`.
 Exit:
-- [ ] A banned address or prefix is refused before a byte, with 1,000,000 bans, under 100 ns p99 (first measurement, recorded).
-- [ ] Edge cases 1 to 28 pass.
-- [ ] Loom L-2 and L-3 pass.
-- [ ] No allocation on door and checkpoint (counting allocator).
-- [ ] Property tests 1 to 6 of PLAN 12.2.
-- [ ] Threat tests T-1 (door part), T-2, T-9 (reseed), T-10, T-18.
-- [ ] Fuzz target `cidr_parse` builds and runs in CI.
+- [x] A banned address or prefix is refused before a byte, with 1,000,000 bans (first measurement recorded in PLAN 11.1). The 100 ns p99 target is not met yet; see the move below.
+- [x] Edge cases 1 to 19 and 21 to 26 pass (`tests/door.rs`, unit tests in `keys`, `ticket`, `bans`).
+- [x] Loom L-2 and L-3 pass.
+- [x] No allocation on door, request, checkpoint, release, and `bind_client` (`tests/alloc.rs`).
+- [x] Property tests 1 to 6 of PLAN 12.2 (`tests/properties.rs`).
+- [x] Threat tests T-1 (door part), T-2 (rotation part), T-9 (flooding needs the key), T-10, T-18.
+- [x] Fuzz target `cidr_parse` builds and runs in CI.
 
 ## v0.4.0 - Extended: revocation, wipe, replace, eject, strikes, budgets, events
 Needs crypt-io 1.2 with the public `wipe` (O-3) published first.
+Also: edge cases 20, 27, 28; the strike part of T-1.
 Items: `revoke`, `apply`, `Target`, `RevokeMode`, `Revocation`, `RevocationEpoch`, builder `epoch`; revocation tables, quiescence cleanup, idle-ticket checks, eject-now sweeps; `before_commit`, `is_cancelled`, `bind_fingerprint`, `bind_session`, `bind_account`, `bind_tenant`; `Bouncer::request`, `egress`, `release`, `into_tag`; `Collected`; `DenialFormat`, `NoFormat`, `Ejector`, `CloseKind`, `Ejected`, `deny_and_eject`; `Denial`, `DenialCode`, `DenialTable`, `Reference`; `Directive`, `Action`, `BanKeys`, `Applied`; strikes, `StrikeRules`, `Enforcement` (observe by default); door budgets and `Rate`; `EventSink`, `Event`, signal catalog; `maintain`, the parked maintainer; `revocation_rate_limit`; `docs/INTEGRATION.md`.
 Exit:
 - [ ] A request revoked at each checkpoint (between stages, before commit, pipeline egress, transport egress) never sends a byte of its original response, never passes before-commit, gets the configured denial, and is ejected.
@@ -45,7 +46,7 @@ Exit:
 - [ ] Fuzz target `directive_sequence`.
 
 ## v0.5.0 - Feature complete
-Items: escalation, offender memory, shared-address detection; lane and tenant budgets, `bind_lane`; throttle directives; posture; `explain`, `list`, `replace_allow`; `health`; persistence (snapshot, journal, MAC, `FilePersistence`, `LoadFailure`, wall-jump rules); sharing (`NodeId`, `Delta`, `Sequence`, `ImportReport`, HLC stamps, revocation records, skew bound); `metrics`; `datagram`; `docs/ARCHITECTURE.md`.
+Items: `BanRecord`; escalation, offender memory, shared-address detection; lane and tenant budgets, `bind_lane`; throttle directives; posture; `explain`, `list`, `replace_allow`; `health`; persistence (snapshot, journal, MAC, `FilePersistence`, `LoadFailure`, wall-jump rules); sharing (`NodeId`, `Delta`, `Sequence`, `ImportReport`, HLC stamps, revocation records, skew bound); `metrics`; `datagram`; `docs/ARCHITECTURE.md`.
 Exit:
 - [ ] Bans survive a restart (kill tests pass on Linux, macOS, Windows).
 - [ ] Two in-process bouncers exchanging deltas converge under every permutation; each keeps enforcing when the other is gone; a revocation on one stops a running request on the other.
@@ -55,7 +56,7 @@ Exit:
 - [ ] Fuzz targets `snapshot_decode`, `journal_replay`, `delta_decode`.
 
 ## v0.6.0 - Optimisation
-Items: the benchmarks of PLAN 11 against the named competitors; prefix structure confirmed or changed (O-4); keyed hash chosen (O-8); shard `Arc` confirmed (O-5); `#[track_caller]` cost on `checkpoint` measured (0.2 defence idea); `docs/PERFORMANCE.md`.
+Items: the door under 100 ns p99 with 1,000,000 bans (moved from 0.3); table rebuild with a fresh seed at the probe bound (moved from 0.3); 8-byte keys and 32-byte slots; the benchmarks of PLAN 11 against the named competitors; prefix structure confirmed or changed (O-4); keyed hash chosen (O-8); shard `Arc` confirmed (O-5); `#[track_caller]` cost on `checkpoint` measured (0.2 defence idea); `docs/PERFORMANCE.md`.
 Exit:
 - [ ] Every target of PLAN 11 met, or the gap recorded here with a plan.
 - [ ] NFR-10 met on `door_1m` and `budget_check`; `checkpoint_fast` within 10% of an `AtomicBool` load.
@@ -91,5 +92,8 @@ Exit:
 - Challenge verdict and proof-of-work verifier; kernel-drop export; tarpit mode; ASN keys once a data source is chosen.
 
 ## Moves recorded
+- 2026-10-23: the door's 100 ns p99 target moves from the 0.3 exit to 0.6, where it already stands as an exit. Reason: measured at 0.3 on a shared machine (PLAN 11.1), the door costs 230-360 ns per call with 1,000,000 bans and random peers. The cost is ticket issue and release (about 70 ns), hashing (about 30 ns per probe), and TLB and cache misses into a 60 MiB table. The fixes are optimisation work: 8-byte keys and 32-byte slots, the O-8 hash decision, fewer atomic operations per ticket, and measurement on a quiet machine.
+- 2026-10-23: rebuilding a ban table with a fresh seed when the probe bound is reached (part of T-9) moves to 0.6 with the O-8 hash decision (PLAN D-038). Reason: it needs a lock-free whole-table swap, and with SipHash under a random key, colliding keys can be chosen only with the key. Until then an insert past the bound fails cleanly as `BanTableFull`.
+- 2026-10-23: edge case 20 (`bind_session` twice) moves to 0.4 with the identity binds, edge cases 27 and 28 (tags after `release`) to 0.4 with `Bouncer::release`, and the strike part of T-1 to 0.4 with strikes. `BanRecord` moves to 0.5 with `list` and `explain`, its first users. Reason: each needs an item of that version.
 - 2026-10-22: the old 0.3 "door" and 0.4 "inside" phases became 0.3 core and 0.4 extended; strikes and door budgets moved from the old 0.3 to 0.4 because they report through the event sink, which is built in 0.4 (nothing is dropped; the door's ban checks stay in 0.3). The old 0.5 "memory and sharing" is part of 0.5 feature complete. The old 0.9 hardening is now 0.7, earlier than before.
 - 2026-10-22: the net-io hook implementation is at 0.8, not 0.3 as in the old roadmap, because it depends on a published net-io 0.3 and no path dependency is allowed. bouncer's own `egress(tag)` and `request(tag, id)` are at 0.4, so the hook is a thin adapter when it lands.

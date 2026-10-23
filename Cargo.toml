@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "bouncer-io"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -14,6 +14,9 @@ license = "Apache-2.0 OR MIT"
 
 # Readme
 readme = "README.md"
+
+# Files kept out of the published package
+exclude = ["fuzz/", ".github/"]
 
 # Description
 description = "Connection gate for Rust services: admission by address, prefix, fingerprint, session, and account; in-flight revocation through cheap checkpoints; wipe, replace, and eject of revoked requests; ban memory with prefix escalation. Protocol-free."
@@ -50,13 +53,31 @@ default = []
 # DEPENDENCIES
 # #################################
 [dependencies]
-# None yet. Planned dependencies and the reason for each are listed in
-# dev/PLAN.md; each is added with the first code that needs it.
+# Monotonic and wall time, mockable in tests (first-party).
+clock-lib = "1.1"
 
 
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
+criterion = { version = "0.7", default-features = false }
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[target.'cfg(bouncer_loom)'.dev-dependencies]
+loom = "0.7"
+
+
+# BENCHMARKS
+# #################################
+[[bench]]
+name    = "door"
+harness = false
+
+
+# LINTS
+# #################################
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(bouncer_loom)"] }
 
 
 # RELEASE PROFILE

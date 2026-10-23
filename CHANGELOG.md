@@ -13,6 +13,53 @@
 
 ---
 
+## [0.3.0] - 2026-10-23
+
+The core: keys, ban memory, the door, tickets, and the checkpoint.
+
+### Added
+
+- `Bouncer` with `new`, `builder`, `door`, `door_at`, `ban`, `lift`, `now`,
+  and `capacity`; `BouncerBuilder` with ticket, shard, and ban capacities,
+  automatic IPv4 and IPv6 lengths, the duration policy, the allow list,
+  trusted proxies, a clock, and fixed seeds for tests.
+- Keys: `Cidr` with a strict parser (at most 64 bytes, no zone ids, no
+  leading zeros in IPv4 octets or the length, the byte position of the first
+  error), `normalize` (IPv4-mapped IPv6 to IPv4; NAT64, Teredo, and 6to4 left
+  alone), `prefix_of`, `ConnId`, `RequestId`, `AccountKey`, `TenantKey`, and
+  the digests `SessionKey` and `FingerprintKey`, which compare in constant
+  time and never print.
+- Ban memory: bans by address (IPv6 clients at /64), prefix, session,
+  account, tenant, fingerprint, and fingerprint within a prefix; timed by
+  `DurationPolicy` (growing for repeat offenders, capped, with jitter) or
+  permanent for the actors allowed to; never on allow-listed keys or trusted
+  proxies; bounded, evicting only expired entries and timed bans from local
+  heuristics. A lock-free table for the automatic lengths and identity keys,
+  and a compiled multibit trie for administrator prefixes of any length.
+- The door: trusted proxy hops, the `AllowList` (immune and budget-exempt
+  entries), and ban memory, from the peer address alone. Every refusal is a
+  `Refusal` value for logs; the peer sees the same close for every reason.
+- Tickets: `Ticket::request`, `checkpoint` (one atomic load while nothing is
+  revoked), `bind_client` for the real client behind a trusted proxy (PROXY
+  protocol on the connection, forwarded headers per request), `tag`, and
+  release on drop. A request whose connection is gone is denied; a request
+  under a proxy hop is denied until its client is bound.
+- `Verdict`, `Denial`, `DenialCode`, `Reference`, `Actor`, `ActorKind`,
+  `Reason`, `Evidence`, `BouncerError`, `ConfigError`.
+- Tests: edge cases and threat tests in `tests/door.rs`, property tests,
+  a counting-allocator test showing the door, request, checkpoint, and
+  `bind_client` paths do not allocate, loom models for the ticket free list
+  and the ban table's sequence-locked slots, and a `cidr_parse` fuzz target.
+- `benches/door.rs` and `examples/door_p99.rs`: the door with 1,000,000 bans
+  and 10,000 administrator prefixes.
+
+### Changed
+
+- `docs/API.md`: `BanRecord.actor` is an `ActorKind`; `ActorKind` added;
+  ticket tags are a cell index and a generation.
+
+---
+
 ## [0.2.0] - 2026-10-22
 
 The design lock: the full public API, the plan rewritten from the crate's
@@ -65,6 +112,7 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/bouncer-io/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/bouncer-io/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/bouncer-io/releases/tag/v0.1.0

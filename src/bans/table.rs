@@ -1,0 +1,788 @@
+//! The dynamic ban table: open addressing with linear probing, one slot per
+//! entry, read without locks.
+//!
+//! Each slot is a small sequence lock: a writer makes the version odd, writes
+//! the words, and makes it even again; a reader reads the version, the words,
+//! and the version again, and keeps the read only if both versions are the
+//! same even number. Writers are serialized by the caller (the ban writer
+//! lock), so a reader never waits on more than one slot write (loom model L-3).
+//!
+//! Every key kind and prefix length shares the one table; the kind and length
+//! are part of the key. A lookup probes once per length in use.
+
+use crate::{
+    directive::{ActorKind, Reason},
+    hash::HashKey,
+    sync::{AtomicU64, Ordering, fence, spin},
+};
+
+/// Slot kinds stored in the low byte of the meta word.
+pub(crate) const KIND_TOMBSTONE: u8 = 1;
+pub(crate) const KIND_V4: u8 = 2;
+pub(crate) const KIND_V6: u8 = 3;
+pub(crate) const KIND_SESSION: u8 = 4;
+pub(crate) const KIND_ACCOUNT: u8 = 5;
+pub(crate) const KIND_TENANT: u8 = 6;
+pub(crate) const KIND_FINGERPRINT: u8 = 7;
+pub(crate) const KIND_FINGERPRINT_IN: u8 = 8;
+
+/// Entry flag: evictable (a local heuristic's timed ban).
+pub(crate) const FLAG_EVICTABLE: u8 = 1;
+
+/// How many groups of eight slots a probe sequence may visit.
+pub(crate) const MAX_PROBE: usize = crate::MAX_PROBE as usize;
+
+/// Spins a reader allows a writer that holds a slot before it gives up.
+#[cfg(not(bouncer_loom))]
+const READ_SPINS: u32 = 256;
+#[cfg(bouncer_loom)]
+const READ_SPINS: u32 = 2;
+
+/// A table key: kind, prefix length (0 for identity kinds), and 128 bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TableKey {
+    pub(crate) kind: u8,
+    pub(crate) len: u8,
+    pub(crate) k0: u64,
+    pub(crate) k1: u64,
+}
+
+/// One stored ban.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Entry {
+    pub(crate) key: TableKey,
+    pub(crate) flags: u8,
+    pub(crate) actor: ActorKind,
+    pub(crate) reason: Reason,
+    pub(crate) offences: u16,
+    /// Seconds since the bouncer started at which the ban ends; 0 = permanent.
+    pub(crate) until: u32,
+    /// Seconds since the bouncer started at which it was issued.
+    pub(crate) issued: u32,
+    pub(crate) id: u64,
+}
+
+impl Entry {
+    #[inline]
+    pub(crate) fn expired(&self, now_secs: u64) -> bool {
+        self.until != 0 && u64::from(self.until) <= now_secs
+    }
+
+    pub(crate) fn evictable(&self) -> bool {
+        self.flags & FLAG_EVICTABLE != 0
+    }
+}
+
+struct Slot {
+    version: AtomicU64,
+    meta: AtomicU64,
+    k0: AtomicU64,
+    k1: AtomicU64,
+    times: AtomicU64,
+    id: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct Raw {
+    meta: u64,
+    k0: u64,
+    k1: u64,
+    times: u64,
+    id: u64,
+}
+
+impl Raw {
+    const fn kind(&self) -> u8 {
+        self.meta as u8
+    }
+
+    fn key(&self) -> TableKey {
+        TableKey {
+            kind: self.kind(),
+            len: (self.meta >> 8) as u8,
+            k0: self.k0,
+            k1: self.k1,
+        }
+    }
+
+    fn entry(&self) -> Entry {
+        Entry {
+            key: self.key(),
+            flags: (self.meta >> 16) as u8,
+            actor: ActorKind::from_code((self.meta >> 24) as u8),
+            reason: Reason::from_code((self.meta >> 32) as u16),
+            offences: (self.meta >> 48) as u16,
+            until: (self.times >> 32) as u32,
+            issued: self.times as u32,
+            id: self.id,
+        }
+    }
+
+    fn from_entry(e: &Entry) -> Raw {
+        let meta = u64::from(e.key.kind)
+            | (u64::from(e.key.len) << 8)
+            | (u64::from(e.flags) << 16)
+            | (u64::from(e.actor.code()) << 24)
+            | (u64::from(e.reason.code()) << 32)
+            | (u64::from(e.offences) << 48);
+        Raw {
+            meta,
+            k0: e.key.k0,
+            k1: e.key.k1,
+            times: (u64::from(e.until) << 32) | u64::from(e.issued),
+            id: e.id,
+        }
+    }
+
+    const fn tombstone() -> Raw {
+        Raw {
+            meta: KIND_TOMBSTONE as u64,
+            k0: 0,
+            k1: 0,
+            times: 0,
+            id: 0,
+        }
+    }
+}
+
+impl Slot {
+    fn new() -> Self {
+        Slot {
+            version: AtomicU64::new(0),
+            meta: AtomicU64::new(0),
+            k0: AtomicU64::new(0),
+            k1: AtomicU64::new(0),
+            times: AtomicU64::new(0),
+            id: AtomicU64::new(0),
+        }
+    }
+
+    /// A consistent snapshot, or `None` when a writer held the slot for longer
+    /// than the spin bound.
+    #[inline]
+    fn read(&self) -> Option<Raw> {
+        for _ in 0..READ_SPINS {
+            let v1 = self.version.load(Ordering::Acquire);
+            if v1 & 1 == 0 {
+                let raw = Raw {
+                    meta: self.meta.load(Ordering::Relaxed),
+                    k0: self.k0.load(Ordering::Relaxed),
+                    k1: self.k1.load(Ordering::Relaxed),
+                    times: self.times.load(Ordering::Relaxed),
+                    id: self.id.load(Ordering::Relaxed),
+                };
+                fence(Ordering::Acquire);
+                if self.version.load(Ordering::Relaxed) == v1 {
+                    return Some(raw);
+                }
+            }
+            spin();
+        }
+        None
+    }
+
+    /// The writer's view: no other writer exists, so plain loads are exact.
+    fn read_owned(&self) -> Raw {
+        Raw {
+            meta: self.meta.load(Ordering::Relaxed),
+            k0: self.k0.load(Ordering::Relaxed),
+            k1: self.k1.load(Ordering::Relaxed),
+            times: self.times.load(Ordering::Relaxed),
+            id: self.id.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Replaces the slot. Callers hold the table's writer lock.
+    fn write(&self, raw: &Raw) {
+        let v = self.version.load(Ordering::Relaxed);
+        self.version.store(v.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.meta.store(raw.meta, Ordering::Relaxed);
+        self.k0.store(raw.k0, Ordering::Relaxed);
+        self.k1.store(raw.k1, Ordering::Relaxed);
+        self.times.store(raw.times, Ordering::Relaxed);
+        self.id.store(raw.id, Ordering::Relaxed);
+        self.version.store(v.wrapping_add(2), Ordering::Release);
+    }
+}
+
+/// The result of a read-side lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Probe {
+    Hit(Entry),
+    Miss,
+    /// A slot on the probe path was being rewritten for longer than the spin
+    /// bound. The caller fails closed.
+    Busy,
+}
+
+/// The result of an insert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Inserted {
+    /// A new entry. `removed` is an entry taken out to make room: an expired
+    /// one (`evicted` false) or the earliest evictable one (`evicted` true).
+    New {
+        removed: Option<Entry>,
+        evicted: bool,
+    },
+    /// The key was already present (possibly expired): merged in place.
+    Merged { previous: Entry },
+}
+
+/// Tag byte of an empty slot. A probe stops at a group holding one.
+const TAG_EMPTY: u8 = 0x80;
+/// Tag byte of a removed slot. Probes continue past it.
+const TAG_DELETED: u8 = 0xfe;
+/// Eight empty tags.
+const TAGS_EMPTY: u64 = 0x8080_8080_8080_8080;
+/// Slots per group: one tag word.
+const GROUP: usize = 8;
+
+/// The table. Readers call [`Table::find`]; every other method needs the
+/// writer lock, which the owner holds.
+///
+/// Slots are grouped by eight, and each group has one tag word: a byte per
+/// slot holding seven bits of the key's hash, or empty, or deleted. A lookup
+/// reads the group's tag word and only the slots whose tag matches, so a miss
+/// costs a few tag-word loads from one contiguous array. Probing moves group
+/// by group, at most [`MAX_PROBE`] groups.
+pub(crate) struct Table {
+    slots: Box<[Slot]>,
+    tags: Box<[AtomicU64]>,
+    key: HashKey,
+    capacity: u32,
+}
+
+/// Writer-side bookkeeping, kept inside the owner's writer lock.
+#[derive(Debug, Default)]
+pub(crate) struct TableWriter {
+    live: u32,
+    hand: usize,
+}
+
+impl TableWriter {
+    #[cfg(all(test, not(bouncer_loom)))]
+    pub(crate) fn live(&self) -> u32 {
+        self.live
+    }
+}
+
+#[inline]
+fn tag_at(word: u64, i: usize) -> u8 {
+    (word >> (8 * i)) as u8
+}
+
+const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+/// Bytes of `word` equal to `tag`, as a mask with the high bit of each
+/// matching byte set. May also flag a byte right after a true match; callers
+/// confirm every candidate by comparing the full key.
+#[inline]
+fn match_tag(word: u64, tag: u8) -> u64 {
+    let x = word ^ (LOW_BITS * u64::from(tag));
+    x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS
+}
+
+/// `true` when some tag in `word` is empty. Empty (0x80) is the only tag
+/// with bit 7 set and bit 6 clear (deleted is 0xfe, hash tags are below 0x80).
+#[inline]
+fn has_empty(word: u64) -> bool {
+    word & !(word << 1) & HIGH_BITS != 0
+}
+
+impl Table {
+    /// A table for `capacity` entries at a load of at most 7/8.
+    pub(crate) fn new(capacity: u32, key: HashKey) -> Table {
+        let wanted = (u64::from(capacity) * 8)
+            .div_ceil(7)
+            .max(u64::from(capacity) + 1);
+        let groups = usize::try_from(wanted.div_ceil(GROUP as u64))
+            .unwrap_or(usize::MAX / GROUP)
+            .max(2);
+        let slots = (0..groups * GROUP)
+            .map(|_| Slot::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let tags = (0..groups)
+            .map(|_| AtomicU64::new(TAGS_EMPTY))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Table {
+            slots,
+            tags,
+            key,
+            capacity,
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// Bytes reserved by the slots and tags.
+    pub(crate) fn bytes(&self) -> u64 {
+        (self.slots.len() * core::mem::size_of::<Slot>() + self.tags.len() * 8) as u64
+    }
+
+    /// Starting group and tag byte for a key.
+    #[inline]
+    pub(crate) fn locate(&self, key: &TableKey) -> (usize, u8) {
+        let meta = u64::from(key.kind) | (u64::from(key.len) << 8);
+        let h = self.key.hash3(meta, key.k0, key.k1);
+        let group = ((u128::from(h) * self.tags.len() as u128) >> 64) as usize;
+        (group, (h & 0x7f) as u8)
+    }
+
+    /// The probe sequence: triangular steps over groups (g, g+1, g+3, g+6, ...),
+    /// which avoids the clustering of linear probing at high load.
+    #[inline]
+    fn next_group(&self, g: usize, step: usize) -> usize {
+        (g + step) % self.tags.len()
+    }
+
+    /// Sets one tag byte. Only the writer changes tags.
+    fn set_tag(&self, slot: usize, tag: u8) {
+        let word = &self.tags[slot / GROUP];
+        let shift = 8 * (slot % GROUP);
+        let old = word.load(Ordering::Relaxed);
+        word.store(
+            (old & !(0xff << shift)) | (u64::from(tag) << shift),
+            Ordering::Release,
+        );
+    }
+
+    /// Lock-free lookup of a live (not expired) entry.
+    #[inline]
+    pub(crate) fn find(&self, key: &TableKey, now_secs: u64) -> Probe {
+        let (g, h2) = self.locate(key);
+        let tags = self.first_tags(g);
+        self.find_at(key, g, h2, tags, now_secs)
+    }
+
+    /// The tag word of a key's first group: callers that probe several keys
+    /// load every first tag word before comparing any, so the cache misses
+    /// overlap.
+    #[inline]
+    pub(crate) fn first_tags(&self, group: usize) -> u64 {
+        self.tags[group].load(Ordering::Acquire)
+    }
+
+    /// Continues a lookup whose first tag word is already loaded.
+    #[inline]
+    pub(crate) fn find_at(
+        &self,
+        key: &TableKey,
+        mut g: usize,
+        h2: u8,
+        mut tags: u64,
+        now_secs: u64,
+    ) -> Probe {
+        for step in 1..=MAX_PROBE {
+            let mut candidates = match_tag(tags, h2);
+            while candidates != 0 {
+                let i = (candidates.trailing_zeros() / 8) as usize;
+                candidates &= candidates - 1;
+                if tag_at(tags, i) != h2 {
+                    continue;
+                }
+                let Some(raw) = self.slots[g * GROUP + i].read() else {
+                    return Probe::Busy;
+                };
+                if raw.kind() >= KIND_V4 && raw.key() == *key {
+                    let e = raw.entry();
+                    return if e.expired(now_secs) {
+                        Probe::Miss
+                    } else {
+                        Probe::Hit(e)
+                    };
+                }
+            }
+            if has_empty(tags) {
+                return Probe::Miss;
+            }
+            g = self.next_group(g, step);
+            tags = self.tags[g].load(Ordering::Acquire);
+        }
+        Probe::Miss
+    }
+
+    /// The slot holding `key` (expired or not), for the writer.
+    fn position(&self, key: &TableKey) -> Option<(usize, Raw)> {
+        let (mut g, h2) = self.locate(key);
+        for step in 1..=MAX_PROBE {
+            let tags = self.tags[g].load(Ordering::Relaxed);
+            for i in 0..GROUP {
+                if tag_at(tags, i) == h2 {
+                    let raw = self.slots[g * GROUP + i].read_owned();
+                    if raw.kind() >= KIND_V4 && raw.key() == *key {
+                        return Some((g * GROUP + i, raw));
+                    }
+                }
+            }
+            if has_empty(tags) {
+                return None;
+            }
+            g = self.next_group(g, step);
+        }
+        None
+    }
+
+    fn store(&self, slot: usize, entry: &Entry, h2: u8) {
+        self.slots[slot].write(&Raw::from_entry(entry));
+        self.set_tag(slot, h2);
+    }
+
+    fn clear(&self, slot: usize) {
+        self.set_tag(slot, TAG_DELETED);
+        self.slots[slot].write(&Raw::tombstone());
+    }
+
+    /// Inserts or merges. `merge` builds the stored entry from the previous
+    /// one when the key is already present.
+    ///
+    /// Eviction order when there is no room: expired entries, then the
+    /// evictable entry with the earliest end within a bounded scan. Entries
+    /// that are not evictable are never removed; then the insert fails.
+    pub(crate) fn insert(
+        &self,
+        w: &mut TableWriter,
+        entry: Entry,
+        now_secs: u64,
+        merge: impl FnOnce(&Entry) -> Entry,
+    ) -> Result<Inserted, ()> {
+        let (start, h2) = self.locate(&entry.key);
+        if let Some((slot, raw)) = self.position(&entry.key) {
+            let previous = raw.entry();
+            self.store(slot, &merge(&previous), h2);
+            return Ok(Inserted::Merged { previous });
+        }
+        // The first reusable slot on the probe path: empty, deleted, or expired.
+        let mut free: Option<(usize, Option<Entry>)> = None;
+        let mut window_victim: Option<(usize, Entry)> = None;
+        let mut g = start;
+        'groups: for step in 1..=MAX_PROBE {
+            let tags = self.tags[g].load(Ordering::Relaxed);
+            for i in 0..GROUP {
+                let slot = g * GROUP + i;
+                let tag = tag_at(tags, i);
+                if tag == TAG_EMPTY || tag == TAG_DELETED {
+                    free = Some((slot, None));
+                    break 'groups;
+                }
+                let raw = self.slots[slot].read_owned();
+                if raw.kind() < KIND_V4 {
+                    free = Some((slot, None));
+                    break 'groups;
+                }
+                let e = raw.entry();
+                if e.expired(now_secs) {
+                    free = Some((slot, Some(e)));
+                    break 'groups;
+                }
+                if e.evictable() && window_victim.is_none_or(|(_, v)| earlier(&e, &v)) {
+                    window_victim = Some((slot, e));
+                }
+            }
+            g = self.next_group(g, step);
+        }
+
+        let (slot, removed, evicted) = match free {
+            // Replaces an expired entry; the live count is unchanged.
+            Some((slot, Some(expired))) => (slot, Some(expired), false),
+            Some((slot, None)) => {
+                let mut removed = None;
+                let mut evicted = false;
+                if w.live >= self.capacity {
+                    let (e, was_evicted) = self.make_room(w, now_secs).ok_or(())?;
+                    removed = Some(e);
+                    evicted = was_evicted;
+                }
+                w.live += 1;
+                (slot, removed, evicted)
+            }
+            None => match window_victim {
+                Some((slot, victim)) => (slot, Some(victim), true),
+                None => return Err(()),
+            },
+        };
+        self.store(slot, &entry, h2);
+        Ok(Inserted::New { removed, evicted })
+    }
+
+    /// Frees one entry somewhere in the table (bounded scan from the clock
+    /// hand): an expired entry, else the evictable entry with the earliest
+    /// end. Returns the entry removed and whether it was evicted (not
+    /// expired); `None` means no room can be made.
+    fn make_room(&self, w: &mut TableWriter, now_secs: u64) -> Option<(Entry, bool)> {
+        let n = self.slots.len();
+        let mut victim: Option<(usize, Entry)> = None;
+        for _ in 0..(MAX_PROBE * GROUP).min(n) {
+            let i = w.hand;
+            w.hand = if w.hand + 1 == n { 0 } else { w.hand + 1 };
+            let raw = self.slots[i].read_owned();
+            if raw.kind() < KIND_V4 {
+                continue;
+            }
+            let e = raw.entry();
+            if e.expired(now_secs) {
+                self.clear(i);
+                w.live -= 1;
+                return Some((e, false));
+            }
+            if e.evictable() && victim.is_none_or(|(_, v)| earlier(&e, &v)) {
+                victim = Some((i, e));
+            }
+        }
+        let (i, e) = victim?;
+        self.clear(i);
+        w.live -= 1;
+        Some((e, true))
+    }
+
+    /// Removes the entry under `key`, expired or not.
+    pub(crate) fn remove(&self, w: &mut TableWriter, key: &TableKey) -> Option<Entry> {
+        let (slot, raw) = self.position(key)?;
+        self.clear(slot);
+        w.live -= 1;
+        Some(raw.entry())
+    }
+
+    /// The entry under `key` for the writer, expired or not.
+    pub(crate) fn get_owned(&self, key: &TableKey) -> Option<Entry> {
+        self.position(key).map(|(_, raw)| raw.entry())
+    }
+}
+
+/// `a` ends before `b` (permanent entries never count as earlier).
+fn earlier(a: &Entry, b: &Entry) -> bool {
+    match (a.until, b.until) {
+        (0, _) => false,
+        (_, 0) => true,
+        (x, y) => x < y,
+    }
+}
+
+#[cfg(all(test, not(bouncer_loom)))]
+mod tests {
+    use super::*;
+
+    fn key(n: u64) -> TableKey {
+        TableKey {
+            kind: KIND_V4,
+            len: 32,
+            k0: 0,
+            k1: n,
+        }
+    }
+
+    fn entry(n: u64, until: u32, evictable: bool) -> Entry {
+        Entry {
+            key: key(n),
+            flags: if evictable { FLAG_EVICTABLE } else { 0 },
+            actor: ActorKind::Local,
+            reason: Reason::STRIKE_THRESHOLD,
+            offences: 0,
+            until,
+            issued: 0,
+            id: n,
+        }
+    }
+
+    fn table(cap: u32) -> (Table, TableWriter) {
+        (
+            Table::new(cap, HashKey::new(11, 22)),
+            TableWriter::default(),
+        )
+    }
+
+    #[test]
+    fn test_table_insert_find_remove() {
+        let (t, mut w) = table(16);
+        assert_eq!(
+            t.insert(&mut w, entry(1, 100, true), 0, |e| *e),
+            Ok(Inserted::New {
+                removed: None,
+                evicted: false
+            })
+        );
+        assert!(matches!(t.find(&key(1), 0), Probe::Hit(e) if e.id == 1));
+        assert_eq!(t.find(&key(2), 0), Probe::Miss);
+        assert!(t.remove(&mut w, &key(1)).is_some());
+        assert_eq!(t.find(&key(1), 0), Probe::Miss);
+        assert_eq!(w.live(), 0);
+        assert!(t.remove(&mut w, &key(1)).is_none());
+    }
+
+    #[test]
+    fn test_table_entry_expires_at_until() {
+        let (t, mut w) = table(4);
+        t.insert(&mut w, entry(1, 10, true), 0, |e| *e).unwrap();
+        assert!(matches!(t.find(&key(1), 9), Probe::Hit(_)));
+        assert_eq!(t.find(&key(1), 10), Probe::Miss);
+        let mut perm = entry(2, 0, false);
+        perm.until = 0;
+        t.insert(&mut w, perm, 0, |e| *e).unwrap();
+        assert!(matches!(t.find(&key(2), u64::MAX), Probe::Hit(_)));
+    }
+
+    #[test]
+    fn test_table_merge_existing_key() {
+        let (t, mut w) = table(4);
+        t.insert(&mut w, entry(1, 10, true), 0, |e| *e).unwrap();
+        let r = t.insert(&mut w, entry(1, 50, true), 0, |prev| Entry {
+            offences: prev.offences + 1,
+            ..entry(1, 50, true)
+        });
+        assert!(matches!(r, Ok(Inserted::Merged { .. })));
+        assert!(matches!(t.find(&key(1), 20), Probe::Hit(e) if e.offences == 1 && e.until == 50));
+        assert_eq!(w.live(), 1);
+    }
+
+    #[test]
+    fn test_table_never_exceeds_capacity_and_keeps_unevictable() {
+        let (t, mut w) = table(8);
+        for n in 0..8 {
+            t.insert(&mut w, entry(n, 0, false), 0, |e| *e).unwrap();
+        }
+        assert_eq!(t.insert(&mut w, entry(100, 50, true), 0, |e| *e), Err(()));
+        for n in 0..8 {
+            assert!(matches!(t.find(&key(n), 0), Probe::Hit(_)));
+        }
+        assert_eq!(w.live(), 8);
+    }
+
+    #[test]
+    fn test_table_evicts_earliest_evictable_when_full() {
+        let (t, mut w) = table(4);
+        t.insert(&mut w, entry(1, 0, false), 0, |e| *e).unwrap();
+        t.insert(&mut w, entry(2, 30, true), 0, |e| *e).unwrap();
+        t.insert(&mut w, entry(3, 10, true), 0, |e| *e).unwrap();
+        t.insert(&mut w, entry(4, 20, true), 0, |e| *e).unwrap();
+        let r = t.insert(&mut w, entry(5, 40, true), 0, |e| *e).unwrap();
+        assert!(matches!(r, Inserted::New { removed: Some(e), evicted: true } if e.id == 3));
+        assert_eq!(w.live(), 4);
+        assert!(matches!(t.find(&key(1), 0), Probe::Hit(_)));
+    }
+
+    #[test]
+    fn test_table_reclaims_expired_first() {
+        let (t, mut w) = table(2);
+        t.insert(&mut w, entry(1, 5, true), 0, |e| *e).unwrap();
+        t.insert(&mut w, entry(2, 0, false), 0, |e| *e).unwrap();
+        let r = t.insert(&mut w, entry(3, 0, false), 10, |e| *e).unwrap();
+        assert!(matches!(r, Inserted::New { removed: Some(e), evicted: false } if e.id == 1));
+        assert_eq!(w.live(), 2);
+        assert!(matches!(t.find(&key(2), 10), Probe::Hit(_)));
+        assert!(matches!(t.find(&key(3), 10), Probe::Hit(_)));
+    }
+
+    #[test]
+    fn test_table_many_keys_round_trip() {
+        let (t, mut w) = table(10_000);
+        for n in 0..10_000 {
+            t.insert(&mut w, entry(n, 0, false), 0, |e| *e).unwrap();
+        }
+        for n in 0..10_000 {
+            assert!(
+                matches!(t.find(&key(n), 0), Probe::Hit(e) if e.id == n),
+                "{n}"
+            );
+        }
+        assert_eq!(t.find(&key(10_001), 0), Probe::Miss);
+    }
+}
+
+#[cfg(all(test, bouncer_loom))]
+mod loom_tests {
+    use super::*;
+
+    /// L-3: a reader racing a writer on one slot sees the old entry, the new
+    /// entry, or gives up; never a torn mix.
+    #[test]
+    fn loom_slot_reader_never_sees_torn_entry() {
+        loom::model(|| {
+            let slot = loom::sync::Arc::new(Slot::new());
+            let old = Raw {
+                meta: 2,
+                k0: 1,
+                k1: 1,
+                times: 1,
+                id: 1,
+            };
+            let new = Raw {
+                meta: 2,
+                k0: 2,
+                k1: 2,
+                times: 2,
+                id: 2,
+            };
+            slot.write(&old);
+            let s = slot.clone();
+            let writer = loom::thread::spawn(move || s.write(&new));
+            if let Some(r) = slot.read() {
+                let words = [r.k0, r.k1, r.times, r.id];
+                assert!(
+                    words == [1, 1, 1, 1] || words == [2, 2, 2, 2],
+                    "torn read {words:?}"
+                );
+            }
+            writer.join().unwrap();
+        });
+    }
+}
+
+#[cfg(all(test, not(bouncer_loom)))]
+mod flood_tests {
+    use super::*;
+
+    fn entry(n: u64) -> Entry {
+        Entry {
+            key: TableKey {
+                kind: KIND_V4,
+                len: 32,
+                k0: 0,
+                k1: n,
+            },
+            flags: 0,
+            actor: ActorKind::Admin,
+            reason: Reason::ADMIN,
+            offences: 0,
+            until: 0,
+            issued: 0,
+            id: n,
+        }
+    }
+
+    /// Threat T-9: keys chosen to collide under a known hash key exhaust the
+    /// probe bound; the same keys under a different (secret, random) key all
+    /// fit. The attacker never learns the key, so it cannot choose collisions.
+    #[test]
+    fn test_table_hash_flooding_needs_the_key() {
+        let known = HashKey::new(0x1111, 0x2222);
+        let victim = Table::new(4096, known);
+        let target = victim.locate(&entry(0).key).0;
+        let colliding: Vec<u64> = (1..)
+            .filter(|&n| victim.locate(&entry(n).key).0 == target)
+            .take(400)
+            .collect();
+        let mut w = TableWriter::default();
+        let refused = colliding
+            .iter()
+            .filter(|&&n| victim.insert(&mut w, entry(n), 0, |e| *e).is_err())
+            .count();
+        assert!(
+            refused > 0,
+            "colliding keys under a known key reach the probe bound"
+        );
+
+        let secret = Table::new(4096, HashKey::new(0x9e37_79b9, 0x7f4a_7c15));
+        let mut w = TableWriter::default();
+        for &n in &colliding {
+            secret.insert(&mut w, entry(n), 0, |e| *e).unwrap();
+        }
+        for &n in &colliding {
+            assert!(matches!(secret.find(&entry(n).key, 0), Probe::Hit(_)));
+        }
+    }
+}
