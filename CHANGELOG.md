@@ -13,6 +13,63 @@
 
 ---
 
+## [0.4.0] - 2026-10-23
+
+In-flight revocation, wipe, replace, eject, strikes, budgets, and events.
+
+### Added
+
+- `Bouncer::revoke` and `Bouncer::apply` with `Directive`, `Action`,
+  `BanKeys`, `Applied`, `Target`, `RevokeMode`, `Revocation`, and the public
+  `RevocationEpoch` (injectable with `BouncerBuilder::epoch`). Revoking a
+  connection, request, session, account, tenant, source prefix, or
+  fingerprint denies every running ticket that carries it at its next
+  checkpoint; a check that begins after `revoke` returns cannot miss it.
+- `Ticket::before_commit`, `is_cancelled`, `bind_fingerprint`,
+  `bind_session`, `bind_account`, `bind_tenant`, `strike`, `into_tag`,
+  `deny_and_eject`, `deny_and_eject_with`.
+- Tags for transports: `Bouncer::request(tag, id)`, `Bouncer::egress(tag)`
+  (the check before every socket write), `Bouncer::release(tag)`.
+- `Collected`, the zeroizing response buffer, wiped through crypt-io's
+  volatile writes and never reallocated in place; `DenialFormat`,
+  `NoFormat`, `FormatError`, `Ejector`, `CloseKind`, `Ejected`,
+  `DenialTable`.
+- Strikes: `StrikeKind`, `StrikeOutcome`, `StrikeRules`, `Enforcement`,
+  `Mode`, `Posture`. Local thresholds observe by default; a decoy touch is
+  definitive.
+- Door budgets: `Budgets` and `Rate` (rate per client and prefix through
+  rate-net's GCRA, concurrency per client and prefix, throttles); trusted
+  proxies and budget-exempt sources are not charged.
+- Events: `EventSink`, `NoSink`, `Event`, `SignalId`, `Category`,
+  `Subject`, `GENERATOR`, and the `signals` catalog; every action reports.
+- Maintenance: `Bouncer::maintain`, `MaintenanceReport`, the parked
+  maintainer thread (`BouncerBuilder::maintainer`), eject-now sweeps,
+  checks on idle tickets (reported as `checkpoint.missing`), and cleanup of
+  revocation entries no live ticket needs.
+- Builder: `revocation_capacity`, `budgets`, `strikes`, `enforcement`,
+  `denials`, `denial_format`, `event_sink`, `ejector`, `epoch`,
+  `max_unchecked`, `maintainer`, `revocation_rate_limit`.
+- `docs/INTEGRATION.md`: the checkpoint contract and how a transport, a
+  pipeline, a protocol adapter, the gates, and the signal bridge wire in.
+- Tests: revocation, wipe (with an inspecting allocator), a 10^8-checkpoint
+  stress run, loom models L-1, L-4, L-5, L-6, and the `directive_sequence`
+  fuzz target.
+
+### Changed
+
+- `Bouncer::new` turns on door budgets by default (20 per second, burst 40,
+  and 64 concurrent per client).
+- Receipts (`Revocation`, `Applied`, `Lifted`) are no longer `#[must_use]`.
+- `docs/API.md`: `LowConfidence` removed (a low-confidence ban is applied as
+  a throttle); budgets key IPv6 clients at /64 with a /48 prefix.
+
+### Dependencies
+
+- `rate-net` 2.0 (default features off) and `crypt-io` 1.2 (features
+  `zeroize` and `mac-blake3` only).
+
+---
+
 ## [0.3.0] - 2026-10-23
 
 The core: keys, ban memory, the door, tickets, and the checkpoint.
@@ -112,7 +169,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/bouncer-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/bouncer-io/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/bouncer-io/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/bouncer-io/releases/tag/v0.1.0

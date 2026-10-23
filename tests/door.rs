@@ -8,9 +8,9 @@ use std::{
 };
 
 use bouncer_io::{
-    AccountKey, Actor, AllowList, BanKey, BanSpec, Bouncer, BouncerError, Cidr, ConnId, DenialCode,
-    DurationPolicy, FingerprintKey, LiftSpec, Now, Provenance, Refusal, RequestId, SessionKey,
-    Verdict,
+    AccountKey, Actor, AllowList, BanKey, BanSpec, Bouncer, BouncerError, Budgets, Cidr, ConnId,
+    DenialCode, DurationPolicy, FingerprintKey, LiftSpec, Now, Provenance, Refusal, RequestId,
+    SessionKey, Verdict,
 };
 use clock_lib::ManualClock;
 
@@ -231,6 +231,7 @@ fn test_registry_concurrent_issue_n_minus_one_n_n_plus_one() {
         let b = Bouncer::builder()
             .tickets(capacity)
             .shards(4)
+            .budgets(Budgets::off())
             .try_build()
             .unwrap();
         let real = b.capacity().tickets as i64;
@@ -580,4 +581,26 @@ fn test_errors_never_print_digests() {
     let b = small();
     let t = b.door(ip("192.0.2.1")).unwrap();
     assert!(format!("{t:?}").contains("Ticket"));
+}
+
+#[test]
+fn test_registry_flood_from_one_address_cannot_exhaust_it() {
+    // Threat T-14: per-address concurrency at the door keeps one source from
+    // taking every ticket; a legitimate address is still admitted.
+    let b = Bouncer::builder()
+        .tickets(256)
+        .budgets(Budgets::default())
+        .try_build()
+        .unwrap();
+    let mut held = Vec::new();
+    for _ in 0..1000 {
+        if let Ok(t) = b.door(ip("198.51.100.1")) {
+            held.push(t);
+        }
+    }
+    assert!(held.len() <= 64, "one address held {}", held.len());
+    assert!(
+        b.door(ip("192.0.2.77")).is_ok(),
+        "a legitimate address is still admitted"
+    );
 }

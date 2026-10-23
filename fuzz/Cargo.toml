@@ -21,3 +21,10 @@ path = "fuzz_targets/cidr_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "directive_sequence"
+path = "fuzz_targets/directive_sequence.rs"
+test = false
+doc = false
+bench = false

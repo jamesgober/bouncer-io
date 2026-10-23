@@ -25,6 +25,9 @@ pub(crate) const KIND_ACCOUNT: u8 = 5;
 pub(crate) const KIND_TENANT: u8 = 6;
 pub(crate) const KIND_FINGERPRINT: u8 = 7;
 pub(crate) const KIND_FINGERPRINT_IN: u8 = 8;
+/// Revocation table kinds: a connection id, a request id.
+pub(crate) const KIND_CONNECTION: u8 = 9;
+pub(crate) const KIND_REQUEST: u8 = 10;
 
 /// Entry flag: evictable (a local heuristic's timed ban).
 pub(crate) const FLAG_EVICTABLE: u8 = 1;
@@ -546,6 +549,29 @@ impl Table {
         self.clear(slot);
         w.live -= 1;
         Some(raw.entry())
+    }
+
+    /// Removes every entry for which `remove` returns `true`; returns them.
+    /// A full scan, for maintenance only.
+    pub(crate) fn remove_where(
+        &self,
+        w: &mut TableWriter,
+        mut remove: impl FnMut(&Entry) -> bool,
+    ) -> Vec<Entry> {
+        let mut out = Vec::new();
+        for slot in 0..self.slots.len() {
+            let raw = self.slots[slot].read_owned();
+            if raw.kind() < KIND_V4 {
+                continue;
+            }
+            let e = raw.entry();
+            if remove(&e) {
+                self.clear(slot);
+                w.live -= 1;
+                out.push(e);
+            }
+        }
+        out
     }
 
     /// The entry under `key` for the writer, expired or not.

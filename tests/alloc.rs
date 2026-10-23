@@ -10,7 +10,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use bouncer_io::{Bouncer, Cidr, Provenance, RequestId};
+use bouncer_io::{AccountKey, Bouncer, Cidr, Provenance, RequestId, SessionKey, StrikeKind};
 
 struct Counting;
 
@@ -69,6 +69,7 @@ fn test_hot_paths_do_not_allocate() {
     }
     b.ban("203.0.0.0/8".parse::<Cidr>().unwrap()).unwrap(); // the administrator set is in use
     let admitted: IpAddr = "192.0.2.9".parse().unwrap();
+    let _ = admitted;
     let banned: IpAddr = "198.51.100.7".parse().unwrap();
     let admin_banned: IpAddr = "203.1.2.3".parse().unwrap();
 
@@ -77,8 +78,10 @@ fn test_hot_paths_do_not_allocate() {
     drop(b.door(admin_banned));
 
     let ((), n) = counted(|| {
-        for _ in 0..1000 {
-            let conn = b.door(admitted).unwrap();
+        for i in 0..1000u32 {
+            // A new /24 each time, so the door budgets admit and count.
+            let peer = IpAddr::from((0x0b00_0000 | (i << 8)).to_be_bytes());
+            let conn = b.door(peer).unwrap();
             let mut req = conn.request(RequestId(1)).unwrap();
             for _ in 0..10 {
                 assert!(req.checkpoint().is_pass());
@@ -103,4 +106,32 @@ fn test_hot_paths_do_not_allocate() {
         }
     });
     assert_eq!(n, 0, "bind_client allocated");
+
+    // 0.4 paths: revocation tables in use, egress by tag, identity binds,
+    // before-commit, strikes in observe mode.
+    b.revoke(
+        SessionKey::from_digest([200; 16]),
+        bouncer_io::Reason::LOGOUT,
+    )
+    .unwrap();
+    let tag = b.door("11.200.0.1".parse().unwrap()).unwrap().into_tag();
+    let warm = b.request(tag, RequestId(1)).unwrap();
+    drop(warm);
+    let ((), n) = counted(|| {
+        for i in 0..200u32 {
+            let mut req = b.request(tag, RequestId(u128::from(i))).unwrap();
+            assert!(
+                req.bind_session(SessionKey::from_digest([(i % 100) as u8; 16]))
+                    .is_pass()
+            );
+            assert!(req.bind_account(AccountKey(u128::from(i))).is_pass());
+            assert!(req.checkpoint().is_pass());
+            assert!(req.before_commit().is_pass());
+            assert!(b.egress(tag).is_pass());
+            assert!(b.egress(req.tag()).is_pass());
+            let _ = req.strike(StrikeKind::Malformed);
+        }
+    });
+    assert_eq!(n, 0, "egress, binds, before-commit, or strikes allocated");
+    b.release(tag);
 }

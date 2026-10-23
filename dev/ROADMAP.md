@@ -18,7 +18,7 @@ Exit: James approves `docs/API.md`; net-io's plan references the same hook shape
 - [x] README: Tier 1 example, `&mdash;` entities removed; DIRECTIVES aligned.
 - [x] James's approval of the API (2026-10-22).
 - [x] Hook shape agreed with net-io's 0.2: the `Gate` trait (D-015, 2026-10-23).
-- [ ] net-io confirms the two additions (`GateTag` in `Admitted` and `ConnectionInfo`; `WriteCheck.response`), or the gap is recorded here with its reason.
+- [x] net-io confirmed the two additions (`GateTag` in `Admitted` and `ConnectionInfo`; `WriteCheck.response`), 2026-10-23 (PLAN D-055).
 - [x] Release: version 0.2.0, CHANGELOG, `docs/release/v0.2.0.md`, CI, tag, GitHub release, publish (O-16).
 
 ## v0.3.0 - Core: keys, ban memory, the door, tickets, the epoch
@@ -33,19 +33,22 @@ Exit:
 - [x] Fuzz target `cidr_parse` builds and runs in CI.
 
 ## v0.4.0 - Extended: revocation, wipe, replace, eject, strikes, budgets, events
-Needs crypt-io 1.2 with the public `wipe` (O-3) published first.
+crypt-io 1.2 with the public `wipe` (O-3) was published 2026-10-23.
 Also: edge cases 20, 27, 28; the strike part of T-1.
 Items: `revoke`, `apply`, `Target`, `RevokeMode`, `Revocation`, `RevocationEpoch`, builder `epoch`; revocation tables, quiescence cleanup, idle-ticket checks, eject-now sweeps; `before_commit`, `is_cancelled`, `bind_fingerprint`, `bind_session`, `bind_account`, `bind_tenant`; `Bouncer::request`, `egress`, `release`, `into_tag`; `Collected`; `DenialFormat`, `NoFormat`, `Ejector`, `CloseKind`, `Ejected`, `deny_and_eject`; `Denial`, `DenialCode`, `DenialTable`, `Reference`; `Directive`, `Action`, `BanKeys`, `Applied`; strikes, `StrikeRules`, `Enforcement` (observe by default); door budgets and `Rate`; `EventSink`, `Event`, signal catalog; `maintain`, the parked maintainer; `revocation_rate_limit`; `docs/INTEGRATION.md`.
 Exit:
-- [ ] A request revoked at each checkpoint (between stages, before commit, pipeline egress, transport egress) never sends a byte of its original response, never passes before-commit, gets the configured denial, and is ejected.
-- [ ] `Collected` memory reads all zero after wipe and at free (inspecting allocator, release build).
-- [ ] Loom L-1, L-4, L-5, L-6 pass.
-- [ ] 10^8 checkpoints with concurrent revocations: no missed revocation.
-- [ ] Edge cases 29 to 47 pass.
-- [ ] Threat tests T-6, T-7 (in-process), T-8 (byte equality), T-11, T-12, T-13, T-14, T-21, T-22, T-23, T-26.
-- [ ] Fuzz target `directive_sequence`.
+- [x] A request revoked at each checkpoint (between stages, before commit, pipeline egress, transport egress) never sends a byte of its original response, never passes before-commit, gets the configured denial, and is ejected (`tests/revoke.rs`, `tests/wipe.rs`).
+- [x] `Collected` memory reads all zero after wipe and at free, growth included (inspecting allocator, debug and release, `tests/wipe.rs`).
+- [x] Loom L-1, L-4, L-5, L-6 pass (with L-2 and L-3).
+- [x] 10^8 checkpoints with concurrent revocations: no missed revocation (`tests/stress.rs`, release, about 0.1 s).
+- [x] Edge cases 20, 27 to 44, and 46 pass; 45 (a formatter that panics) and 47 (the flush deadline) are the transport's and are documented.
+- [x] Threat tests T-1 (strikes), T-6, T-7 (in-process), T-8 (byte equality), T-11, T-13, T-14 (one source cannot exhaust the registry), T-21, T-22, T-23, T-26. T-12 (p99 under a revocation storm) is a benchmark and moves to 0.6.
+- [x] Fuzz target `directive_sequence` (against a model of bans and revocations), run in CI with `cidr_parse`.
+- [x] No allocation on egress, binds, before-commit, and strikes added to `tests/alloc.rs`.
+- [x] `docs/INTEGRATION.md`.
 
 ## v0.5.0 - Feature complete
+Also: identity throttles (moved from 0.4, PLAN D-052); `set_posture` and its effects (PLAN D-053); `health` reporting revocation load and detached tickets.
 Items: `BanRecord`; escalation, offender memory, shared-address detection; lane and tenant budgets, `bind_lane`; throttle directives; posture; `explain`, `list`, `replace_allow`; `health`; persistence (snapshot, journal, MAC, `FilePersistence`, `LoadFailure`, wall-jump rules); sharing (`NodeId`, `Delta`, `Sequence`, `ImportReport`, HLC stamps, revocation records, skew bound); `metrics`; `datagram`; `docs/ARCHITECTURE.md`.
 Exit:
 - [ ] Bans survive a restart (kill tests pass on Linux, macOS, Windows).
@@ -56,7 +59,7 @@ Exit:
 - [ ] Fuzz targets `snapshot_decode`, `journal_replay`, `delta_decode`.
 
 ## v0.6.0 - Optimisation
-Items: the door under 100 ns p99 with 1,000,000 bans (moved from 0.3); table rebuild with a fresh seed at the probe bound (moved from 0.3); 8-byte keys and 32-byte slots; the benchmarks of PLAN 11 against the named competitors; prefix structure confirmed or changed (O-4); keyed hash chosen (O-8); shard `Arc` confirmed (O-5); `#[track_caller]` cost on `checkpoint` measured (0.2 defence idea); `docs/PERFORMANCE.md`.
+Items: the door under 100 ns p99 with 1,000,000 bans (moved from 0.3); T-12, p99 checkpoint under 100,000 revocations per second (moved from 0.4); table rebuild with a fresh seed at the probe bound (moved from 0.3); 8-byte keys and 32-byte slots; the benchmarks of PLAN 11 against the named competitors; prefix structure confirmed or changed (O-4); keyed hash chosen (O-8); shard `Arc` confirmed (O-5); `#[track_caller]` cost on `checkpoint` measured (0.2 defence idea); `docs/PERFORMANCE.md`.
 Exit:
 - [ ] Every target of PLAN 11 met, or the gap recorded here with a plan.
 - [ ] NFR-10 met on `door_1m` and `budget_check`; `checkpoint_fast` within 10% of an `AtomicBool` load.
@@ -92,6 +95,8 @@ Exit:
 - Challenge verdict and proof-of-work verifier; kernel-drop export; tarpit mode; ASN keys once a data source is chosen.
 
 ## Moves recorded
+- 2026-10-23: T-12 (checkpoint p99 under a revocation storm) moves from 0.4 to 0.6. Reason: it is a latency benchmark, and 0.6 is where the benchmarks run on a quiet machine; the storm's correctness (every revocation applies, the excess is reported) is tested at 0.4.
+- 2026-10-23: identity throttles (session, account) move from 0.4 to 0.5 with lane and tenant budgets, and `set_posture` with its budget halving to 0.5. Reason: each acts on budgets that land at 0.5. `Throttle` on a source works at 0.4.
 - 2026-10-23: the door's 100 ns p99 target moves from the 0.3 exit to 0.6, where it already stands as an exit. Reason: measured at 0.3 on a shared machine (PLAN 11.1), the door costs 230-360 ns per call with 1,000,000 bans and random peers. The cost is ticket issue and release (about 70 ns), hashing (about 30 ns per probe), and TLB and cache misses into a 60 MiB table. The fixes are optimisation work: 8-byte keys and 32-byte slots, the O-8 hash decision, fewer atomic operations per ticket, and measurement on a quiet machine.
 - 2026-10-23: rebuilding a ban table with a fresh seed when the probe bound is reached (part of T-9) moves to 0.6 with the O-8 hash decision (PLAN D-038). Reason: it needs a lock-free whole-table swap, and with SipHash under a random key, colliding keys can be chosen only with the key. Until then an insert past the bound fails cleanly as `BanTableFull`.
 - 2026-10-23: edge case 20 (`bind_session` twice) moves to 0.4 with the identity binds, edge cases 27 and 28 (tags after `release`) to 0.4 with `Bouncer::release`, and the strike part of T-1 to 0.4 with strikes. `BanRecord` moves to 0.5 with `list` and `explain`, its first users. Reason: each needs an item of that version.

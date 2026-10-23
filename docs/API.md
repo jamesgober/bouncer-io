@@ -18,7 +18,7 @@
 
 The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every item lists its tier, its grade, the version that brings it, and what it costs. The rustdoc on [docs.rs](https://docs.rs/bouncer-io) becomes the exhaustive reference as each item lands; until then this file is the contract.
 
-> **Status: `0.3.0` (core).** Built and tested: keys and prefixes, ban memory (bans, lifts, durations, the allow list, trusted proxies), the door, tickets with `request`, `checkpoint`, and `bind_client`, verdicts, errors, and `capacity`. Every item marked with a later version is the agreed shape, built version by version as [`../dev/ROADMAP.md`](../dev/ROADMAP.md) lists; its examples become doctests when it lands. The rustdoc of the built items has runnable examples for each.
+> **Status: `0.4.0` (extended).** Built and tested: everything of 0.3 (keys, ban memory, the door, tickets), plus in-flight revocation by every target, before-commit, identity binds, tags and the egress check, `Collected` and wipe-replace-eject, directives, strikes (observe by default), door budgets, events and the signal catalog, and maintenance. Items marked with a later version are the agreed shape, built version by version as [`../dev/ROADMAP.md`](../dev/ROADMAP.md) lists; their examples become doctests when they land.
 
 **Reading the item headers.** *Tier 1* is the simple surface (one-line constructors, no builder), *Tier 2* is configuration, *Tier 3* is the full surface for integrations and other libraries. *P0* is required for the crate's job, *P1* is what users of the best existing tools expect, *P2* is high value for serious deployments, *P3* comes after 1.0. Costs are targets, marked `[est.]` until they are measured at 0.6.
 
@@ -417,7 +417,7 @@ The single entry for decisions made elsewhere: the security signals policy, sent
 
 Rules that hold whatever the directive says: automated actors never touch allow-listed keys or trusted proxies; a directive below the Medium confidence band (under 30) cannot ban by itself (it may throttle); every applied directive is an event naming its cause.
 
-**Errors:** as [`ban`](#ban) and [`revoke`](#revoke), plus `LowConfidence`.
+**Errors:** as [`ban`](#ban) and [`revoke`](#revoke), plus `InvalidTarget` when the action does not fit the target (a lift of a connection id; at 0.4, a throttle of anything but a source). A ban directive below confidence 30 is not an error: it is applied as a throttle and `Applied::downgraded` says so.
 
 ```rust
 use bouncer_io::{Actor, Bouncer, Directive, Reason, SessionKey};
@@ -1396,6 +1396,7 @@ impl Collected {
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
     pub fn capacity(&self) -> usize;
+    pub fn limit(&self) -> usize;
     pub fn as_slice(&self) -> &[u8];
     pub fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), BouncerError>;
     pub fn spare(&mut self, want: usize) -> Result<&mut [u8], BouncerError>;
@@ -1499,7 +1500,7 @@ How bouncer closes a connection it is not holding: from `deny_and_eject`, from e
 ### `Ejected`
 
 ```rust
-#[must_use] #[non_exhaustive] #[derive(Clone, Copy, Debug)]
+#[non_exhaustive] #[derive(Clone, Copy, Debug)]
 pub struct Ejected { pub wiped: bool, pub formatted: bool, pub ejected: bool, pub remembered: bool, pub reference: Reference }
 ```
 
@@ -1542,13 +1543,13 @@ Tier 2 · P0 (`EjectNow` P1) · 0.4 · `AtCheckpoint` O(1); `EjectNow` adds a sw
 ### `Revocation`
 
 ```rust
-#[must_use] #[non_exhaustive] #[derive(Clone, Copy, Debug)]
+#[non_exhaustive] #[derive(Clone, Copy, Debug)]
 pub struct Revocation { pub epoch: u64, pub reference: Reference, pub matched_live: Option<u32> }
 ```
 
 Tier 1 · P0 · 0.4
 
-The receipt. `epoch` is the epoch value that carries this revocation; `matched_live` is filled by eject-now sweeps.
+The receipt. `epoch` is the epoch value that carries this revocation; `matched_live` is filled by an eject-now sweep run inline (no maintainer thread); with a maintainer thread the sweep runs there and it is `None`. Receipts, like `Applied` and `Lifted`, are not `#[must_use]`: `bouncer.revoke(session, Reason::LOGOUT)?;` reads without noise (decision D-045).
 
 ### `RevocationEpoch`
 
@@ -1619,7 +1620,7 @@ pub struct LiftSpec { pub key: BanKey, pub actor: Actor, pub reason: Reason }
 impl LiftSpec { pub fn key(key: impl Into<BanKey>) -> LiftSpec; pub fn by(self, actor: Actor) -> LiftSpec; pub fn because(self, reason: Reason) -> LiftSpec; }
 impl From<IpAddr> for LiftSpec; impl From<Cidr> for LiftSpec; impl From<BanKey> for LiftSpec;
 
-#[must_use] #[non_exhaustive] #[derive(Clone, Copy, Debug)]
+#[non_exhaustive] #[derive(Clone, Copy, Debug)]
 pub struct Lifted { pub removed: u32, pub tombstone: BanId }
 ```
 
@@ -1868,8 +1869,8 @@ let evidence = Evidence::new(&PAIRS);
 ### `Applied`
 
 ```rust
-#[must_use] #[non_exhaustive] #[derive(Clone, Copy, Debug)]
-pub struct Applied { pub ban: Option<BanId>, pub revocation: Option<Revocation>, pub lifted: Option<Lifted>, pub throttled: bool, pub downgraded: bool }
+#[non_exhaustive] #[derive(Clone, Copy, Debug, Default)]
+pub struct Applied { pub ban: Option<BanId>, pub bans: u32, pub revocation: Option<Revocation>, pub lifted: Option<Lifted>, pub throttled: bool, pub downgraded: bool }
 ```
 
 Tier 2 · P0 · 0.4
@@ -1897,7 +1898,7 @@ What each layer reports: the transport (handshake, PROXY, slow peer), the TLS ad
 ### `StrikeOutcome`
 
 ```rust
-#[must_use] #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StrikeOutcome {
     Counted,
     ThresholdObserved { would_ban: BanKey },
@@ -1906,7 +1907,7 @@ pub enum StrikeOutcome {
     Ignored(IgnoredBecause),
 }
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IgnoredBecause { TrustedProxy, AllowListed, UnverifiedSource, PendingClient }
+pub enum IgnoredBecause { TrustedProxy, AllowListed, UnverifiedSource, PendingClient, Released, CounterTableFull }
 ```
 
 Tier 1 · P0 · 0.4
@@ -1982,7 +1983,9 @@ impl Budgets {
     pub fn tenant_in_flight(self, default: u32) -> Budgets;
     pub fn capacity(self, keys: u32) -> Budgets;
 }
-impl Default for Budgets;   // door: 20/s burst 40 and 64 concurrent per address; 200/s and 512 concurrent per /24 or /64
+impl Default for Budgets;   // door: 20/s burst 40 and 64 concurrent per client; 200/s and 512 concurrent per prefix
+// A client is an IPv4 address or an IPv6 /64 (one host controls its /64); its prefix is the IPv4 /24 or IPv6 /48.
+// Lane and tenant budgets arrive at 0.5.
 ```
 
 Tier 2 · P1 (lanes and tenants P2) · 0.4 / 0.5 · door share 20-30 ns [est.]
@@ -2024,6 +2027,8 @@ impl Rate {
     pub const fn per_minute(limit: u32) -> Rate;
     pub fn new(limit: u32, period: Duration) -> Result<Rate, BouncerError>;
     pub const fn burst(self, burst: u32) -> Rate;   // default: equal to the limit
+    pub const fn limit(&self) -> u32;
+    pub const fn burst_size(&self) -> u32;
 }
 ```
 
@@ -2335,7 +2340,7 @@ Monotonic. In-process expiry uses only this, so stepping the wall clock never sh
 ### `MaintenanceReport`
 
 ```rust
-#[must_use] #[non_exhaustive] #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive] #[derive(Clone, Copy, Debug, Default)]
 pub struct MaintenanceReport { pub swept: u32, pub ejected: u32, pub idle_checked: u32, pub reclaimed: u32, pub journal_written: u32, pub next_due: Option<Now> }
 ```
 
@@ -2410,7 +2415,7 @@ Tier 3 · P0 · 0.8
 | `Gate::closed(ticket, info, reason)`, exactly once | releases the connection ticket (its live requests are revoked with `CONNECTION_CLOSED`, its concurrency slot returned); close reasons that mean misbehaviour (`SlowPeer`, `ProxyInvalid`, `ProxyUntrusted`, `TlsFailed`, `HelloRefused`) become strikes |
 | `ServerHandle::kill(id, reason)` | used by `NetIoEjector`, so eject-now sweeps and idle checks can close connections bouncer holds only by id |
 
-The protocol engine reads the connection's tag from `ConnectionInfo` and opens request tickets with [`Bouncer::request`](#request); it passes a request's [`tag`](#tickettag-and-into_tag) to `Output::begin_response` so the egress check judges that request, which matters on multiplexed connections (HTTP/2, or a trusted proxy pooling many clients over one connection).
+The protocol engine reads the connection's tag from `ConnectionInfo` and opens request tickets with [`Bouncer::request`](#request); it passes a request's [`tag`](#tickettag-and-into_tag) to `Output::begin_tagged_response` so the egress check judges that request, which matters on multiplexed connections (HTTP/2, or a trusted proxy pooling many clients over one connection).
 
 ---
 
@@ -2429,7 +2434,6 @@ pub enum BouncerError {
     AllowListed { key: BanKey },
     TrustedProxyTarget,
     PermanentNotAllowed,
-    LowConfidence { confidence: u8 },
     InvalidDuration,
     NotFound,
     NotAConnectionTicket,
@@ -2461,7 +2465,6 @@ Every message says what to do, and none prints key bytes.
 | `AllowListed` | `ban`, `revoke`, `apply` | remove the allow entry first |
 | `TrustedProxyTarget` | `ban`, `revoke`, `apply` | target the real client |
 | `PermanentNotAllowed` | `ban`, `apply` | use a timed ban, or act as an administrator |
-| `LowConfidence` | `apply` | raise confidence with more signals; the directive was applied as a throttle |
 | `InvalidDuration` | `ban`, `apply` | use a duration above zero |
 | `NotFound` | `lift` | nothing to lift; `explain` shows covering prefix bans |
 | `NotAConnectionTicket` | `request` | issue requests from the connection ticket |
