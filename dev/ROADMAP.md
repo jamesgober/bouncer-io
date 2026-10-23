@@ -17,7 +17,8 @@ Exit: James approves `docs/API.md`; net-io's plan references the same hook shape
 - [x] net-io hook shape proposed for net-io's 0.2 (D-015).
 - [x] README: Tier 1 example, `&mdash;` entities removed; DIRECTIVES aligned.
 - [ ] James's approval of the API.
-- [ ] net-io's 0.2 confirms the close notice, the per-response gate tag, and kill by id (or the gap is recorded here with its reason).
+- [x] Hook shape agreed with net-io's 0.2: the `Gate` trait (D-015, 2026-10-23).
+- [ ] net-io confirms the two additions (`GateTag` in `Admitted` and `ConnectionInfo`; `WriteCheck.response`), or the gap is recorded here with its reason.
 - [ ] Release: version 0.2.0, CHANGELOG, `docs/release/v0.2.0.md`, CI, tag, GitHub release, publish (O-16).
 
 ## v0.3.0 - Core: keys, ban memory, the door, tickets, the epoch
@@ -70,7 +71,7 @@ Exit:
 
 ## v0.8.0 - Alpha
 Needs a published net-io 0.3 or later.
-Items: feature `net-io` (`Admission`, `Egress`, conversions, `NetIoEjector`); serve-net running with bouncer on Windows and WSL; the replay harness (scanner, slowloris, credential stuffing from a /48, CGNAT population).
+Items: feature `net-io` (`Gate` for `Bouncer`, `ConnectionGate`, conversions, `NetIoEjector`); serve-net running with bouncer on Windows and WSL; the replay harness (scanner, slowloris, credential stuffing from a /48, CGNAT population).
 Exit:
 - [ ] A browser on localhost banned by an admin call is refused at the door.
 - [ ] A logged-in browser whose session is revoked mid-request gets the generic denial and its connection is closed.

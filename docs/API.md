@@ -108,7 +108,7 @@ Rate and concurrency budgets are one tool inside the door. They are not the purp
 | B4 between stages | the pipeline, between every pair of stages | [`Ticket::checkpoint`](#ticketcheckpoint) | one atomic load and compare |
 | B5 before commit | a handler, right before a database commit | [`Ticket::before_commit`](#ticketbefore_commit) | one sequentially consistent load |
 | B6a pipeline egress | the response pipeline before encoding | [`Ticket::checkpoint`](#ticketcheckpoint) | one atomic load and compare |
-| B6b transport egress | the transport before every socket write | [`Bouncer::egress`](#egress) or the [net-io hook](#net-io-integration) | two atomic loads [est. under 3 ns] |
+| B6b transport egress | the transport before every socket write | the [net-io gate](#net-io-integration) (one atomic load) or [`Bouncer::egress`](#egress) by tag (two loads) | under 3 ns [est.] |
 
 B6b is enforced by the transport itself, so a pipeline that forgets every other checkpoint still cannot send a byte for a revoked connection.
 
@@ -2376,28 +2376,31 @@ Tier 2 · P1 · 0.5 · counters are per shard, relaxed, on the shard's own cache
 
 ## net-io integration
 
-Feature `net-io`, version 0.8 (needs a published net-io 0.3 or later). net-io defines the hooks and calls them; bouncer implements them; net-io never depends on bouncer. The shapes are agreed in both crates' 0.2 design locks.
+Feature `net-io`, version 0.8 (needs a published net-io 0.3 or later). net-io defines the `Gate` trait and calls it; bouncer implements it; net-io never depends on bouncer. The shape below is agreed with net-io's 0.2 design lock (decision D-015).
 
 ```rust
-#[cfg(feature = "net-io")] impl net_io::Admission for Bouncer;
-#[cfg(feature = "net-io")] impl net_io::Egress for Bouncer;
+#[cfg(feature = "net-io")] impl net_io::Gate for Bouncer { type Ticket = ConnectionGate; }
+#[cfg(feature = "net-io")] pub struct ConnectionGate { /* the connection Ticket, with its last-seen epoch */ }
+#[cfg(feature = "net-io")] impl ConnectionGate { pub fn ticket(&mut self) -> &mut Ticket; }
 #[cfg(feature = "net-io")] impl From<net_io::ConnectionId> for ConnId;
 #[cfg(feature = "net-io")] impl From<TicketTag> for net_io::GateTag;
 #[cfg(feature = "net-io")] impl From<net_io::GateTag> for TicketTag;
 #[cfg(feature = "net-io")] impl From<net_io::Cidr> for Cidr;
-#[cfg(feature = "net-io")] pub struct NetIoEjector { /* over net-io's kill handles */ }
+#[cfg(feature = "net-io")] pub struct NetIoEjector { /* holds a net_io::ServerHandle */ }
+#[cfg(feature = "net-io")] impl Ejector for NetIoEjector;
 ```
 
 Tier 3 · P0 · 0.8
 
 | net-io calls | bouncer does |
 |---|---|
-| `Admission::admit(info, Accept)` | `door_at` with net-io's id and accept time; `Admit { lane: info.lane, gate }` where `gate` is the connection ticket's tag, or a silent `Refuse` (abortive close, identical for every reason) |
-| `Admission::admit(info, RealPeer)` | `bind_client` on the ticket named by `info.gate`, with `Provenance::ProxyProtocol` |
-| the connection's close notice | `release(gate)`, exactly once |
-| `Egress::check(cx)` before every write | `egress` on the response's tag when the session set one, else on `cx.gate`; `Deny { code }` carries the `DenialCode` as a number; net-io wipes its pending output, writes the protocol's denial only if nothing of the response has left, and closes with `SO_LINGER` 0 |
+| `Gate::admit(info, Accept)` | `door_at` with net-io's id and accept time; `Ok(Admitted { lane: info.lane, ticket, tag })`, where `ticket` is the connection's `ConnectionGate` and `tag` its `TicketTag`; or `Err(Refusal::Reset { .. })`, silent and identical for every reason |
+| `Gate::readmit(ticket, info)` after a trusted PROXY header | `bind_client` on the connection ticket with `Provenance::ProxyProtocol` |
+| `Gate::check(ticket, write)` before every write | the egress check with the ticket in hand: one atomic load while nothing is revoked (the last-seen epoch lives in the ticket). When the session set a response tag (`write.response`), that request is judged; otherwise the connection and its latest request. `Err(Denial { code })` carries the `DenialCode` as a number (1 `Unavailable`, 2 `NotFound`, 3 `TooManyRequests`, 4 `Unauthorized`, 5 `Forbidden`); net-io wipes its pending output, has the session format the denial only if nothing of the response has left, and closes with `SO_LINGER` 0 |
+| `Gate::closed(ticket, info, reason)`, exactly once | releases the connection ticket (its live requests are revoked with `CONNECTION_CLOSED`, its concurrency slot returned); close reasons that mean misbehaviour (`SlowPeer`, `ProxyInvalid`, `ProxyUntrusted`, `TlsFailed`, `HelloRefused`) become strikes |
+| `ServerHandle::kill(id, reason)` | used by `NetIoEjector`, so eject-now sweeps and idle checks can close connections bouncer holds only by id |
 
-The agreed shape, and the two additions bouncer asks of net-io's 0.2 (a close notice to the admission hook, and a per-response gate tag in the egress context so multiplexed connections are judged per request), are recorded in [`../dev/PLAN.md`](../dev/PLAN.md) decision D-015.
+The protocol engine reads the connection's tag from `ConnectionInfo` and opens request tickets with [`Bouncer::request`](#request); it passes a request's [`tag`](#tickettag-and-into_tag) to `Output::begin_response` so the egress check judges that request, which matters on multiplexed connections (HTTP/2, or a trusted proxy pooling many clients over one connection).
 
 ---
 
