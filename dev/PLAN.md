@@ -4,7 +4,7 @@
 >
 > **Read order:** [`../REPS.md`](../REPS.md) &rarr; [`DIRECTIVES.md`](./DIRECTIVES.md) &rarr; **this file** &rarr; [`ROADMAP.md`](./ROADMAP.md) &rarr; [`../docs/API.md`](../docs/API.md).
 >
-> **Status:** `0.3.0` core: keys, ban memory, the door, tickets, and the epoch are built. Design lock was `0.2.0`. Rewritten on 2026-10-22 from the crate's full specification; where the 2026-10-13 plan differed, the specification won and the change is in the decision log (D-009 onward).
+> **Status:** `0.4.0` extended: in-flight revocation, wipe-replace-eject, strikes, door budgets, events, and maintenance are built on the 0.3 core. Design lock was `0.2.0`. Rewritten on 2026-10-22 from the crate's full specification; where the 2026-10-13 plan differed, the specification won and the change is in the decision log (D-009 onward).
 
 ---
 
@@ -804,10 +804,10 @@ Every decision from the specification is answered below (and logged in section 1
 |---|---|---|---|
 | O-1 | How bouncer uses rate-net and better-bucket | rate-net `Gcra` and better-bucket `BucketCore` with default features off, inside bouncer's own bounded keyed table; revisit when rate-net's keyed store drops `ahash` and `hashbrown` | decided (D-019) |
 | O-2 | Who owns the epoch word | bouncer by default, injectable with `BouncerBuilder::epoch` | decided (D-020) |
-| O-3 | Wipe under `forbid(unsafe_code)` | crypt-io 1.2 adds a public `wipe(&mut [u8])` over its existing volatile-write helper | decided (D-021); **needs a crypt-io 1.2 release before bouncer 0.4** |
+| O-3 | Wipe under `forbid(unsafe_code)` | crypt-io 1.2 adds a public `wipe(&mut [u8])` over its existing volatile-write helper | decided (D-021); crypt-io 1.2.0 published 2026-10-23 and used by 0.4 |
 | O-4 | Prefix lookup structure | hash per length in use for the dynamic table; compiled Poptrie-style set for admin lists and the allow list; confirm at 0.6 | decided (D-022) |
 | O-5 | Per-shard `Arc` or `&Bouncer` per call | per-shard `Arc` (shard holds the shared state, no cycle); measure at 0.6 | decided (D-023) |
-| O-6 | net-io hook shape | net-io's `Gate` trait with an associated ticket, agreed 2026-10-23; two small additions asked (7.16) | decided (D-015); **net-io's 0.2 to confirm the `GateTag` and per-response tag** |
+| O-6 | net-io hook shape | net-io's `Gate` trait with an associated ticket and the two additions, agreed with net-io 2026-10-23 | decided (D-015, D-055) |
 | O-7 | Sharing across nodes | transport-agnostic mergeable deltas with HLC stamps, including revocations; gossip or a replicated log is the node core's choice | decided (D-017) |
 | O-8 | Keyed hash | in-house keyed multiply-mix for fixed-size keys with probe bound and reseed if the T-9 test passes, else SipHash; API-neutral | decided at 0.6 by test (D-024) |
 | O-9 | Snapshot integrity | keyed BLAKE3 MAC through crypt-io when a key is configured, CRC32C always | decided (D-018) |
@@ -877,4 +877,16 @@ Every decision from the specification is answered below (and logged in section 1
 | D-042 | 2026-10-23 | If a ban slot on the probe path is being rewritten for longer than the spin bound, the door refuses with `Refusal::Banned` and a reference of zero | fail closed; a writer holds a slot for a handful of stores, so this happens only if the writer thread is descheduled mid-write |
 | D-043 | 2026-10-23 | `BanRecord.actor` is an `ActorKind`; the full `Actor` (with its id) goes to events | compact records: the ban entry keeps four bits for the actor |
 | D-044 | 2026-10-23 | A ticket that revokes itself (its own failed `bind_client`, or finding its connection gone) forces its own slow path from then on | such a revocation does not move the epoch, so the fast path alone would have passed it |
+| D-045 | 2026-10-23 | `#[must_use]` stays on `Verdict` and `Ticket` only; receipts (`Revocation`, `Applied`, `Lifted`, `Ejected`, `StrikeOutcome`, `MaintenanceReport`) drop it | ignoring a verdict is the bug this crate prevents; ignoring a receipt is not, and with the attribute the Tier 1 line `bouncer.revoke(session, Reason::LOGOUT)?;` warned |
+| D-046 | 2026-10-23 | A ban directive below confidence 30 is applied as a throttle and reported in `Applied::downgraded` instead of failing with `LowConfidence` (the variant is removed) | the caller still gets a defence and a clear record; an error would drop the signal entirely |
+| D-047 | 2026-10-23 | A revocation's birth is taken and the epoch moved under the revocation writer lock | with births taken outside the lock, two concurrent revokers could share a birth and cleanup could remove an entry a ticket had not checked yet |
+| D-048 | 2026-10-23 | Idle tickets are found by sampling (epoch, time) at each maintenance run: a live ticket whose last check is at or before an epoch sampled `max_unchecked` ago is checked on its behalf | cells have no room for a time stamp; the samples cost one small queue per bouncer |
+| D-049 | 2026-10-23 | Strike counters, door budget cells, and throttles live in a lock-free claim table keyed by a 64-bit keyed hash (no stored key); a slot is taken over only when its payload is idle (an expired window, a recovered budget with no connections) | the strike and door paths stay lock-free and allocation-free; a 64-bit keyed hash makes a counting collision negligible, and the action uses the ticket's real keys |
+| D-050 | 2026-10-23 | Door budgets key an IPv4 client at /32 with its /24 prefix, and an IPv6 client at /64 with its /48 prefix | FR-4 (one host controls its /64); the spec's "/24 or /64" prefix line conflicted with FR-4 for IPv6 |
+| D-051 | 2026-10-23 | A request revoked by a session, account, tenant, or fingerprint revocation takes its connection with it unless the revocation keeps it; a request revoked with `keep_connection` carries a flag so `deny_and_eject` formats the denial without ejecting | James's intent is "eject the connection"; administrators can end one request on a multiplexed connection |
+| D-052 | 2026-10-23 | Throttle directives take source targets only at 0.4; identity throttles arrive with lane and tenant budgets at 0.5 (`InvalidTarget` meanwhile) | an identity throttle needs the identity budgets to act on |
+| D-053 | 2026-10-23 | `Posture` exists as a type from 0.4 (`Enforcement::mode` takes it); `set_posture` and its effects arrive at 0.5 | the enforcement API is final now; the posture switch belongs with the rest of 0.5 |
+| D-054 | 2026-10-23 | The revocation rate limit reports a storm but still applies every revocation | revocations are security actions; dropping some to save checkpoint time would let an attacker hide in the storm |
+| D-055 | 2026-10-23 | The net-io hook is net-io's `Gate` trait with the two additions agreed by net-io (D-018, D-051 there): `GateTag` in `Admitted` and `ConnectionInfo`, `Output::begin_tagged_response` and `WriteCheck::response` | confirmed by the net-io session; closes O-6 |
+| D-056 | 2026-10-23 | `Collected` keeps a zero-initialized fixed block and a length instead of a `Vec`'s spare capacity | in-place writes (`spare`) need initialized memory without `unsafe`; growth stays allocate, copy, wipe |
 | D-035 | 2026-10-22 | Posture: `strict_budget_divisor` (default 2) and `strict_revokes_unauthenticated` replace the spec's "refuses guests on admin listeners" | listeners are the transport's concept; net-io already refuses listeners not marked for lockdown |

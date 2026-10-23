@@ -75,7 +75,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Loom (free list L-2, sequence-locked slot L-3)
+      - name: Loom models L-1 to L-6
         run: cargo test --lib --release loom_
         env:
           RUSTFLAGS: "--cfg bouncer_loom -D warnings"
@@ -98,5 +98,10 @@ jobs:
       - name: Run cidr_parse for 60 seconds
         working-directory: fuzz
         run: cargo fuzz run --target x86_64-unknown-linux-gnu cidr_parse -- -max_total_time=60
+        env:
+          RUSTFLAGS: ""
+      - name: Run directive_sequence for 60 seconds
+        working-directory: fuzz
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu directive_sequence -- -max_total_time=60
         env:
           RUSTFLAGS: ""

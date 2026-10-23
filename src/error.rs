@@ -71,6 +71,29 @@ pub enum BouncerError {
     InvalidTarget,
     /// The connection is revoked. Deny and eject the request.
     Revoked,
+    /// The tag names a ticket that was released, or another bouncer's.
+    /// Treat the connection as closed.
+    Stale,
+    /// The revocation table is full. The revocation still reached every live
+    /// matching ticket through a direct sweep; check that maintenance runs
+    /// and raise `revocation_capacity`.
+    RevocationTableFull {
+        /// The configured revocation capacity.
+        capacity: u32,
+    },
+    /// The operating system refused to start the maintainer thread. Call
+    /// `Bouncer::maintain` yourself instead.
+    Spawn(std::io::ErrorKind),
+    /// A `Collected` buffer would pass its limit. Raise the limit, or stream
+    /// the response.
+    CollectedFull {
+        /// The buffer's limit.
+        capacity: usize,
+        /// The size the write needed.
+        needed: usize,
+    },
+    /// `Collected::commit` claimed more bytes than `spare` gave.
+    InvalidCommit,
     /// A configuration value out of range.
     Config(ConfigError),
 }
@@ -136,6 +159,20 @@ impl fmt::Display for BouncerError {
                 "the action does not fit this target (automation bans a fingerprint only within a prefix)"
             ),
             Self::Revoked => write!(f, "the connection is revoked: deny and eject the request"),
+            Self::Stale => write!(f, "the ticket was released: treat the connection as closed"),
+            Self::RevocationTableFull { capacity } => write!(
+                f,
+                "revocation table full ({capacity} entries): the revocation still reached live tickets; check maintenance runs and raise `revocation_capacity`"
+            ),
+            Self::CollectedFull { capacity, needed } => write!(
+                f,
+                "response buffer full ({needed} bytes needed, limit {capacity}): raise the limit or stream the response"
+            ),
+            Self::InvalidCommit => write!(f, "commit at most what `spare` gave"),
+            Self::Spawn(kind) => write!(
+                f,
+                "could not start the maintainer thread ({kind:?}): call `maintain` yourself"
+            ),
             Self::Config(err) => write!(f, "{err}"),
         }
     }
@@ -205,6 +242,8 @@ pub enum ConfigProblem {
     InvalidFactor,
     /// More allow-list entries than the limit.
     AllowListTooLarge,
+    /// A denial message longer than 256 bytes.
+    MessageTooLong,
 }
 
 impl fmt::Display for ConfigError {
@@ -226,6 +265,9 @@ impl fmt::Display for ConfigError {
                 "`{field}` needs durations above zero and a maximum at or above the base"
             ),
             ConfigProblem::InvalidFactor => write!(f, "`{field}` needs a factor of at least 1"),
+            ConfigProblem::MessageTooLong => {
+                write!(f, "`{field}` has a message longer than 256 bytes")
+            }
             ConfigProblem::AllowListTooLarge => write!(
                 f,
                 "`{field}` has more than {} entries",

@@ -252,7 +252,6 @@ impl From<BanKey> for LiftSpec {
 }
 
 /// What a lift removed.
-#[must_use]
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lifted {
@@ -665,12 +664,24 @@ impl BanMemory {
         Ok(())
     }
 
-    /// Adds a ban.
+    /// Adds a ban with the bouncer's duration policy.
+    #[cfg(all(test, not(bouncer_loom)))]
     pub(crate) fn ban(
         &self,
         spec: &BanSpec,
         guards: &Guards<'_>,
         now: Now,
+    ) -> Result<BanId, BouncerError> {
+        self.ban_with(spec, guards, now, None)
+    }
+
+    /// Adds a ban; `policy` overrides the duration policy (per strike kind).
+    pub(crate) fn ban_with(
+        &self,
+        spec: &BanSpec,
+        guards: &Guards<'_>,
+        now: Now,
+        policy: Option<DurationPolicy>,
     ) -> Result<BanId, BouncerError> {
         let key = spec.key.normalized();
         self.guard(&key, guards)?;
@@ -697,7 +708,9 @@ impl BanMemory {
             BanDuration::Permanent => 0,
             BanDuration::Fixed(d) => end(now_secs, ceil_secs(d)),
             BanDuration::Policy => {
-                let secs = self.policy.seconds(previous.unwrap_or(0), &mut w.rng);
+                let secs = policy
+                    .unwrap_or(self.policy)
+                    .seconds(previous.unwrap_or(0), &mut w.rng);
                 end(now_secs, secs.max(1))
             }
         };
@@ -966,12 +979,59 @@ impl BanMemory {
     }
 
     /// Lookup of one table key, for identity checks.
-    #[allow(dead_code)] // identity binds arrive in 0.4
     pub(crate) fn lookup_key(&self, key: &TableKey, now_secs: u64) -> Probe {
         if self.present_ident.load(Ordering::Acquire) & (1u64 << (key.kind & 63)) == 0 {
             return Probe::Miss;
         }
         self.table.find(key, now_secs)
+    }
+
+    /// Bind-side check of a fingerprint: a bare fingerprint ban, or a ban of
+    /// the fingerprint within any automatic prefix of `source`.
+    pub(crate) fn lookup_fingerprint(
+        &self,
+        fp: &crate::keys::FingerprintKey,
+        source: Option<IpAddr>,
+        now_secs: u64,
+    ) -> Probe {
+        let (k0, k1) = fp.words();
+        let bare = TableKey {
+            kind: table::KIND_FINGERPRINT,
+            len: 0,
+            k0,
+            k1,
+        };
+        let mut busy = false;
+        match self.lookup_key(&bare, now_secs) {
+            Probe::Hit(e) => return Probe::Hit(e),
+            Probe::Busy => busy = true,
+            Probe::Miss => {}
+        }
+        if let Some(src) = source {
+            if self.present_ident.load(Ordering::Acquire) & (1u64 << table::KIND_FINGERPRINT_IN)
+                != 0
+            {
+                let host = Cidr::host(src);
+                let lengths: Vec<u8> = match host.family() {
+                    Family::V4 => (0..=32u8)
+                        .filter(|&l| self.is_auto(Family::V4, l))
+                        .collect(),
+                    Family::V6 => (0..=128u8)
+                        .filter(|&l| self.is_auto(Family::V6, l))
+                        .collect(),
+                };
+                for len in lengths {
+                    if let Some(p) = host.parent(len) {
+                        match self.table.find(&self.fingerprint_in_key(fp, &p), now_secs) {
+                            Probe::Hit(e) => return Probe::Hit(e),
+                            Probe::Busy => busy = true,
+                            Probe::Miss => {}
+                        }
+                    }
+                }
+            }
+        }
+        if busy { Probe::Busy } else { Probe::Miss }
     }
 
     /// Runs `f` on the current administrator set through the per-thread

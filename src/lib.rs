@@ -50,12 +50,22 @@
 mod allow;
 mod bans;
 mod bouncer;
+mod budgets;
+mod claims;
+mod collected;
 mod directive;
 mod door;
 mod error;
+mod events;
+mod format;
 mod hash;
 mod keys;
+#[cfg(all(test, bouncer_loom))]
+mod loom_models;
+mod maintain;
 mod registry;
+mod revoke;
+mod strikes;
 mod sync;
 mod ticket;
 mod time;
@@ -65,16 +75,25 @@ pub use crate::{
     allow::{AllowKind, AllowList},
     bans::{BanDuration, BanId, BanSpec, DurationPolicy, LiftSpec, Lifted},
     bouncer::{Bouncer, BouncerBuilder, Capacity},
-    directive::{Actor, ActorKind, Evidence, EvidenceValue, Reason},
+    budgets::{Budgets, Rate},
+    collected::Collected,
+    directive::{
+        Action, Actor, ActorKind, Applied, BanKeys, Directive, Evidence, EvidenceValue, Reason,
+    },
     door::{Provenance, Refusal},
     error::{BouncerError, ConfigError, ConfigProblem},
+    events::{Category, Event, EventSink, GENERATOR, NoSink, SignalId, Subject, signals},
+    format::{DenialFormat, Ejected, FormatError, NoFormat},
     keys::{
         AccountKey, BanKey, Cidr, ConnId, Family, FingerprintKey, RequestId, SessionKey, TenantKey,
         normalize, prefix_of,
     },
+    maintain::{CloseKind, Ejector, MaintenanceReport},
+    revoke::{Revocation, RevocationEpoch, RevokeMode, Target},
+    strikes::{Enforcement, IgnoredBecause, Mode, Posture, StrikeKind, StrikeOutcome, StrikeRules},
     ticket::{Ticket, TicketId, TicketKind, TicketTag},
     time::Now,
-    verdict::{Denial, DenialCode, Reference, Verdict},
+    verdict::{Denial, DenialCode, DenialTable, Reference, Verdict},
 };
 
 /// Crate version string, populated by Cargo at build time.
@@ -86,11 +105,17 @@ pub const DEFAULT_TICKETS: u32 = 65_536;
 /// Default dynamic ban table capacity, in entries.
 pub const DEFAULT_BAN_CAPACITY: u32 = 1_048_576;
 
+/// Default revocation table capacity, in entries.
+pub const DEFAULT_REVOCATION_CAPACITY: u32 = 65_536;
+
 /// Default automatic ban lengths for IPv4.
 pub const DEFAULT_IPV4_LENGTHS: &[u8] = &[32, 24];
 
 /// Default automatic ban lengths for IPv6: never /128, one host owns its /64.
 pub const DEFAULT_IPV6_LENGTHS: &[u8] = &[64, 56, 48];
+
+/// Most bytes a denial formatter may write.
+pub const MAX_DENIAL_BYTES: usize = 1024;
 
 /// Most bytes of evidence kept per event.
 pub const MAX_EVIDENCE_BYTES: usize = 256;

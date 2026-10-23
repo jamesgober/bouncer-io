@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "bouncer-io"
-version = "0.3.0"
+version = "0.4.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -55,6 +55,12 @@ default = []
 [dependencies]
 # Monotonic and wall time, mockable in tests (first-party).
 clock-lib = "1.1"
+# GCRA rate math for door budgets (first-party). Default features off: its
+# `std` feature pulls ahash and hashbrown.
+rate-net = { version = "2.0", default-features = false }
+# Guaranteed (volatile) wipe of response buffers: the audited-cryptography
+# exception. Only the features bouncer uses.
+crypt-io = { version = "1.2", default-features = false, features = ["zeroize", "mac-blake3"] }
 
 
 # DEV DEPENDENCIES

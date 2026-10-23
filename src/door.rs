@@ -138,6 +138,7 @@ impl Provenance {
 pub(crate) enum Judgement {
     Admit {
         immune: bool,
+        exempt: bool,
     },
     /// The peer is a trusted proxy: admit the hop, judge the client later.
     ProxyHop,
@@ -160,11 +161,18 @@ impl Shared {
                 })
             };
         }
-        if allow::lookup(&self.allow, peer) == Some(AllowKind::Immune) {
-            return Judgement::Admit { immune: true };
+        let allowed = allow::lookup(&self.allow, peer);
+        if allowed == Some(AllowKind::Immune) {
+            return Judgement::Admit {
+                immune: true,
+                exempt: true,
+            };
         }
         match self.bans.lookup_addr(peer, now.secs()) {
-            Lookup::Clear => Judgement::Admit { immune: false },
+            Lookup::Clear => Judgement::Admit {
+                immune: false,
+                exempt: allowed == Some(AllowKind::ExemptBudgets),
+            },
             Lookup::Banned(id) => Judgement::Refuse(Refusal::Banned {
                 reference: self.reference(id),
             }),

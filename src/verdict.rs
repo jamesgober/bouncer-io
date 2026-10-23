@@ -82,6 +82,7 @@ pub struct Denial {
 }
 
 impl Denial {
+    #[cfg(test)]
     pub(crate) const fn new(code: DenialCode, reference: Reference) -> Denial {
         Denial {
             code,
@@ -187,6 +188,87 @@ impl Reference {
 impl fmt::Display for Reference {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:016x}", self.0)
+    }
+}
+
+/// The fixed message and application code per denial code, set at build so a
+/// denial can never carry text made from the request.
+///
+/// # Examples
+///
+/// ```
+/// use bouncer_io::{Bouncer, DenialCode, DenialTable};
+/// let bouncer = Bouncer::builder()
+///     .denials(DenialTable::new().message(DenialCode::Forbidden, "Request refused.").app_code(DenialCode::Forbidden, 4031))
+///     .try_build()?;
+/// # let _ = bouncer;
+/// # Ok::<(), bouncer_io::BouncerError>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenialTable {
+    entries: [(&'static str, u16); 5],
+}
+
+impl Default for DenialTable {
+    /// Plain messages: "Service unavailable.", "Not found.", "Too many
+    /// requests.", "Unauthorized.", "Forbidden."; application code 0.
+    fn default() -> Self {
+        DenialTable {
+            entries: [
+                (DenialCode::Unavailable.default_message(), 0),
+                (DenialCode::NotFound.default_message(), 0),
+                (DenialCode::TooManyRequests.default_message(), 0),
+                (DenialCode::Unauthorized.default_message(), 0),
+                (DenialCode::Forbidden.default_message(), 0),
+            ],
+        }
+    }
+}
+
+impl DenialTable {
+    /// The default table.
+    #[must_use]
+    pub fn new() -> DenialTable {
+        DenialTable::default()
+    }
+
+    /// The message for one code (at most 256 bytes, checked at build).
+    #[must_use]
+    pub fn message(mut self, code: DenialCode, message: &'static str) -> DenialTable {
+        self.entries[Self::slot(code)].0 = message;
+        self
+    }
+
+    /// The application code for one code.
+    #[must_use]
+    pub fn app_code(mut self, code: DenialCode, app_code: u16) -> DenialTable {
+        self.entries[Self::slot(code)].1 = app_code;
+        self
+    }
+
+    fn slot(code: DenialCode) -> usize {
+        usize::from(code.number() - 1)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), crate::error::ConfigError> {
+        if self.entries.iter().any(|(m, _)| m.len() > 256) {
+            return Err(crate::error::ConfigError::new(
+                "denials",
+                crate::error::ConfigProblem::MessageTooLong,
+            ));
+        }
+        Ok(())
+    }
+
+    /// The denial for a code and reference.
+    pub(crate) fn denial(&self, code: DenialCode, reference: Reference) -> Denial {
+        let (message, app_code) = self.entries[Self::slot(code)];
+        Denial {
+            code,
+            app_code,
+            message,
+            reference,
+        }
     }
 }
 

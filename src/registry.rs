@@ -12,29 +12,7 @@ use crate::sync::{AtomicU32, AtomicU64, Ordering};
 /// "No index": the end of a free-list chain, and "no parent".
 pub(crate) const NIL: u32 = u32::MAX;
 
-/// The epoch every checkpoint reads, alone on its cache line.
-#[repr(align(64))]
-pub(crate) struct Epoch {
-    value: AtomicU64,
-}
-
-impl Epoch {
-    pub(crate) fn new() -> Self {
-        Epoch {
-            value: AtomicU64::new(0),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn load(&self) -> u64 {
-        self.value.load(Ordering::Acquire)
-    }
-
-    /// Moves the epoch so every live ticket re-checks at its next checkpoint.
-    pub(crate) fn bump(&self) -> u64 {
-        self.value.fetch_add(1, Ordering::Release) + 1
-    }
-}
+pub(crate) use crate::revoke::RevocationEpoch as Epoch;
 
 /// Ticket kinds, in the low byte of the state word.
 pub(crate) const KIND_CONNECTION: u64 = 1;
@@ -43,10 +21,17 @@ pub(crate) const KIND_REQUEST: u64 = 2;
 /// Cell flags, bits 16..32 of the state word.
 pub(crate) const F_LIVE: u64 = 1 << 16;
 pub(crate) const F_REVOKED: u64 = 1 << 17;
+pub(crate) const F_CANCELLED: u64 = 1 << 18;
 pub(crate) const F_PENDING_CLIENT: u64 = 1 << 19;
 pub(crate) const F_PROXY_HOP: u64 = 1 << 20;
 pub(crate) const F_IMMUNE: u64 = 1 << 21;
 pub(crate) const F_CLIENT_BOUND: u64 = 1 << 22;
+/// The connection ticket is held by its tag, not by a handle.
+pub(crate) const F_DETACHED: u64 = 1 << 23;
+/// The connection holds door concurrency slots, returned on release.
+pub(crate) const F_CHARGED: u64 = 1 << 27;
+/// A request revoked by a revocation that keeps its connection open.
+pub(crate) const F_KEEP_CONNECTION: u64 = 1 << 28;
 /// Provenance, three bits at 24..27.
 pub(crate) const PROVENANCE_SHIFT: u32 = 24;
 pub(crate) const PROVENANCE_MASK: u64 = 0b111 << PROVENANCE_SHIFT;
@@ -57,11 +42,21 @@ pub(crate) const CODE_SHIFT: u32 = 8;
 pub(crate) const P_SOURCE: u64 = 1;
 pub(crate) const P_SOURCE_V6: u64 = 1 << 1;
 pub(crate) const P_REQUEST: u64 = 1 << 2;
+pub(crate) const P_SESSION: u64 = 1 << 3;
+pub(crate) const P_ACCOUNT: u64 = 1 << 4;
+pub(crate) const P_TENANT: u64 = 1 << 5;
+pub(crate) const P_FINGERPRINT: u64 = 1 << 6;
 pub(crate) const PRESENT_SHIFT: u32 = 56;
+/// Low bits of `present_child`: a connection's latest live request, or [`NIL`].
+pub(crate) const CHILD_MASK: u64 = 0xffff_ffff;
 
 /// Key word positions.
 pub(crate) const K_SOURCE: usize = 0;
 pub(crate) const K_REQUEST: usize = 2;
+pub(crate) const K_SESSION: usize = 4;
+pub(crate) const K_ACCOUNT: usize = 6;
+pub(crate) const K_TENANT: usize = 8;
+pub(crate) const K_FINGERPRINT: usize = 9;
 
 #[inline]
 pub(crate) const fn generation(state: u64) -> u32 {
@@ -72,33 +67,33 @@ pub(crate) const fn generation(state: u64) -> u32 {
 ///
 /// `link` is, for a request, the parent connection's index and generation;
 /// for a connection, its own generation and the number of live requests.
-/// `born_present` holds the epoch at issue in the low 56 bits and the
-/// present-key bitmap in the high 8.
+/// `present_child` holds the present-key bitmap in the high 8 bits and, for a
+/// connection, the index of its latest live request in the low 32.
 #[repr(align(64))]
 pub(crate) struct Cell {
     pub(crate) state: AtomicU64,
     pub(crate) link: AtomicU64,
     pub(crate) seen: AtomicU64,
     pub(crate) conn: AtomicU64,
-    pub(crate) born_present: AtomicU64,
+    pub(crate) present_child: AtomicU64,
     pub(crate) keys: [AtomicU64; 11],
 }
 
 impl Cell {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Cell {
             // Generation 1: a tag or id with generation 0 is never valid.
             state: AtomicU64::new(1u64 << 32),
             link: AtomicU64::new(0),
             seen: AtomicU64::new(0),
             conn: AtomicU64::new(0),
-            born_present: AtomicU64::new(0),
+            present_child: AtomicU64::new(CHILD_MASK),
             keys: core::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
     pub(crate) fn present(&self) -> u64 {
-        self.born_present.load(Ordering::Acquire) >> PRESENT_SHIFT
+        self.present_child.load(Ordering::Acquire) >> PRESENT_SHIFT
     }
 }
 
@@ -246,7 +241,6 @@ mod tests {
     fn test_cell_is_two_cache_lines() {
         assert_eq!(core::mem::size_of::<Cell>(), 128);
         assert_eq!(core::mem::align_of::<Cell>(), 64);
-        assert_eq!(core::mem::align_of::<Epoch>(), 64);
     }
 
     #[test]
@@ -290,14 +284,6 @@ mod tests {
         }
         held.sort_unstable();
         assert_eq!(held, (0..64).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn test_epoch_bump_moves_value() {
-        let e = Epoch::new();
-        assert_eq!(e.load(), 0);
-        assert_eq!(e.bump(), 1);
-        assert_eq!(e.load(), 1);
     }
 }
 

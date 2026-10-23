@@ -1,6 +1,6 @@
 //! The bouncer and its builder.
 
-use core::{cell::Cell as StdCell, fmt};
+use core::{cell::Cell as StdCell, fmt, time::Duration};
 use std::{net::IpAddr, sync::Arc};
 
 use clock_lib::{Clock, Monotonic, SystemClock};
@@ -8,16 +8,27 @@ use clock_lib::{Clock, Monotonic, SystemClock};
 use crate::{
     allow::{AllowKind, AllowList},
     bans::{
-        BanId, BanMemory, BanSpec, DurationPolicy, Guards, LiftSpec, Lifted, compiled::PrefixSet,
+        BanDuration, BanId, BanMemory, BanSpec, DurationPolicy, Guards, LiftSpec, Lifted,
+        compiled::PrefixSet,
     },
+    budgets::{Budgets, DoorBudgets},
+    directive::{Action, Actor, Applied, BanKeys, Directive, Reason},
     door::{Judgement, Provenance, Refusal},
     error::{BouncerError, ConfigError, ConfigProblem},
+    events::{self, Emit, EventSink},
     hash::{HashKey, Seeds},
-    keys::{Cidr, ConnId, normalize},
-    registry::{Epoch, F_IMMUNE, F_PROXY_HOP, Registry, Shard},
+    keys::{BanKey, Cidr, ConnId, RequestId, normalize},
+    maintain::{self, Ejector, Maintenance, MaintenanceReport},
+    registry::{
+        F_CHARGED, F_DETACHED, F_IMMUNE, F_LIVE, F_PROXY_HOP, KIND_CONNECTION, Registry, Shard,
+        generation,
+    },
+    revoke::{Record, Revocation, RevocationEpoch, Revocations, RevokeMode, Target, target_key},
+    strikes::{Counters, Enforcement, Posture, StrikeRules},
     sync::Ordering,
-    ticket::{Issue, Ticket, TicketKind},
+    ticket::{self, Issue, Ticket, TicketKind, TicketTag, subject_of},
     time::Now,
+    verdict::{DenialCode, DenialTable, Reference, Verdict},
 };
 
 /// Most tickets a bouncer holds: the cell index has 24 bits per shard.
@@ -27,7 +38,8 @@ const MAX_SHARDS: u16 = 256;
 /// Most ban entries.
 const MAX_BAN_CAPACITY: u32 = 1 << 26;
 
-/// State every shard reads: time, ban memory, allow list, trusted proxies.
+/// State every shard reads: time, ban memory, allow list, trusted proxies,
+/// revocations, budgets, events.
 pub(crate) struct Shared {
     clock: Arc<dyn Clock>,
     start: Monotonic,
@@ -37,6 +49,18 @@ pub(crate) struct Shared {
     pub(crate) references: HashKey,
     pub(crate) tickets_capacity: u32,
     pub(crate) registry: Registry,
+    pub(crate) epoch: Arc<RevocationEpoch>,
+    pub(crate) revocations: Revocations,
+    pub(crate) budgets: DoorBudgets,
+    pub(crate) strikes: StrikeRules,
+    pub(crate) counters: Counters,
+    pub(crate) enforcement: Enforcement,
+    pub(crate) denials: DenialTable,
+    pub(crate) sink: Option<Arc<dyn EventSink>>,
+    pub(crate) ejector: Option<Arc<dyn Ejector>>,
+    pub(crate) maintenance: Maintenance,
+    pub(crate) revocation_rate: Option<rate_net::Gcra>,
+    pub(crate) format: Arc<dyn crate::format::DenialFormat>,
 }
 
 impl Shared {
@@ -51,6 +75,65 @@ impl Shared {
             proxies: &self.proxies,
         }
     }
+
+    pub(crate) fn posture(&self) -> Posture {
+        Posture::Normal
+    }
+
+    /// Adds a ban and reports it.
+    pub(crate) fn ban(
+        &self,
+        spec: &BanSpec,
+        policy: Option<DurationPolicy>,
+    ) -> Result<BanId, BouncerError> {
+        let result = self.bans.ban_with(spec, &self.guards(), self.now(), policy);
+        if self.sink.is_some() {
+            let signal = match &result {
+                Ok(_) => Some(events::signals::BAN_ADDED),
+                Err(BouncerError::BanTableFull { .. }) => Some(events::signals::BAN_TABLE_FULL),
+                Err(BouncerError::AllowListed { .. } | BouncerError::TrustedProxyTarget)
+                    if spec.actor.is_automated() =>
+                {
+                    Some(events::signals::BAN_REFUSED_ALLOWLISTED)
+                }
+                Err(_) => None,
+            };
+            if let Some(signal) = signal {
+                let reference = match &result {
+                    Ok(id) => self.reference(id.get()),
+                    Err(_) => Reference::new(0),
+                };
+                Emit {
+                    actor: spec.actor,
+                    reason: spec.reason,
+                    subject: subject_of_key(&spec.key),
+                    reference,
+                    evidence: spec.evidence,
+                    ..Emit::new(signal)
+                }
+                .send(self);
+            }
+        }
+        result
+    }
+}
+
+/// The subject of an event about one ban key.
+pub(crate) fn subject_of_key(key: &BanKey) -> events::Subject {
+    let mut s = events::Subject::default();
+    match *key {
+        BanKey::Address(a) => s.source = Some(a),
+        BanKey::Prefix(c) => s.prefix = Some(c),
+        BanKey::Session(k) => s.session = Some(k),
+        BanKey::Account(k) => s.account = Some(k),
+        BanKey::Tenant(k) => s.tenant = Some(k),
+        BanKey::Fingerprint(k) => s.fingerprint = Some(k),
+        BanKey::FingerprintIn(k, c) => {
+            s.fingerprint = Some(k);
+            s.prefix = Some(c);
+        }
+    }
+    s
 }
 
 struct Inner {
@@ -59,13 +142,19 @@ struct Inner {
     capacity: Capacity,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.shared.maintenance.stop();
+    }
+}
+
 /// The gate itself. One `Bouncer` serves a whole process; clones share all
 /// state. Every method takes `&self` and may be called from any thread.
 ///
 /// # Examples
 ///
 /// ```
-/// use bouncer_io::{Bouncer, RequestId};
+/// use bouncer_io::{Bouncer, Reason, RequestId};
 ///
 /// let bouncer = Bouncer::new();
 /// bouncer.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
@@ -74,6 +163,8 @@ struct Inner {
 /// let conn = bouncer.door("203.0.113.7".parse()?)?;
 /// let mut request = conn.request(RequestId(1))?;
 /// assert!(request.checkpoint().is_pass());
+/// bouncer.revoke(conn.conn(), Reason::ADMIN)?;               // from any thread
+/// assert!(request.checkpoint().is_deny());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone)]
@@ -120,8 +211,10 @@ fn shard_hint() -> u32 {
 
 impl Bouncer {
     /// A bouncer with safe defaults: 65,536 tickets, 1,048,576 ban entries,
-    /// automatic keys at IPv4 /32 and /24 and IPv6 /64, /56, /48, no allow
-    /// list, no trusted proxies.
+    /// 65,536 revocation entries, automatic keys at IPv4 /32 and /24 and IPv6
+    /// /64, /56, /48, door budgets of 20 connections per second (burst 40)
+    /// and 64 concurrent per address, local heuristics in observe mode, no
+    /// event sink, no ejector, no maintainer thread.
     ///
     /// # Examples
     ///
@@ -132,14 +225,9 @@ impl Bouncer {
     /// ```
     #[must_use]
     pub fn new() -> Bouncer {
-        // The default configuration is valid by construction.
-        match BouncerBuilder::default().try_build() {
-            Ok(b) => b,
-            Err(_) => BouncerBuilder::default()
-                .tickets(1)
-                .ban_capacity(1)
-                .build_unchecked(),
-        }
+        // The default configuration is valid by construction, and spawns no
+        // thread, so building it cannot fail.
+        BouncerBuilder::default().build_with(PrefixSet::empty())
     }
 
     /// Starts a [`BouncerBuilder`] with the same defaults as `new`.
@@ -158,9 +246,9 @@ impl Bouncer {
         BouncerBuilder::default()
     }
 
-    /// Checkpoint B1, before a byte is read: trusted proxy, allow list, and
-    /// ban memory, from the peer address alone. On success it issues a
-    /// connection ticket.
+    /// Checkpoint B1, before a byte is read: trusted proxy, allow list, ban
+    /// memory, and door budgets, from the peer address alone. On success it
+    /// issues a connection ticket.
     ///
     /// Reads the clock once and numbers the connection itself; use
     /// [`door_at`](Self::door_at) when the transport already has both.
@@ -222,24 +310,40 @@ impl Bouncer {
         provenance: Provenance,
         now: Now,
     ) -> Result<Ticket, Refusal> {
+        let shared = &self.inner.shared;
         let peer = normalize(peer);
-        let (flags, source) = match self.inner.shared.judge(peer, provenance, now) {
-            Judgement::Admit { immune } => (if immune { F_IMMUNE } else { 0 }, Some(peer)),
-            Judgement::ProxyHop => (F_PROXY_HOP, None),
-            Judgement::Refuse(r) => return Err(r),
+        let (mut flags, source, charge) = match shared.judge(peer, provenance, now) {
+            Judgement::Admit { immune, exempt } => {
+                (if immune { F_IMMUNE } else { 0 }, Some(peer), !exempt)
+            }
+            Judgement::ProxyHop => (F_PROXY_HOP, None, false),
+            Judgement::Refuse(r) => {
+                self.report_refusal(r, peer);
+                return Err(r);
+            }
         };
-        let flags = flags | (provenance.code() << crate::registry::PROVENANCE_SHIFT);
+        if charge {
+            if let Err(over) = shared.budgets.admit(peer, now) {
+                let r = Refusal::OverBudget {
+                    retry_after: over.0,
+                };
+                self.report_refusal(r, peer);
+                return Err(r);
+            }
+            flags |= F_CHARGED;
+        }
+        flags |= provenance.code() << crate::registry::PROVENANCE_SHIFT;
         let shards = &self.inner.shards;
         let first = shard_hint() as usize & (shards.len() - 1);
         let shard = &shards[first];
         let id = match conn {
             Some(c) => c.0,
             None => {
-                let k = self.inner.shared.registry.next_conn[first].fetch_add(1, Ordering::Relaxed);
+                let k = shared.registry.next_conn[first].fetch_add(1, Ordering::Relaxed);
                 (1u64 << 63) | ((k & ((1u64 << 55) - 1)) << 8) | u64::from(shard.id)
             }
         };
-        Ticket::issue(
+        let issued = Ticket::issue(
             shard,
             first,
             Issue {
@@ -250,14 +354,51 @@ impl Bouncer {
                 request: None,
                 parent: None,
             },
-        )
-        .ok_or(Refusal::RegistryFull)
+        );
+        match issued {
+            Some(t) => Ok(t),
+            None => {
+                if charge {
+                    shared.budgets.release_connection(Some(peer), now);
+                }
+                self.report_refusal(Refusal::RegistryFull, peer);
+                Err(Refusal::RegistryFull)
+            }
+        }
+    }
+
+    #[cold]
+    fn report_refusal(&self, refusal: Refusal, peer: IpAddr) {
+        let shared = &self.inner.shared;
+        if shared.sink.is_none() {
+            return;
+        }
+        let (signal, reference) = match refusal {
+            Refusal::Banned { reference } => (events::signals::DOOR_REFUSED_BAN, reference),
+            Refusal::OverBudget { .. } => (events::signals::DOOR_REFUSED_BUDGET, Reference::new(0)),
+            Refusal::RegistryFull => (
+                events::signals::DOOR_REFUSED_REGISTRY_FULL,
+                Reference::new(0),
+            ),
+            _ => return,
+        };
+        let subject = events::Subject {
+            source: Some(peer),
+            ..events::Subject::default()
+        };
+        Emit {
+            subject,
+            reference,
+            ..Emit::new(signal)
+        }
+        .send(shared);
     }
 
     /// Adds a ban. An address or `Cidr` converts directly (timed by the
     /// duration policy, actor [`Actor::App`](crate::Actor::App)); a
     /// [`BanSpec`] sets the rest. Takes effect at the next door check on every
-    /// thread; connections already admitted are not touched.
+    /// thread; connections already admitted are not touched (use
+    /// [`apply`](Self::apply) with `Directive::revoke_and_ban` for that).
     ///
     /// # Errors
     ///
@@ -277,10 +418,7 @@ impl Bouncer {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn ban(&self, spec: impl Into<BanSpec>) -> Result<BanId, BouncerError> {
-        let shared = &self.inner.shared;
-        shared
-            .bans
-            .ban(&spec.into(), &shared.guards(), shared.now())
+        self.inner.shared.ban(&spec.into(), None)
     }
 
     /// Removes the bans on exactly this key. A wider prefix ban that covers
@@ -301,13 +439,460 @@ impl Bouncer {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn lift(&self, spec: impl Into<LiftSpec>) -> Result<Lifted, BouncerError> {
-        self.inner.shared.bans.lift(&spec.into())
+        let shared = &self.inner.shared;
+        let spec = spec.into();
+        let result = shared.bans.lift(&spec);
+        if let Ok(l) = &result {
+            Emit {
+                actor: spec.actor,
+                reason: spec.reason,
+                subject: subject_of_key(&spec.key),
+                reference: shared.reference(l.tombstone.get()),
+                ..Emit::new(events::signals::BAN_LIFTED)
+            }
+            .send(shared);
+        }
+        result
+    }
+
+    /// Stops what is running now. Every ticket that carries the target key is
+    /// denied at its next checkpoint; a checkpoint that begins after `revoke`
+    /// has returned on any thread cannot miss it. The actor is
+    /// [`Actor::App`](crate::Actor::App), the mode `AtCheckpoint`, a revoked
+    /// request takes its connection with it, and no ban is added; for any
+    /// other choice use [`apply`](Self::apply).
+    ///
+    /// A revocation is not a ban: it ends running work. A connection that
+    /// comes back is judged at the door as usual unless a ban was also set.
+    ///
+    /// # Errors
+    ///
+    /// `RevocationTableFull`: the revocation still reached every live
+    /// matching ticket through a direct sweep before the error returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{AccountKey, Bouncer, Reason, RequestId};
+    ///
+    /// let bouncer = Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let mut request = conn.request(RequestId(1))?;
+    /// assert!(request.bind_account(AccountKey(42)).is_pass());
+    /// // Password changed: every running request of this account stops.
+    /// bouncer.revoke(AccountKey(42), Reason::PASSWORD_CHANGED)?;
+    /// assert!(request.checkpoint().is_deny());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn revoke(
+        &self,
+        target: impl Into<Target>,
+        reason: Reason,
+    ) -> Result<Revocation, BouncerError> {
+        self.revoke_with(
+            &target.into(),
+            Actor::App,
+            reason,
+            RevokeMode::AtCheckpoint,
+            false,
+            DenialCode::Forbidden,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn revoke_with(
+        &self,
+        target: &Target,
+        actor: Actor,
+        reason: Reason,
+        mode: RevokeMode,
+        keep_connection: bool,
+        code: DenialCode,
+        confidence: Option<u8>,
+    ) -> Result<Revocation, BouncerError> {
+        let shared = &self.inner.shared;
+        let target = match *target {
+            Target::Source(c) => {
+                if actor.is_automated() {
+                    let immune = shared
+                        .allow
+                        .find_covering_map(&c, |k| (*k == AllowKind::Immune).then_some(()))
+                        .is_some();
+                    if immune {
+                        return Err(BouncerError::AllowListed {
+                            key: BanKey::Prefix(c),
+                        });
+                    }
+                }
+                if shared.proxies.covers(&c) {
+                    return Err(BouncerError::TrustedProxyTarget);
+                }
+                Target::Source(c)
+            }
+            t => t,
+        };
+        if actor.is_automated() {
+            if let Some(rate) = &shared.revocation_rate {
+                let now_d = Duration::from_nanos(shared.now().as_nanos());
+                if rate.check_at(now_d).is_deny() {
+                    // A revocation storm: the revocation still applies (they are
+                    // security actions); the excess is reported.
+                    Emit {
+                        actor,
+                        reason,
+                        mode: crate::strikes::Mode::Observe,
+                        ..Emit::new(events::signals::REVOKE_APPLIED)
+                    }
+                    .send(shared);
+                }
+            }
+        }
+        let record = Record {
+            key: target_key(&target),
+            code,
+            keep_connection,
+            actor: actor.kind(),
+            reason,
+        };
+        let reference = shared.reference(shared.epoch.next() ^ 0x5eed);
+        let epoch = match shared.revocations.insert(&record, &shared.epoch) {
+            Ok(e) => e,
+            Err(()) => {
+                maintain::direct_sweep(shared, &target, code, keep_connection);
+                shared.epoch.bump();
+                maintain::report_revocation(shared, &target, actor, reason, reference, confidence);
+                return Err(BouncerError::RevocationTableFull {
+                    capacity: shared.revocations.capacity(),
+                });
+            }
+        };
+        let mut matched_live = None;
+        if mode == RevokeMode::EjectNow {
+            if shared.maintenance.has_thread() {
+                shared.maintenance.request_sweep();
+            } else {
+                matched_live = Some(maintain::sweep_all(shared, epoch).0);
+            }
+        } else {
+            // Schedule cleanup of the entry.
+            shared.maintenance.wake();
+        }
+        maintain::report_revocation(shared, &target, actor, reason, reference, confidence);
+        Ok(Revocation {
+            epoch,
+            reference,
+            matched_live,
+        })
+    }
+
+    /// The single entry for decisions made elsewhere: the security signals
+    /// policy, sentinel-sec, the gates, administrators, and other nodes. Safe
+    /// from any thread.
+    ///
+    /// Rules that hold whatever the directive says: automated actors never
+    /// touch allow-listed keys or trusted proxies; a directive below the
+    /// Medium confidence band (under 30) cannot ban by itself and is applied
+    /// as a throttle (`Applied::downgraded`); every applied directive is an
+    /// event naming its cause.
+    ///
+    /// # Errors
+    ///
+    /// As [`ban`](Self::ban) and [`revoke`](Self::revoke); `InvalidTarget`
+    /// when the action does not fit the target (a lift of a connection id, a
+    /// throttle of a session at this version).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, Bouncer, Directive, Reason};
+    /// use std::time::Duration;
+    ///
+    /// let bouncer = Bouncer::new();
+    /// let applied = bouncer.apply(
+    ///     Directive::ban("198.51.100.77".parse::<std::net::IpAddr>()?)
+    ///         .by(Actor::Policy(12))
+    ///         .because(Reason::POLICY)
+    ///         .confidence(20),                              // too low to ban by itself
+    /// )?;
+    /// assert!(applied.downgraded && applied.throttled && applied.ban.is_none());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn apply(&self, directive: Directive) -> Result<Applied, BouncerError> {
+        let d = directive;
+        let low = d.confidence.is_some_and(|c| c < 30);
+        let code = d.deny_with.unwrap_or(DenialCode::Forbidden);
+        let mut applied = Applied::default();
+        match d.action {
+            Action::Throttle { factor, duration } => {
+                self.throttle(&d.target, factor, duration)?;
+                applied.throttled = true;
+            }
+            Action::Ban(duration) => {
+                if low {
+                    self.throttle(&d.target, 4, downgrade_duration(duration))?;
+                    applied.throttled = true;
+                    applied.downgraded = true;
+                } else {
+                    self.ban_target(&d, duration, &mut applied)?;
+                }
+            }
+            Action::Revoke(mode) => {
+                applied.revocation = Some(self.revoke_with(
+                    &d.target,
+                    d.actor,
+                    d.reason,
+                    mode,
+                    d.keep_connection,
+                    code,
+                    d.confidence,
+                )?);
+            }
+            Action::RevokeAndBan(mode, duration) => {
+                // Ban first, while the tickets that carry the keys are live.
+                if low {
+                    self.throttle(&d.target, 4, downgrade_duration(duration))
+                        .ok();
+                    applied.throttled = true;
+                    applied.downgraded = true;
+                } else {
+                    self.ban_target(&d, duration, &mut applied)?;
+                }
+                applied.revocation = Some(self.revoke_with(
+                    &d.target,
+                    d.actor,
+                    d.reason,
+                    mode,
+                    d.keep_connection,
+                    code,
+                    d.confidence,
+                )?);
+            }
+            Action::Lift => {
+                let key = match d.target {
+                    Target::Source(c) => host_or_prefix(c),
+                    Target::Session(k) => BanKey::Session(k),
+                    Target::Account(k) => BanKey::Account(k),
+                    Target::Tenant(k) => BanKey::Tenant(k),
+                    Target::Fingerprint(k) => BanKey::Fingerprint(k),
+                    _ => return Err(BouncerError::InvalidTarget),
+                };
+                applied.lifted = Some(self.lift(LiftSpec::key(key).by(d.actor).because(d.reason))?);
+            }
+        }
+        Ok(applied)
+    }
+
+    fn ban_target(
+        &self,
+        d: &Directive,
+        duration: BanDuration,
+        applied: &mut Applied,
+    ) -> Result<(), BouncerError> {
+        let shared = &self.inner.shared;
+        let spec = |key: BanKey| {
+            let s = BanSpec::key(key)
+                .by(d.actor)
+                .because(d.reason)
+                .evidence(d.evidence);
+            BanSpec { duration, ..s }
+        };
+        let mut record = |r: Result<BanId, BouncerError>| -> Result<(), BouncerError> {
+            let id = r?;
+            applied.ban.get_or_insert(id);
+            applied.bans += 1;
+            Ok(())
+        };
+        match d.target {
+            Target::Source(c) => record(shared.ban(&spec(host_or_prefix(c)), None)),
+            Target::Session(k) => record(shared.ban(&spec(BanKey::Session(k)), None)),
+            Target::Account(k) => record(shared.ban(&spec(BanKey::Account(k)), None)),
+            Target::Tenant(k) => record(shared.ban(&spec(BanKey::Tenant(k)), None)),
+            Target::Fingerprint(k) => record(shared.ban(&spec(BanKey::Fingerprint(k)), None)),
+            Target::Connection(_) | Target::Request(_) => {
+                let keys = d.ban_keys.unwrap_or(BanKeys::SOURCE);
+                let mut found = false;
+                for cell in shared.registry.cells.iter() {
+                    if cell.state.load(Ordering::Acquire) & F_LIVE == 0
+                        || !maintain::matches_target(cell, &d.target)
+                    {
+                        continue;
+                    }
+                    found = true;
+                    let s = subject_of(cell);
+                    let mut wanted: Vec<BanKey> = Vec::new();
+                    if keys.contains(BanKeys::SOURCE) {
+                        if let Some(a) = s.source {
+                            wanted.push(BanKey::Address(a));
+                        }
+                    }
+                    if keys.contains(BanKeys::FINGERPRINT_IN_PREFIX) {
+                        if let (Some(fp), Some(a)) = (s.fingerprint, s.source) {
+                            wanted.push(BanKey::FingerprintIn(fp, shared.bans.address_prefix(a)));
+                        }
+                    }
+                    if keys.contains(BanKeys::SESSION) {
+                        if let Some(k) = s.session {
+                            wanted.push(BanKey::Session(k));
+                        }
+                    }
+                    if keys.contains(BanKeys::ACCOUNT) {
+                        if let Some(k) = s.account {
+                            wanted.push(BanKey::Account(k));
+                        }
+                    }
+                    if keys.contains(BanKeys::TENANT) {
+                        if let Some(k) = s.tenant {
+                            wanted.push(BanKey::Tenant(k));
+                        }
+                    }
+                    for key in wanted {
+                        record(shared.ban(&spec(key), None))?;
+                    }
+                }
+                if !found {
+                    return Ok(());
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn throttle(
+        &self,
+        target: &Target,
+        factor: u8,
+        duration: Duration,
+    ) -> Result<(), BouncerError> {
+        let shared = &self.inner.shared;
+        let cidr = match *target {
+            Target::Source(c) => {
+                if shared.proxies.covers(&c) {
+                    return Err(BouncerError::TrustedProxyTarget);
+                }
+                match c.family() {
+                    crate::keys::Family::V6 if c.len() > 64 => c.parent(64).unwrap_or(c),
+                    _ => c,
+                }
+            }
+            _ => return Err(BouncerError::InvalidTarget),
+        };
+        let now = shared.now().secs();
+        let until = now.saturating_add(crate::time::ceil_secs(duration).max(1));
+        shared
+            .budgets
+            .throttle(&cidr, factor.clamp(2, 16), until, now);
+        Ok(())
+    }
+
+    /// Issues a request ticket under a connection held as a [`TicketTag`].
+    ///
+    /// # Errors
+    ///
+    /// `Stale` (released, or another bouncer's tag), `Revoked`,
+    /// `RegistryFull`, `NotAConnectionTicket`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, RequestId};
+    /// let bouncer = Bouncer::new();
+    /// let tag = bouncer.door("192.0.2.8".parse()?)?.into_tag();
+    /// let request = bouncer.request(tag, RequestId(9))?;
+    /// assert_eq!(request.conn(), bouncer.request(tag, RequestId(10))?.conn());
+    /// # drop(request);
+    /// bouncer.release(tag);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn request(&self, connection: TicketTag, id: RequestId) -> Result<Ticket, BouncerError> {
+        let shards = &self.inner.shards;
+        let shard = &shards[shard_hint() as usize & (shards.len() - 1)];
+        ticket::issue_request(shard, connection.index(), connection.generation(), id)
+    }
+
+    /// Checkpoint B6b for a transport: call it before every socket write.
+    /// Pass the tag of the request whose response is being written when the
+    /// transport knows it, or the connection's tag otherwise (which also
+    /// checks the request most recently issued on it). A stale or unknown tag
+    /// is denied (fail closed).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Reason, Verdict};
+    /// let bouncer = Bouncer::new();
+    /// let ticket = bouncer.door("192.0.2.9".parse()?)?;
+    /// let conn = ticket.conn();
+    /// let tag = ticket.into_tag();                   // the transport keeps only this
+    /// assert!(bouncer.egress(tag).is_pass());
+    /// bouncer.revoke(conn, Reason::ADMIN)?;
+    /// assert!(matches!(bouncer.egress(tag), Verdict::Deny(_)));
+    /// bouncer.release(tag);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[inline]
+    pub fn egress(&self, ticket: TicketTag) -> Verdict {
+        let shared = &self.inner.shared;
+        ticket::egress(shared, &shared.epoch, ticket)
+    }
+
+    /// Releases a connection ticket held as a tag. Live request tickets under
+    /// it are denied from then on. Returns `false` when the tag was already
+    /// released, is stale, or is not a detached connection ticket.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let bouncer = bouncer_io::Bouncer::new();
+    /// let tag = bouncer.door("192.0.2.12".parse()?)?.into_tag();
+    /// assert!(bouncer.release(tag));
+    /// assert!(!bouncer.release(tag));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn release(&self, connection: TicketTag) -> bool {
+        let shared = &self.inner.shared;
+        let index = connection.index();
+        if index as usize >= shared.registry.cells.len() {
+            return false;
+        }
+        let st = shared.registry.cell(index).state.load(Ordering::Acquire);
+        if generation(st) != connection.generation()
+            || st & F_DETACHED == 0
+            || st & 0xff != KIND_CONNECTION
+        {
+            return false;
+        }
+        let shard = &self.inner.shards[shared.registry.shard_of(index) % self.inner.shards.len()];
+        ticket::release_cell(shard, index, connection.generation())
     }
 
     /// The bouncer's monotonic time base, for the `_at` functions.
     #[must_use]
     pub fn now(&self) -> Now {
         self.inner.shared.now()
+    }
+
+    /// Does a bounded amount of every pending job: eject-now sweeps, checks
+    /// on tickets that have not crossed a checkpoint for `max_unchecked`
+    /// (checked on their behalf; matching ones are ejected and reported as
+    /// `checkpoint.missing`), and cleanup of revocation entries no live
+    /// ticket needs. Returns when more work is due, or `None` when nothing is
+    /// pending. Use it when your own worker drives maintenance; otherwise
+    /// enable the parked thread with [`BouncerBuilder::maintainer`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{AccountKey, Bouncer, Reason};
+    /// let bouncer = Bouncer::new();
+    /// bouncer.revoke(AccountKey(1), Reason::ADMIN)?;
+    /// let report = bouncer.maintain(bouncer.now());
+    /// assert_eq!(report.reclaimed, 1);          // no live ticket can need it
+    /// assert_eq!(bouncer.maintain(bouncer.now()).next_due, None);
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
+    pub fn maintain(&self, now: Now) -> MaintenanceReport {
+        maintain::run(&self.inner.shared, now)
     }
 
     /// The memory every table reserved at construction, and the entry limits.
@@ -324,14 +909,33 @@ impl Bouncer {
     /// ```
     #[must_use]
     pub fn capacity(&self) -> Capacity {
+        let shared = &self.inner.shared;
         let mut c = self.inner.capacity;
-        c.table_bytes = self.inner.shared.bans.table_bytes();
+        c.table_bytes = shared.bans.table_bytes();
         c.total_bytes = c.table_bytes
-            + self.inner.shared.bans.admin_bytes()
-            + self.inner.shared.registry.bytes()
-            + self.inner.shared.allow.bytes()
-            + self.inner.shared.proxies.bytes();
+            + shared.bans.admin_bytes()
+            + shared.registry.bytes()
+            + shared.allow.bytes()
+            + shared.proxies.bytes()
+            + shared.revocations.bytes()
+            + shared.budgets.bytes()
+            + shared.counters.bytes();
         c
+    }
+}
+
+fn host_or_prefix(c: Cidr) -> BanKey {
+    if c.len() == c.family().max_len() {
+        BanKey::Address(c.network())
+    } else {
+        BanKey::Prefix(c)
+    }
+}
+
+fn downgrade_duration(d: BanDuration) -> Duration {
+    match d {
+        BanDuration::Fixed(f) => f,
+        _ => Duration::from_secs(600),
     }
 }
 
@@ -343,9 +947,9 @@ pub struct Capacity {
     pub tickets: u32,
     /// Dynamic ban entries.
     pub bans: u32,
-    /// Revocation entries (arrives with revocation tables).
+    /// Revocation entries.
     pub revocations: u32,
-    /// Budget keys (arrives with budgets).
+    /// Budget keys per tier.
     pub budget_keys: u32,
     /// Bytes of the dynamic ban table.
     pub table_bytes: u64,
@@ -359,10 +963,11 @@ pub struct Capacity {
 /// # Examples
 ///
 /// ```
-/// use bouncer_io::{Bouncer, DurationPolicy};
+/// use bouncer_io::{Bouncer, DurationPolicy, Enforcement, StrikeKind};
 /// use std::time::Duration;
 /// let bouncer = Bouncer::builder()
 ///     .durations(DurationPolicy::default().base(Duration::from_secs(900)).max(Duration::from_secs(86_400)))
+///     .enforcement(Enforcement::observe_all().enforce(StrikeKind::ProxyViolation))
 ///     .ipv6_lengths(&[64, 48])
 ///     .try_build()?;
 /// # Ok::<(), bouncer_io::BouncerError>(())
@@ -372,13 +977,25 @@ pub struct BouncerBuilder {
     tickets: u32,
     shards: Option<u16>,
     ban_capacity: u32,
+    revocation_capacity: u32,
     ipv4_lengths: Vec<u8>,
     ipv6_lengths: Vec<u8>,
     durations: DurationPolicy,
     allow: AllowList,
     trusted_proxies: Vec<Cidr>,
+    budgets: Budgets,
+    strikes: StrikeRules,
+    enforcement: Enforcement,
+    denials: DenialTable,
+    sink: Option<Arc<dyn EventSink>>,
+    ejector: Option<Arc<dyn Ejector>>,
+    format: Option<Arc<dyn crate::format::DenialFormat>>,
+    epoch: Option<Arc<RevocationEpoch>>,
     clock: Option<Arc<dyn Clock>>,
     seed: Option<[u8; 32]>,
+    max_unchecked: Duration,
+    maintainer: bool,
+    revocation_rate_limit: u32,
 }
 
 impl Default for BouncerBuilder {
@@ -387,13 +1004,25 @@ impl Default for BouncerBuilder {
             tickets: crate::DEFAULT_TICKETS,
             shards: None,
             ban_capacity: crate::DEFAULT_BAN_CAPACITY,
+            revocation_capacity: crate::DEFAULT_REVOCATION_CAPACITY,
             ipv4_lengths: crate::DEFAULT_IPV4_LENGTHS.to_vec(),
             ipv6_lengths: crate::DEFAULT_IPV6_LENGTHS.to_vec(),
             durations: DurationPolicy::default(),
             allow: AllowList::new(),
             trusted_proxies: Vec::new(),
+            budgets: Budgets::default(),
+            strikes: StrikeRules::default(),
+            enforcement: Enforcement::default(),
+            denials: DenialTable::default(),
+            sink: None,
+            ejector: None,
+            format: None,
+            epoch: None,
             clock: None,
             seed: None,
+            max_unchecked: Duration::from_secs(60),
+            maintainer: false,
+            revocation_rate_limit: 10_000,
         }
     }
 }
@@ -404,8 +1033,10 @@ impl fmt::Debug for BouncerBuilder {
             .field("tickets", &self.tickets)
             .field("shards", &self.shards)
             .field("ban_capacity", &self.ban_capacity)
+            .field("revocation_capacity", &self.revocation_capacity)
             .field("ipv4_lengths", &self.ipv4_lengths)
             .field("ipv6_lengths", &self.ipv6_lengths)
+            .field("maintainer", &self.maintainer)
             .finish_non_exhaustive()
     }
 }
@@ -428,6 +1059,12 @@ impl BouncerBuilder {
     /// Dynamic ban table entries (default 1,048,576).
     pub fn ban_capacity(mut self, entries: u32) -> Self {
         self.ban_capacity = entries;
+        self
+    }
+
+    /// Revocation table entries (default 65,536).
+    pub fn revocation_capacity(mut self, entries: u32) -> Self {
+        self.revocation_capacity = entries;
         self
     }
 
@@ -456,10 +1093,60 @@ impl BouncerBuilder {
         self
     }
 
-    /// Proxies whose PROXY and forwarded headers are believed; never banned
-    /// or struck. Use the same list the transport uses.
+    /// Proxies whose PROXY and forwarded headers are believed; never banned,
+    /// struck, or budgeted. Use the same list the transport uses.
     pub fn trusted_proxies(mut self, cidrs: &[Cidr]) -> Self {
         self.trusted_proxies = cidrs.to_vec();
+        self
+    }
+
+    /// Door budgets ([`Budgets::off`] for none).
+    pub fn budgets(mut self, budgets: Budgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+
+    /// Strike weights, windows, thresholds.
+    pub fn strikes(mut self, rules: StrikeRules) -> Self {
+        self.strikes = rules;
+        self
+    }
+
+    /// Observe or enforce, per strike kind (default: observe every kind).
+    pub fn enforcement(mut self, modes: Enforcement) -> Self {
+        self.enforcement = modes;
+        self
+    }
+
+    /// The fixed message and application code per denial code.
+    pub fn denials(mut self, table: DenialTable) -> Self {
+        self.denials = table;
+        self
+    }
+
+    /// Where every event goes (the security signal bridge, audit).
+    pub fn event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// How bouncer closes connections it is not holding (sweeps, idle
+    /// checks, `deny_and_eject`).
+    pub fn ejector(mut self, ejector: Arc<dyn Ejector>) -> Self {
+        self.ejector = Some(ejector);
+        self
+    }
+
+    /// The protocol formatter `deny_and_eject` uses (default `NoFormat`:
+    /// close without a reply).
+    pub fn denial_format(mut self, format: Arc<dyn crate::format::DenialFormat>) -> Self {
+        self.format = Some(format);
+        self
+    }
+
+    /// An epoch word owned by the security core, shared with other modules.
+    pub fn epoch(mut self, epoch: Arc<RevocationEpoch>) -> Self {
+        self.epoch = Some(epoch);
         self
     }
 
@@ -476,11 +1163,33 @@ impl BouncerBuilder {
         self
     }
 
+    /// How long a ticket may go without a checkpoint before maintenance
+    /// checks it on its behalf (default 60 seconds).
+    pub fn max_unchecked(mut self, idle: Duration) -> Self {
+        self.max_unchecked = idle;
+        self
+    }
+
+    /// Spawn one maintenance thread that parks until work is due (default
+    /// `false`: call [`Bouncer::maintain`] yourself).
+    pub fn maintainer(mut self, spawn: bool) -> Self {
+        self.maintainer = spawn;
+        self
+    }
+
+    /// Revocations per second accepted from automated actors before the
+    /// excess is reported as a storm (default 10,000; they still apply).
+    pub fn revocation_rate_limit(mut self, per_second: u32) -> Self {
+        self.revocation_rate_limit = per_second;
+        self
+    }
+
     /// Validates the configuration and allocates every table.
     ///
     /// # Errors
     ///
-    /// [`BouncerError::Config`] naming the field and the accepted range.
+    /// [`BouncerError::Config`] naming the field and the accepted range;
+    /// [`BouncerError::Spawn`] when the maintainer thread cannot start.
     ///
     /// # Examples
     ///
@@ -502,8 +1211,23 @@ impl BouncerBuilder {
             1,
             u64::from(MAX_BAN_CAPACITY),
         )?;
+        check_range(
+            "revocation_capacity",
+            u64::from(self.revocation_capacity),
+            1,
+            u64::from(MAX_BAN_CAPACITY),
+        )?;
+        check_range(
+            "revocation_rate_limit",
+            u64::from(self.revocation_rate_limit),
+            1,
+            u64::from(u32::MAX),
+        )?;
         if let Some(s) = self.shards {
             check_range("shards", u64::from(s), 1, u64::from(MAX_SHARDS))?;
+        }
+        if self.max_unchecked.is_zero() {
+            return Err(ConfigError::new("max_unchecked", ConfigProblem::InvalidDuration).into());
         }
         if self.ipv4_lengths.is_empty()
             || self.ipv4_lengths.iter().any(|&l| l > 32)
@@ -518,16 +1242,20 @@ impl BouncerBuilder {
             return Err(ConfigError::new("ipv6_lengths", ConfigProblem::InvalidLength).into());
         }
         self.durations.validate("durations")?;
-        Ok(self.build_unchecked_with(self.allow.compile()?))
+        self.strikes.validate()?;
+        self.denials.validate()?;
+        self.budgets.validate()?;
+        let allow = self.allow.compile()?;
+        let maintainer = self.maintainer;
+        let bouncer = self.build_with(allow);
+        if maintainer {
+            maintain::spawn(&bouncer.inner.shared).map_err(BouncerError::Spawn)?;
+        }
+        Ok(bouncer)
     }
 
-    /// Builds without validating; only for configurations known valid.
-    fn build_unchecked(self) -> Bouncer {
-        let allow = self.allow.compile().unwrap_or_else(|_| PrefixSet::empty());
-        self.build_unchecked_with(allow)
-    }
-
-    fn build_unchecked_with(&self, allow: PrefixSet<AllowKind>) -> Bouncer {
+    /// Allocates every table from a validated configuration.
+    fn build_with(self, allow: PrefixSet<AllowKind>) -> Bouncer {
         let seeds = match self.seed {
             Some(s) => Seeds::from_bytes(s),
             None => Seeds::random(),
@@ -555,6 +1283,17 @@ impl BouncerBuilder {
         let shard_count = prev_power_of_two(wanted.min(self.tickets).max(1));
         let per_shard = self.tickets.div_ceil(shard_count);
         let tickets = per_shard * shard_count;
+        let epoch = self
+            .epoch
+            .clone()
+            .unwrap_or_else(|| Arc::new(RevocationEpoch::new()));
+        let mut rng = crate::hash::Rng::from_seed(seeds.rng ^ 0x0b0b);
+        let derived = |rng: &mut crate::hash::Rng| HashKey::new(rng.next_u64(), rng.next_u64());
+        let budgets = DoorBudgets::new(&self.budgets, derived(&mut rng));
+        let revocation_rate =
+            rate_net::Quota::rate(self.revocation_rate_limit, Duration::from_secs(1))
+                .ok()
+                .map(rate_net::Gcra::new);
 
         let shared = Arc::new(Shared {
             start: clock.now(),
@@ -572,8 +1311,22 @@ impl BouncerBuilder {
             references: seeds.references,
             tickets_capacity: tickets,
             registry: Registry::new(shard_count, per_shard),
+            epoch: Arc::clone(&epoch),
+            revocations: Revocations::new(self.revocation_capacity, derived(&mut rng)),
+            budgets,
+            strikes: self.strikes.clone(),
+            counters: Counters::new(65_536, derived(&mut rng)),
+            enforcement: self.enforcement,
+            denials: self.denials.clone(),
+            sink: self.sink.clone(),
+            ejector: self.ejector.clone(),
+            maintenance: Maintenance::new(self.max_unchecked),
+            revocation_rate,
+            format: self
+                .format
+                .clone()
+                .unwrap_or_else(|| Arc::new(crate::format::NoFormat)),
         });
-        let epoch = Arc::new(Epoch::new());
         let shards: Box<[Arc<Shard>]> = (0..shard_count)
             .map(|i| {
                 Arc::new(Shard {
@@ -586,8 +1339,8 @@ impl BouncerBuilder {
         let capacity = Capacity {
             tickets,
             bans: shared.bans.capacity(),
-            revocations: 0,
-            budget_keys: 0,
+            revocations: shared.revocations.capacity(),
+            budget_keys: shared.budgets.capacity(),
             table_bytes: 0,
             total_bytes: 0,
         };
@@ -624,7 +1377,7 @@ fn prev_power_of_two(n: u32) -> u32 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(bouncer_loom)))]
 mod tests {
     use super::*;
 
@@ -645,13 +1398,21 @@ mod tests {
 
     #[test]
     fn test_builder_validation_errors_name_fields() {
-        let cases: [(BouncerBuilder, &str); 6] = [
+        let cases: [(BouncerBuilder, &str); 8] = [
             (Bouncer::builder().tickets(0), "tickets"),
             (Bouncer::builder().tickets(MAX_TICKETS + 1), "tickets"),
             (Bouncer::builder().ban_capacity(0), "ban_capacity"),
+            (
+                Bouncer::builder().revocation_capacity(0),
+                "revocation_capacity",
+            ),
             (Bouncer::builder().shards(0), "shards"),
             (Bouncer::builder().ipv4_lengths(&[24]), "ipv4_lengths"),
             (Bouncer::builder().ipv6_lengths(&[]), "ipv6_lengths"),
+            (
+                Bouncer::builder().max_unchecked(Duration::ZERO),
+                "max_unchecked",
+            ),
         ];
         for (b, field) in cases {
             match b.try_build() {
@@ -665,6 +1426,16 @@ mod tests {
                 .try_build(),
             Err(BouncerError::Config(ConfigError {
                 problem: ConfigProblem::InvalidFactor,
+                ..
+            }))
+        ));
+        let long: &'static str = Box::leak("x".repeat(300).into_boxed_str());
+        assert!(matches!(
+            Bouncer::builder()
+                .denials(DenialTable::new().message(DenialCode::Forbidden, long))
+                .try_build(),
+            Err(BouncerError::Config(ConfigError {
+                problem: ConfigProblem::MessageTooLong,
                 ..
             }))
         ));
@@ -687,6 +1458,7 @@ mod tests {
         let c = b.capacity();
         assert!(c.tickets >= crate::DEFAULT_TICKETS);
         assert_eq!(c.bans, crate::DEFAULT_BAN_CAPACITY);
+        assert!(c.revocations >= crate::DEFAULT_REVOCATION_CAPACITY);
         assert!(format!("{b:?}").contains("Bouncer"));
     }
 }
