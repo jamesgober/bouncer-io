@@ -29,16 +29,51 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: scaffold (<code>0.1.0</code>).</strong> No functional code yet. The design is written down in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a> and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>; the public API is locked in <code>0.2.0</code>.
+        <strong>Status: design lock (<code>0.2.0</code>).</strong> The public API is written down in <a href="./docs/API.md"><code>docs/API.md</code></a>; the code lands version by version as <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a> lists, starting with the door and tickets in <code>0.3.0</code>. Design and decisions: <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>.
     </blockquote>
 </div>
 
 <hr>
 <br>
 
+## Quick start
+
+The planned Tier 1 API (see [`docs/API.md`](./docs/API.md)): the door, a request, a revocation from another thread, and the checkpoint that throws the request out.
+
+```rust
+use bouncer_io::{Bouncer, Collected, Reason, RequestId, Verdict};
+
+let bouncer = Bouncer::new();
+
+// The door: before reading a byte. A refusal means close abortively.
+let conn = bouncer.door("203.0.113.7".parse()?)?;
+
+// A request on that connection, and the buffer its response is built in.
+let mut request = conn.request(RequestId(1))?;
+let mut reply = Collected::new();
+
+// Anywhere, any thread: an administrator throws this connection out.
+bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+
+// Between pipeline stages: one atomic load until something is revoked.
+if let Verdict::Deny(_) = request.checkpoint() {
+    request.deny_and_eject(&mut reply);   // wipe, replace, eject, remember
+}
+```
+
+Banning is one line, and a logout stops the session's running requests:
+
+```rust
+bouncer.ban("2001:db8:7::/48".parse::<bouncer_io::Cidr>()?)?;
+bouncer.revoke(session_key, Reason::LOGOUT)?;
+```
+
+<hr>
+<br>
+
 ## Scope
 
-Admission at the door (ban memory by address, prefix, fingerprint, session, and account; prefix escalation; per-prefix budgets), in-flight revocation through epoch-gated checkpoints (between stages, before commit, and at egress through net-io), wipe-replace-eject with a zeroizing response buffer, strikes from every layer, persistence and sharing of bans. It is not a rate limiter, a parser, or the detection layer (that is sentinel-sec).
+Admission at the door (ban memory by address, prefix, fingerprint, session, and account; prefix escalation; per-prefix budgets), in-flight revocation through epoch-gated checkpoints (between stages, before commit, and at egress through net-io), wipe-replace-eject with a zeroizing response buffer, strikes from every layer, persistence and sharing of bans. Rate and concurrency budgets are one tool at the door, not the purpose. It is not a rate limiter, a parser, or the detection layer (that is sentinel-sec). Bans and revocations are shared across nodes as mergeable deltas, and every action is reported as a security event.
 
 See [`dev/PLAN.md`](./dev/PLAN.md) for the full scope, what is deliberately left to other crates, and the decision log.
 
@@ -55,8 +90,8 @@ See <a href="./dev/DIRECTIVES.md"><code>dev/DIRECTIVES.md</code></a> for enginee
     <h2>License</h2>
     <p>Licensed under either of</p>
     <ul>
-        <li><b>Apache License, Version 2.0</b> &mdash; <a href="./LICENSE-APACHE">LICENSE-APACHE</a></li>
-        <li><b>MIT License</b> &mdash; <a href="./LICENSE-MIT">LICENSE-MIT</a></li>
+        <li><b>Apache License, Version 2.0</b> (<a href="./LICENSE-APACHE">LICENSE-APACHE</a>)</li>
+        <li><b>MIT License</b> (<a href="./LICENSE-MIT">LICENSE-MIT</a>)</li>
     </ul>
     <p>at your option.</p>
 </div>
