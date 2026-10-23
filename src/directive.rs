@@ -178,6 +178,10 @@ impl Reason {
     pub const IMPORTED: Reason = Reason(9);
     /// The connection closed while the request was live.
     pub const CONNECTION_CLOSED: Reason = Reason(10);
+    /// The strict posture (a lockdown).
+    pub const LOCKDOWN: Reason = Reason(11);
+    /// Over a budget.
+    pub const BUDGET: Reason = Reason(12);
 
     /// A project's own code; values below 1000 are raised to 1000.
     #[must_use]

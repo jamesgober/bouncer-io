@@ -709,9 +709,20 @@ fn test_apply_lift_and_invalid_targets() {
         b.apply(Directive::lift(ConnId(1))).err(),
         Some(BouncerError::InvalidTarget)
     );
-    assert_eq!(
+    // Identity throttles work from 0.5; connections and requests are never
+    // throttle targets.
+    assert!(
         b.apply(Directive::throttle(
             SessionKey::from_digest([1; 16]),
+            4,
+            Duration::from_secs(10)
+        ))
+        .unwrap()
+        .throttled
+    );
+    assert_eq!(
+        b.apply(Directive::throttle(
+            RequestId(1),
             4,
             Duration::from_secs(10)
         ))

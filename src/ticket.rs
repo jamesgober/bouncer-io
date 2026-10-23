@@ -13,6 +13,7 @@ use std::{
 use crate::{
     bans::table::{self, Probe, TableKey},
     bouncer::Shared,
+    budgets::{IdentityKey, IdentityKind},
     collected::Collected,
     door::{Judgement, Provenance, Refusal},
     error::BouncerError,
@@ -22,10 +23,10 @@ use crate::{
     maintain::CloseKind,
     registry::{
         CHILD_MASK, CODE_SHIFT, Cell, F_CANCELLED, F_CHARGED, F_CLIENT_BOUND, F_DETACHED, F_IMMUNE,
-        F_KEEP_CONNECTION, F_LIVE, F_PENDING_CLIENT, F_PROXY_HOP, F_REVOKED, K_ACCOUNT,
-        K_FINGERPRINT, K_REQUEST, K_SESSION, K_SOURCE, K_TENANT, KIND_CONNECTION, KIND_REQUEST,
-        NIL, P_ACCOUNT, P_FINGERPRINT, P_REQUEST, P_SESSION, P_SOURCE, P_SOURCE_V6, P_TENANT,
-        PRESENT_SHIFT, PROVENANCE_MASK, PROVENANCE_SHIFT, Shard, generation,
+        F_KEEP_CONNECTION, F_LIVE, F_PENDING_CLIENT, F_PROXY_HOP, F_REVOKED, F_TENANT_CHARGED,
+        K_ACCOUNT, K_FINGERPRINT, K_REQUEST, K_SESSION, K_SOURCE, K_TENANT, KIND_CONNECTION,
+        KIND_REQUEST, NIL, P_ACCOUNT, P_FINGERPRINT, P_REQUEST, P_SESSION, P_SOURCE, P_SOURCE_V6,
+        P_TENANT, PRESENT_SHIFT, PROVENANCE_MASK, PROVENANCE_SHIFT, Shard, generation,
     },
     sync::{Ordering, fence, update},
     verdict::{Denial, DenialCode, Reference, Verdict},
@@ -63,6 +64,55 @@ impl TicketKind {
             TicketKind::Request
         } else {
             TicketKind::Connection
+        }
+    }
+}
+
+/// The lane a request is charged against: mirrors the gateway's lanes.
+///
+/// # Examples
+///
+/// ```
+/// use bouncer_io::{Bouncer, Budgets, LaneClass, Rate, RequestId};
+/// let bouncer = Bouncer::builder()
+///     .budgets(Budgets::off().lane_rate(LaneClass::Auth, Rate::per_minute(2)))
+///     .try_build()?;
+/// let conn = bouncer.door("192.0.2.1".parse()?)?;
+/// for id in 0..2 {
+///     assert!(conn.request(RequestId(id))?.bind_lane(LaneClass::Auth).is_pass());
+/// }
+/// assert!(conn.request(RequestId(2))?.bind_lane(LaneClass::Auth).is_deny());   // 429
+/// assert!(conn.request(RequestId(3))?.bind_lane(LaneClass::Normal).is_pass()); // no budget on that lane
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LaneClass {
+    /// Health checks and other traffic that must always get through.
+    Critical,
+    /// Administration.
+    Admin,
+    /// Logins, token refresh, password resets.
+    Auth,
+    /// Writes.
+    Write,
+    /// Ordinary reads.
+    Normal,
+    /// Exports, reports, bulk jobs.
+    Bulk,
+}
+
+impl LaneClass {
+    pub(crate) const COUNT: usize = 6;
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            LaneClass::Critical => 0,
+            LaneClass::Admin => 1,
+            LaneClass::Auth => 2,
+            LaneClass::Write => 3,
+            LaneClass::Normal => 4,
+            LaneClass::Bulk => 5,
         }
     }
 }
@@ -520,7 +570,12 @@ impl Ticket {
         // A PROXY-protocol client is a connection: it is charged the door
         // budgets the proxy hop was not.
         let charge = self.kind == TicketKind::Connection && !exempt;
-        if charge && shared.budgets.admit(addr, now).is_err() {
+        if charge
+            && shared
+                .budgets
+                .admit(addr, now, shared.door_divisor())
+                .is_err()
+        {
             return self.deny(DenialCode::TooManyRequests);
         }
         let present = write_source(cell, addr);
@@ -678,7 +733,7 @@ impl Ticket {
     /// ```
     pub fn bind_tenant(&mut self, key: TenantKey) -> Verdict {
         let k1 = key.0;
-        self.bind(
+        let verdict = self.bind(
             P_TENANT,
             K_TENANT,
             None,
@@ -695,7 +750,150 @@ impl Ticket {
                     now,
                 )
             },
-        )
+        );
+        if verdict.is_deny() {
+            return verdict;
+        }
+        let shard = Arc::clone(&self.shard);
+        let shared = &shard.shared;
+        if !shared.identity.has_tenant() || self.exempt(shared) {
+            return verdict;
+        }
+        let now = shared.now();
+        let tenant = IdentityKey {
+            kind: IdentityKind::Tenant,
+            k0: 0,
+            k1,
+        };
+        let factor = shared.identity.factor(tenant, now.secs());
+        match shared.identity.tenant(k1, factor, now) {
+            Ok(false) => verdict,
+            Ok(true) => {
+                let cell = shared.registry.cell(self.index);
+                let generation_now = self.generation;
+                let set = update(&cell.state, Ordering::AcqRel, Ordering::Acquire, |st| {
+                    (generation(st) == generation_now && st & F_LIVE != 0)
+                        .then_some(st | F_TENANT_CHARGED)
+                });
+                if set.is_err() {
+                    shared.identity.release_tenant(k1);
+                    return self.deny(DenialCode::Unavailable);
+                }
+                verdict
+            }
+            Err(_) => self.over_budget(shared),
+        }
+    }
+
+    /// Selects the lane budget ([`Budgets::lane_rate`](crate::Budgets::lane_rate))
+    /// this ticket is charged against, keyed by the session when one is
+    /// bound, else by the client (IPv4 address, IPv6 /64).
+    ///
+    /// Throttles on the source, session, account, tenant, or fingerprint
+    /// multiply the cost. Over budget, the ticket is denied with
+    /// `TooManyRequests`; a request keeps its connection, so the denial is an
+    /// ordinary 429. Allow-listed sources and lanes with no budget pass.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Budgets, DenialCode, LaneClass, Rate, RequestId, SessionKey, Verdict};
+    /// let bouncer = Bouncer::builder()
+    ///     .budgets(Budgets::off().lane_rate(LaneClass::Write, Rate::per_second(1)))
+    ///     .try_build()?;
+    /// let conn = bouncer.door("192.0.2.70".parse()?)?;
+    /// let session = SessionKey::from_digest([9; 16]);
+    /// let mut first = conn.request(RequestId(1))?;
+    /// assert!(first.bind_session(session).is_pass());
+    /// assert!(first.bind_lane(LaneClass::Write).is_pass());
+    /// let mut second = conn.request(RequestId(2))?;
+    /// assert!(second.bind_session(session).is_pass());
+    /// let Verdict::Deny(denial) = second.bind_lane(LaneClass::Write) else { unreachable!() };
+    /// assert_eq!(denial.code, DenialCode::TooManyRequests);
+    /// assert!(conn.request(RequestId(3)).is_ok(), "the connection stays");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn bind_lane(&mut self, lane: LaneClass) -> Verdict {
+        let verdict = self.checkpoint();
+        if verdict.is_deny() {
+            return verdict;
+        }
+        let shard = Arc::clone(&self.shard);
+        let shared = &shard.shared;
+        if !shared.identity.has_lanes() || self.exempt(shared) {
+            return verdict;
+        }
+        let cell = shared.registry.cell(self.index);
+        let present = cell.present();
+        let now = shared.now();
+        let secs = now.secs();
+        let word = |i: usize| cell.keys[i].load(Ordering::Relaxed);
+        let id = |kind: IdentityKind, k0: u64, k1: u64| IdentityKey { kind, k0, k1 };
+        let source = source_of(cell);
+        let who = if present & P_SESSION != 0 {
+            id(IdentityKind::Session, word(K_SESSION), word(K_SESSION + 1))
+        } else if let Some(a) = source {
+            IdentityKey::client(a)
+        } else {
+            return verdict;
+        };
+        let mut factor = shared.identity.factor(who, secs);
+        if let Some(a) = source {
+            factor = factor.max(shared.budgets.source_factor(a, secs));
+        }
+        let others = [
+            (
+                P_ACCOUNT,
+                id(IdentityKind::Account, word(K_ACCOUNT), word(K_ACCOUNT + 1)),
+            ),
+            (P_TENANT, id(IdentityKind::Tenant, 0, word(K_TENANT))),
+            (
+                P_FINGERPRINT,
+                id(
+                    IdentityKind::Fingerprint,
+                    word(K_FINGERPRINT),
+                    word(K_FINGERPRINT + 1),
+                ),
+            ),
+        ];
+        for (bit, key) in others {
+            if present & bit != 0 {
+                factor = factor.max(shared.identity.factor(key, secs));
+            }
+        }
+        match shared.identity.lane(lane, who, factor, now) {
+            Ok(()) => verdict,
+            Err(_) => self.over_budget(shared),
+        }
+    }
+
+    /// Whether this ticket's source is allow-listed (immune or exempt from
+    /// budgets).
+    fn exempt(&self, shared: &Shared) -> bool {
+        let cell = shared.registry.cell(self.index);
+        if cell.state.load(Ordering::Acquire) & F_IMMUNE != 0 {
+            return true;
+        }
+        source_of(cell).is_some_and(|a| crate::allow::lookup(&shared.allow, a).is_some())
+    }
+
+    /// Denies this ticket for an identity budget: `TooManyRequests`, and a
+    /// request keeps its connection.
+    fn over_budget(&mut self, shared: &Shared) -> Verdict {
+        let cell = shared.registry.cell(self.index);
+        let generation_now = self.generation;
+        mark_revoked(cell, generation_now, DenialCode::TooManyRequests);
+        if self.kind == TicketKind::Request {
+            let _ = update(&cell.state, Ordering::AcqRel, Ordering::Acquire, |st| {
+                (generation(st) == generation_now).then_some(st | F_KEEP_CONNECTION)
+            });
+        }
+        self.seen = SEEN_ALWAYS_CHECK;
+        let verdict = self.deny(DenialCode::TooManyRequests);
+        if let Verdict::Deny(d) = &verdict {
+            events::emit_ticket(shared, events::signals::BUDGET_REFUSED, cell, d.reference);
+        }
+        verdict
     }
 
     /// Writes a key, publishes it, then checks it (the binder's half of the
@@ -1229,6 +1427,11 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
                 |w| (w & CHILD_MASK == me).then_some(w | CHILD_MASK),
             );
         }
+    }
+    if st & F_TENANT_CHARGED != 0 {
+        shared
+            .identity
+            .release_tenant(cell.keys[K_TENANT].load(Ordering::Relaxed));
     }
     if !retire {
         shared.registry.push(index);

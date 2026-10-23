@@ -11,7 +11,7 @@ use crate::{
         BanDuration, BanId, BanMemory, BanSpec, DurationPolicy, Guards, LiftSpec, Lifted,
         compiled::PrefixSet,
     },
-    budgets::{Budgets, DoorBudgets},
+    budgets::{Budgets, DoorBudgets, IdentityBudgets, IdentityKey, IdentityKind},
     directive::{Action, Actor, Applied, BanKeys, Directive, Reason},
     door::{Judgement, Provenance, Refusal},
     error::{BouncerError, ConfigError, ConfigProblem},
@@ -20,13 +20,13 @@ use crate::{
     keys::{BanKey, Cidr, ConnId, RequestId, normalize},
     maintain::{self, Ejector, Maintenance, MaintenanceReport},
     registry::{
-        F_CHARGED, F_DETACHED, F_IMMUNE, F_LIVE, F_PROXY_HOP, KIND_CONNECTION, Registry, Shard,
-        generation,
+        F_CHARGED, F_DETACHED, F_IMMUNE, F_LIVE, F_PROXY_HOP, KIND_CONNECTION, KIND_REQUEST,
+        P_SESSION, Registry, Shard, generation,
     },
     revoke::{Record, Revocation, RevocationEpoch, Revocations, RevokeMode, Target, target_key},
     strikes::{Counters, Enforcement, Posture, StrikeRules},
-    sync::Ordering,
-    ticket::{self, Issue, Ticket, TicketKind, TicketTag, subject_of},
+    sync::{AtomicU32, Ordering},
+    ticket::{self, Issue, Ticket, TicketKind, TicketTag, mark_revoked, subject_of},
     time::Now,
     verdict::{DenialCode, DenialTable, Reference, Verdict},
 };
@@ -52,6 +52,11 @@ pub(crate) struct Shared {
     pub(crate) epoch: Arc<RevocationEpoch>,
     pub(crate) revocations: Revocations,
     pub(crate) budgets: DoorBudgets,
+    pub(crate) identity: IdentityBudgets,
+    /// 0 normal, 1 strict.
+    posture: AtomicU32,
+    strict_divisor: u32,
+    strict_revokes_unauthenticated: bool,
     pub(crate) strikes: StrikeRules,
     pub(crate) counters: Counters,
     pub(crate) enforcement: Enforcement,
@@ -76,8 +81,23 @@ impl Shared {
         }
     }
 
+    #[inline]
     pub(crate) fn posture(&self) -> Posture {
-        Posture::Normal
+        if self.posture.load(Ordering::Relaxed) == 0 {
+            Posture::Normal
+        } else {
+            Posture::Strict
+        }
+    }
+
+    /// What one admission costs at the door: 1, or the strict divisor.
+    #[inline]
+    pub(crate) fn door_divisor(&self) -> u32 {
+        if self.posture.load(Ordering::Relaxed) == 0 {
+            1
+        } else {
+            self.strict_divisor
+        }
     }
 
     /// Adds a ban and reports it.
@@ -323,7 +343,7 @@ impl Bouncer {
             }
         };
         if charge {
-            if let Err(over) = shared.budgets.admit(peer, now) {
+            if let Err(over) = shared.budgets.admit(peer, now, shared.door_divisor()) {
                 let r = Refusal::OverBudget {
                     retry_after: over.0,
                 };
@@ -765,23 +785,37 @@ impl Bouncer {
         duration: Duration,
     ) -> Result<(), BouncerError> {
         let shared = &self.inner.shared;
-        let cidr = match *target {
+        let now = shared.now().secs();
+        let until = now.saturating_add(crate::time::ceil_secs(duration).max(1));
+        let factor = factor.clamp(2, 16);
+        let identity = |kind: IdentityKind, k0: u64, k1: u64| {
+            shared
+                .identity
+                .throttle(IdentityKey { kind, k0, k1 }, factor, until, now);
+        };
+        match *target {
             Target::Source(c) => {
                 if shared.proxies.covers(&c) {
                     return Err(BouncerError::TrustedProxyTarget);
                 }
-                match c.family() {
+                let cidr = match c.family() {
                     crate::keys::Family::V6 if c.len() > 64 => c.parent(64).unwrap_or(c),
                     _ => c,
-                }
+                };
+                shared.budgets.throttle(&cidr, factor, until, now);
             }
-            _ => return Err(BouncerError::InvalidTarget),
-        };
-        let now = shared.now().secs();
-        let until = now.saturating_add(crate::time::ceil_secs(duration).max(1));
-        shared
-            .budgets
-            .throttle(&cidr, factor.clamp(2, 16), until, now);
+            Target::Session(k) => {
+                let (k0, k1) = k.words();
+                identity(IdentityKind::Session, k0, k1);
+            }
+            Target::Account(k) => identity(IdentityKind::Account, (k.0 >> 64) as u64, k.0 as u64),
+            Target::Tenant(k) => identity(IdentityKind::Tenant, 0, k.0),
+            Target::Fingerprint(k) => {
+                let (k0, k1) = k.words();
+                identity(IdentityKind::Fingerprint, k0, k1);
+            }
+            Target::Connection(_) | Target::Request(_) => return Err(BouncerError::InvalidTarget),
+        }
         Ok(())
     }
 
@@ -866,6 +900,69 @@ impl Bouncer {
         ticket::release_cell(shard, index, connection.generation())
     }
 
+    /// Switches between [`Posture::Normal`] and [`Posture::Strict`]
+    /// (lockdown).
+    ///
+    /// Strict divides the door budgets by
+    /// [`strict_budget_divisor`](BouncerBuilder::strict_budget_divisor)
+    /// and switches the strike kinds listed in
+    /// [`Enforcement::strict`](crate::Enforcement::strict) from observe to
+    /// enforce. Nothing already admitted is revoked unless
+    /// [`strict_revokes_unauthenticated`](BouncerBuilder::strict_revokes_unauthenticated)
+    /// is set; then every request ticket with no bound session is revoked.
+    /// Refusing whole listeners during a lockdown is the transport's job.
+    /// A change is reported as `bouncer.posture.changed`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Posture};
+    /// let bouncer = Bouncer::new();
+    /// bouncer.set_posture(Posture::Strict);
+    /// assert_eq!(bouncer.posture(), Posture::Strict);
+    /// bouncer.set_posture(Posture::Normal);
+    /// ```
+    pub fn set_posture(&self, posture: Posture) {
+        let shared = &self.inner.shared;
+        let code = u32::from(posture == Posture::Strict);
+        if shared.posture.swap(code, Ordering::AcqRel) == code {
+            return;
+        }
+        Emit {
+            actor: Actor::App,
+            reason: Reason::LOCKDOWN,
+            ..Emit::new(events::signals::POSTURE_CHANGED)
+        }
+        .send(shared);
+        if posture != Posture::Strict || !shared.strict_revokes_unauthenticated {
+            return;
+        }
+        let mut any = false;
+        for cell in shared.registry.cells.iter() {
+            let st = cell.state.load(Ordering::Acquire);
+            if st & F_LIVE == 0
+                || st & 0xff != KIND_REQUEST
+                || st & F_IMMUNE != 0
+                || cell.present() & P_SESSION != 0
+            {
+                continue;
+            }
+            any |= mark_revoked(cell, generation(st), DenialCode::Unavailable);
+        }
+        if any {
+            // Marked before the bump: a checkpoint that sees the new epoch
+            // sees the flags.
+            shared.epoch.bump();
+            shared.maintenance.wake();
+        }
+    }
+
+    /// The current posture.
+    #[must_use]
+    pub fn posture(&self) -> Posture {
+        self.inner.shared.posture()
+    }
+
     /// The bouncer's monotonic time base, for the `_at` functions.
     #[must_use]
     pub fn now(&self) -> Now {
@@ -919,6 +1016,7 @@ impl Bouncer {
             + shared.proxies.bytes()
             + shared.revocations.bytes()
             + shared.budgets.bytes()
+            + shared.identity.bytes()
             + shared.counters.bytes();
         c
     }
@@ -996,6 +1094,8 @@ pub struct BouncerBuilder {
     max_unchecked: Duration,
     maintainer: bool,
     revocation_rate_limit: u32,
+    strict_budget_divisor: u8,
+    strict_revokes_unauthenticated: bool,
 }
 
 impl Default for BouncerBuilder {
@@ -1023,6 +1123,8 @@ impl Default for BouncerBuilder {
             max_unchecked: Duration::from_secs(60),
             maintainer: false,
             revocation_rate_limit: 10_000,
+            strict_budget_divisor: 2,
+            strict_revokes_unauthenticated: false,
         }
     }
 }
@@ -1184,6 +1286,21 @@ impl BouncerBuilder {
         self
     }
 
+    /// How much [`Posture::Strict`] divides the door budgets by (default 2):
+    /// each admission costs that many tokens and the concurrency limits
+    /// shrink by it. Zero is refused at `try_build`.
+    pub fn strict_budget_divisor(mut self, divisor: u8) -> Self {
+        self.strict_budget_divisor = divisor;
+        self
+    }
+
+    /// Whether entering [`Posture::Strict`] revokes every request ticket
+    /// with no bound session (default `false`).
+    pub fn strict_revokes_unauthenticated(mut self, revoke: bool) -> Self {
+        self.strict_revokes_unauthenticated = revoke;
+        self
+    }
+
     /// Validates the configuration and allocates every table.
     ///
     /// # Errors
@@ -1245,6 +1362,11 @@ impl BouncerBuilder {
         self.strikes.validate()?;
         self.denials.validate()?;
         self.budgets.validate()?;
+        if self.strict_budget_divisor == 0 {
+            return Err(
+                ConfigError::new("strict_budget_divisor", ConfigProblem::InvalidFactor).into(),
+            );
+        }
         let allow = self.allow.compile()?;
         let maintainer = self.maintainer;
         let bouncer = self.build_with(allow);
@@ -1290,6 +1412,7 @@ impl BouncerBuilder {
         let mut rng = crate::hash::Rng::from_seed(seeds.rng ^ 0x0b0b);
         let derived = |rng: &mut crate::hash::Rng| HashKey::new(rng.next_u64(), rng.next_u64());
         let budgets = DoorBudgets::new(&self.budgets, derived(&mut rng));
+        let identity = IdentityBudgets::new(&self.budgets, derived(&mut rng), Now::default());
         let revocation_rate =
             rate_net::Quota::rate(self.revocation_rate_limit, Duration::from_secs(1))
                 .ok()
@@ -1314,6 +1437,10 @@ impl BouncerBuilder {
             epoch: Arc::clone(&epoch),
             revocations: Revocations::new(self.revocation_capacity, derived(&mut rng)),
             budgets,
+            identity,
+            posture: AtomicU32::new(0),
+            strict_divisor: u32::from(self.strict_budget_divisor.max(1)),
+            strict_revokes_unauthenticated: self.strict_revokes_unauthenticated,
             strikes: self.strikes.clone(),
             counters: Counters::new(65_536, derived(&mut rng)),
             enforcement: self.enforcement,

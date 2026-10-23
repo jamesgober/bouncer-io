@@ -91,7 +91,7 @@ pub use crate::{
     maintain::{CloseKind, Ejector, MaintenanceReport},
     revoke::{Revocation, RevocationEpoch, RevokeMode, Target},
     strikes::{Enforcement, IgnoredBecause, Mode, Posture, StrikeKind, StrikeOutcome, StrikeRules},
-    ticket::{Ticket, TicketId, TicketKind, TicketTag},
+    ticket::{LaneClass, Ticket, TicketId, TicketKind, TicketTag},
     time::Now,
     verdict::{Denial, DenialCode, DenialTable, Reference, Verdict},
 };

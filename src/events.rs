@@ -164,11 +164,13 @@ const fn catalog(id: u32) -> (&'static str, Category, f32) {
             Category::Integrity,
             5.0,
         ),
+        5 => ("bouncer.budget.refused", Category::Abuse, 2.0),
         10 => ("bouncer.revoke.applied", Category::Access, 5.0),
         11 => ("bouncer.denial.wipe_eject", Category::Access, 5.0),
         12 => ("bouncer.commit.blocked", Category::Integrity, 6.0),
         13 => ("bouncer.egress.blocked", Category::Integrity, 6.0),
         14 => ("bouncer.checkpoint.missing", Category::Integrity, 5.0),
+        15 => ("bouncer.posture.changed", Category::Policy, 4.0),
         20 => ("bouncer.ban.added", Category::Access, 4.0),
         21 => ("bouncer.ban.escalated", Category::Access, 5.0),
         22 => ("bouncer.ban.lifted", Category::Policy, 1.0),
@@ -205,6 +207,8 @@ pub mod signals {
     pub const DOOR_REFUSED_REGISTRY_FULL: SignalId = SignalId::new(3);
     /// A proxied connection never bound a real client.
     pub const DOOR_PROXY_HOP_UNRESOLVED: SignalId = SignalId::new(4);
+    /// Over a lane, tenant rate, or tenant in-flight budget (sampled).
+    pub const BUDGET_REFUSED: SignalId = SignalId::new(5);
     /// Any revocation.
     pub const REVOKE_APPLIED: SignalId = SignalId::new(10);
     /// A request was wiped, denied, and ejected.
@@ -215,6 +219,8 @@ pub mod signals {
     pub const EGRESS_BLOCKED: SignalId = SignalId::new(13);
     /// A revoked ticket went without a checkpoint; the maintainer ejected it.
     pub const CHECKPOINT_MISSING: SignalId = SignalId::new(14);
+    /// The posture changed (lockdown entered or left).
+    pub const POSTURE_CHANGED: SignalId = SignalId::new(15);
     /// A ban was inserted.
     pub const BAN_ADDED: SignalId = SignalId::new(20);
     /// A prefix escalation.
