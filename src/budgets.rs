@@ -247,6 +247,10 @@ impl Budgets {
         self
     }
 
+    pub(crate) fn capacity_keys(&self) -> u32 {
+        self.capacity.max(1024)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         if self.capacity == 0 || self.capacity > 1 << 24 {
             return Err(ConfigError::new(
@@ -518,6 +522,37 @@ impl DoorBudgets {
                         return Err(OverBudget(Duration::ZERO));
                     }
                     taken[i] = Some(slot);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The datagram budget step: the rate tiers only (no concurrency). An
+    /// unverified source is charged at its prefix only, so a forged address
+    /// cannot spend a real client's budget.
+    pub(crate) fn datagram(
+        &self,
+        addr: IpAddr,
+        verified: bool,
+        now: Now,
+        divisor: u32,
+    ) -> Result<(), OverBudget> {
+        let Some(tiers) = &self.rate else {
+            return Ok(());
+        };
+        let keys = self.keys(addr);
+        let now_d = Duration::from_nanos(now.as_nanos());
+        let now_secs = now.secs();
+        let first = usize::from(!verified);
+        for (tier, &key) in tiers.iter().zip(keys.iter()).skip(first) {
+            let n = self.factor(key, now_secs).saturating_mul(divisor);
+            let cells = &tier.cells;
+            let burst = tier.burst;
+            let idle = |slot: usize| cells[slot].peek_at(now_d).remaining() >= burst;
+            if let Some((slot, _)) = tier.claims.find_or_claim(key, idle, |s| cells[s].reset()) {
+                if let Decision::Deny { retry_after } = cells[slot].check_n_at(n, now_d) {
+                    return Err(OverBudget(retry_after));
                 }
             }
         }

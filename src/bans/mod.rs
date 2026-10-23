@@ -7,6 +7,8 @@
 //! compiled set through a per-thread cache keyed by a version word.
 
 pub(crate) mod compiled;
+pub(crate) mod escalate;
+pub(crate) mod offenders;
 pub(crate) mod table;
 pub(crate) mod view;
 
@@ -19,6 +21,8 @@ use std::{
 
 use self::{
     compiled::PrefixSet,
+    escalate::{EscalationPolicy, Plan, Tracker},
+    offenders::{Offence, Offenders},
     table::{Entry, FLAG_EVICTABLE, Inserted, Probe, Table, TableKey, TableWriter},
 };
 use crate::{
@@ -289,6 +293,7 @@ pub struct DurationPolicy {
     step_cap: u8,
     max: Duration,
     jitter: Duration,
+    half_life: Duration,
 }
 
 impl Default for DurationPolicy {
@@ -299,6 +304,7 @@ impl Default for DurationPolicy {
             step_cap: 20,
             max: Duration::from_secs(7 * 24 * 3600),
             jitter: Duration::from_secs(60),
+            half_life: Duration::from_secs(24 * 3600),
         }
     }
 }
@@ -339,12 +345,34 @@ impl DurationPolicy {
         self
     }
 
+    /// How fast offender memory forgets: an offence counts half after this
+    /// long (default 24 hours). Offences rounded from the decayed score
+    /// drive the next ban's length.
+    #[must_use]
+    pub fn half_life(mut self, d: Duration) -> Self {
+        self.half_life = d;
+        self
+    }
+
+    /// The first ban's length in whole seconds.
+    pub(crate) fn base_secs(&self) -> u64 {
+        ceil_secs(self.base)
+    }
+
+    /// The longest ban in whole seconds, before jitter.
+    pub(crate) fn max_secs(&self) -> u64 {
+        ceil_secs(self.max)
+    }
+
     pub(crate) fn validate(&self, field: &'static str) -> Result<(), ConfigError> {
         if self.base.is_zero() || self.max < self.base {
             return Err(ConfigError::new(field, ConfigProblem::InvalidDuration));
         }
         if self.factor == 0 {
             return Err(ConfigError::new(field, ConfigProblem::InvalidFactor));
+        }
+        if self.half_life.is_zero() {
+            return Err(ConfigError::new(field, ConfigProblem::InvalidDuration));
         }
         Ok(())
     }
@@ -416,6 +444,8 @@ struct Writer {
     compound: HashMap<(u8, u64, u64), (crate::keys::FingerprintKey, Cidr)>,
     rng: Rng,
     next_id: u64,
+    offenders: Offenders,
+    tracker: Tracker,
 }
 
 /// The per-thread cache of the administrator set: bouncer id, version, set.
@@ -442,6 +472,7 @@ pub(crate) struct BanMemory {
     auto_v6: [u64; 3],
     host_v6: u8,
     policy: DurationPolicy,
+    escalation: EscalationPolicy,
     fingerprint_keys: (HashKey, HashKey),
     /// Expired entries reclaimed by inserts, and entries evicted.
     expired: std::sync::atomic::AtomicU64,
@@ -461,6 +492,7 @@ impl BanMemory {
         v4_lengths: &[u8],
         v6_lengths: &[u8],
         policy: DurationPolicy,
+        escalation: EscalationPolicy,
         rng_seed: u64,
     ) -> BanMemory {
         let mut auto_v4 = 0u64;
@@ -500,11 +532,17 @@ impl BanMemory {
                 compound: HashMap::new(),
                 rng,
                 next_id: 1,
+                offenders: Offenders::new(
+                    (capacity as usize / 4).max(1024),
+                    ceil_secs(policy.half_life),
+                ),
+                tracker: Tracker::default(),
             }),
             auto_v4,
             auto_v6,
             host_v6,
             policy,
+            escalation,
             fingerprint_keys,
             expired: std::sync::atomic::AtomicU64::new(0),
             evicted: std::sync::atomic::AtomicU64::new(0),
@@ -703,6 +741,7 @@ impl BanMemory {
     }
 
     /// Adds a ban; `policy` overrides the duration policy (per strike kind).
+    #[cfg(all(test, not(bouncer_loom)))]
     pub(crate) fn ban_with(
         &self,
         spec: &BanSpec,
@@ -710,6 +749,18 @@ impl BanMemory {
         now: Now,
         policy: Option<DurationPolicy>,
     ) -> Result<BanId, BouncerError> {
+        self.ban_plan(spec, guards, now, policy).map(|(id, _)| id)
+    }
+
+    /// Adds a ban and reports an escalation it makes due: the parent prefix
+    /// and the children to fold, for the caller to check and apply.
+    pub(crate) fn ban_plan(
+        &self,
+        spec: &BanSpec,
+        guards: &Guards<'_>,
+        now: Now,
+        policy: Option<DurationPolicy>,
+    ) -> Result<(BanId, Option<Plan>), BouncerError> {
         let key = spec.key.normalized();
         self.guard(&key, guards)?;
         let placement = self.place(&key, spec.actor)?;
@@ -725,10 +776,21 @@ impl BanMemory {
         let issued = clamp_secs(now_secs);
         let mut w = self.lock();
         let previous = match &placement {
-            Placement::Dynamic(k) => self
-                .table
-                .get_owned(k)
-                .map(|e| e.offences.saturating_add(1)),
+            Placement::Dynamic(k) => {
+                // A ban still in force counts its own history; once it has
+                // expired, offender memory (with its decay) decides.
+                let held = self
+                    .table
+                    .get_owned(k)
+                    .filter(|e| !e.expired(now_secs))
+                    .map(|e| e.offences.saturating_add(1));
+                let remembered = w.offenders.offences(k, now_secs);
+                match held {
+                    Some(h) => Some(h.max(remembered)),
+                    None if remembered > 0 => Some(remembered),
+                    None => None,
+                }
+            }
             Placement::Admin(_) => None,
         };
         let until = match spec.duration {
@@ -741,6 +803,14 @@ impl BanMemory {
                 end(now_secs, secs.max(1))
             }
         };
+        // A wider ban that already outlasts this one covers it: automation
+        // stores nothing new (the table stays compact under a flood). An
+        // explicit ban is stored anyway, so lifting the prefix keeps it.
+        if let (Placement::Dynamic(tkey), true) = (&placement, spec.actor.is_automated()) {
+            if let Some(covering) = self.covering_wider(tkey, until, now_secs) {
+                return Ok((BanId(covering), None));
+            }
+        }
         let id = w.next_id;
         w.next_id += 1;
         let actor = spec.actor.kind();
@@ -767,8 +837,8 @@ impl BanMemory {
                     .insert(&mut writer.table, entry, now_secs, |old| {
                         merge(old, &entry, now_secs)
                     });
-                match result {
-                    Ok(Inserted::Merged { previous }) => Ok(BanId(previous.id)),
+                let id = match result {
+                    Ok(Inserted::Merged { previous }) => BanId(previous.id),
                     Ok(Inserted::New { removed, evicted }) => {
                         if let Some(r) = removed {
                             self.count(writer, &r.key, false);
@@ -783,12 +853,17 @@ impl BanMemory {
                         if let BanKey::FingerprintIn(fp, c) = key {
                             self.remember_compound(writer, &tkey, fp, c);
                         }
-                        Ok(BanId(id))
+                        BanId(id)
                     }
-                    Err(()) => Err(BouncerError::BanTableFull {
-                        capacity: self.table.capacity(),
-                    }),
-                }
+                    Err(()) => {
+                        return Err(BouncerError::BanTableFull {
+                            capacity: self.table.capacity(),
+                        });
+                    }
+                };
+                writer.offenders.record(tkey, now_secs);
+                let plan = self.plan(writer, &tkey, now_secs);
+                Ok((id, plan))
             }
             Placement::Admin(cidr) => {
                 let entry = AdminEntry {
@@ -818,9 +893,137 @@ impl BanMemory {
                     }
                 };
                 self.publish_admin(&writer.admin);
-                Ok(BanId(id))
+                Ok((BanId(id), None))
             }
         }
+    }
+
+    /// The id of an unexpired ban at a shorter automatic length that covers
+    /// `tkey` and lasts at least until `until` (0 = permanent).
+    fn covering_wider(&self, tkey: &TableKey, until: u32, now_secs: u64) -> Option<u64> {
+        let c = view::cidr_of(tkey)?;
+        (0..c.len())
+            .rev()
+            .filter(|&l| self.is_auto(c.family(), l))
+            .filter_map(|l| c.parent(l))
+            .filter_map(|p| self.table.get_owned(&Self::prefix_key(&p)))
+            .find(|e| !e.expired(now_secs) && (e.until == 0 || (until != 0 && e.until >= until)))
+            .map(|e| e.id)
+    }
+
+    /// Notes a newly banned address or prefix for escalation; returns the
+    /// plan when its parent is due.
+    fn plan(&self, w: &mut Writer, tkey: &TableKey, now_secs: u64) -> Option<Plan> {
+        let child = view::cidr_of(tkey)?;
+        let parent = Tracker::parent_of(&self.escalation, &child, |l| {
+            self.is_auto(child.family(), l)
+        })?;
+        let children = w.tracker.note(&self.escalation, parent, child, now_secs)?;
+        let mut longest = Some(0u64);
+        let mut keys = Vec::with_capacity(children.len());
+        for c in &children {
+            let k = Self::prefix_key(c);
+            if let Some(e) = self.table.get_owned(&k) {
+                if e.expired(now_secs) {
+                    continue;
+                }
+                longest = match (longest, e.until) {
+                    (_, 0) | (None, _) => None,
+                    (Some(l), u) => Some(l.max(u64::from(u).saturating_sub(now_secs))),
+                };
+                keys.push(k);
+            }
+        }
+        // Children evicted or expired since they were counted still count;
+        // the one just banned is always there to time the parent.
+        (!keys.is_empty()).then_some(Plan {
+            parent,
+            children: keys,
+            longest,
+        })
+    }
+
+    /// The duration of an escalated parent: the longest remaining child times
+    /// the factor, capped by the policy's maximum. `None` for permanent.
+    pub(crate) fn escalated_secs(&self, plan: &Plan) -> Option<u64> {
+        plan.longest.map(|l| {
+            l.max(1)
+                .saturating_mul(u64::from(self.escalation.factor))
+                .min(self.policy.max_secs())
+                .max(1)
+        })
+    }
+
+    /// Removes children folded into a parent that ends at `parent_until`
+    /// (0 = permanent). A child that outlasts the parent stays.
+    pub(crate) fn fold(&self, children: &[TableKey], parent_until: u32) -> u32 {
+        let mut w = self.lock();
+        let writer = &mut *w;
+        let mut n = 0;
+        for k in children {
+            let Some(e) = self.table.get_owned(k) else {
+                continue;
+            };
+            let outlasts =
+                e.until == 0 && parent_until != 0 || (parent_until != 0 && e.until > parent_until);
+            if outlasts {
+                continue;
+            }
+            if self.table.remove(&mut writer.table, k).is_some() {
+                self.count(writer, k, false);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Puts the children of a refused escalation back in the tracker; past
+    /// the quota, the earliest-ending evictable children are dropped from
+    /// the table so one allocation cannot fill it.
+    pub(crate) fn refuse_escalation(&self, plan: &Plan, now_secs: u64) -> u32 {
+        let mut w = self.lock();
+        let writer = &mut *w;
+        let quota = usize::from(self.escalation.max_children);
+        let mut dropped = 0;
+        let mut held: Vec<Entry> = plan
+            .children
+            .iter()
+            .filter_map(|k| self.table.get_owned(k))
+            .collect();
+        if held.len() > quota {
+            held.sort_by_key(|e| if e.until == 0 { u32::MAX } else { e.until });
+            let excess = held.len() - quota;
+            let mut kept = Vec::new();
+            for e in held {
+                if dropped < excess as u32 && e.evictable() {
+                    if self.table.remove(&mut writer.table, &e.key).is_some() {
+                        self.count(writer, &e.key, false);
+                        dropped += 1;
+                        continue;
+                    }
+                }
+                kept.push(e);
+            }
+            held = kept;
+        }
+        let cidrs: Vec<Cidr> = held.iter().filter_map(|e| view::cidr_of(&e.key)).collect();
+        writer
+            .tracker
+            .restore(&self.escalation, plan.parent, &cidrs, now_secs);
+        dropped
+    }
+
+    /// The longest ban of the duration policy, in whole seconds.
+    pub(crate) fn max_secs(&self) -> u64 {
+        self.policy.max_secs()
+    }
+
+    /// The offence record of a ban key.
+    pub(crate) fn offender(&self, key: &BanKey, now_secs: u64) -> Option<Offence> {
+        let Ok(Placement::Dynamic(tkey)) = self.place(&key.normalized(), Actor::App) else {
+            return None;
+        };
+        self.lock().offenders.get(&tkey, now_secs)
     }
 
     /// Removes the ban on exactly this key.
@@ -1170,6 +1373,7 @@ mod tests {
             &[32, 24],
             &[64, 56, 48],
             DurationPolicy::default().jitter(Duration::ZERO),
+            EscalationPolicy::default().off(),
             9,
         )
     }

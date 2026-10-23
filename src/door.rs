@@ -50,6 +50,28 @@ pub enum Refusal {
     Posture,
 }
 
+/// The answer of [`Bouncer::datagram`](crate::Bouncer::datagram).
+///
+/// # Examples
+///
+/// ```
+/// use bouncer_io::{Bouncer, DatagramVerdict};
+/// let bouncer = Bouncer::new();
+/// bouncer.ban("198.51.100.20".parse::<std::net::IpAddr>()?)?;
+/// let v = bouncer.datagram("198.51.100.20".parse()?, true, bouncer.now());
+/// assert_eq!(v, DatagramVerdict::Drop);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatagramVerdict {
+    /// Process the datagram.
+    Accept,
+    /// Drop it silently.
+    Drop,
+}
+
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -80,6 +80,9 @@ pub(crate) struct PrefixSet<V> {
     entries: Vec<Entry<V>>,
     roots: [u32; 2],
     defaults: [u32; 2],
+    /// Every prefix as (family slot, left-aligned bits, length), sorted, for
+    /// "is anything inside this prefix" (escalation checks; cold).
+    spans: Vec<(u8, u128, u8)>,
 }
 
 fn family_slot(f: Family) -> usize {
@@ -99,6 +102,7 @@ impl<V: Clone> PrefixSet<V> {
             entries: Vec::new(),
             roots: [NONE; 2],
             defaults: [NONE; 2],
+            spans: Vec::new(),
         }
     }
 
@@ -108,6 +112,12 @@ impl<V: Clone> PrefixSet<V> {
         let mut sorted: Vec<&(Cidr, V)> = input.iter().collect();
         sorted.sort_by_key(|a| a.0);
         let mut set = PrefixSet::empty();
+        set.spans = input
+            .iter()
+            .map(|(c, _)| (family_slot(c.family()) as u8, left_aligned(c), c.len()))
+            .collect();
+        set.spans.sort_unstable();
+        set.spans.dedup();
         let mut by_family: [Vec<Prefix>; 2] = [Vec::new(), Vec::new()];
         for (cidr, value) in sorted {
             if let Some(last) = set.entries.last_mut() {
@@ -311,9 +321,33 @@ impl<V> PrefixSet<V> {
         self.find_covering_map(cidr, |_| Some(())).is_some()
     }
 
+    /// `true` when some prefix overlaps `cidr`: contains it, or lies inside it.
+    pub(crate) fn overlaps(&self, cidr: &Cidr) -> bool {
+        if self.covers(cidr) {
+            return true;
+        }
+        let fam = family_slot(cidr.family()) as u8;
+        let start = left_aligned(cidr);
+        // Left-aligned, a prefix of length L spans start ..= start | (2^(128-L) - 1).
+        let host = 128 - u32::from(cidr.len());
+        let end = if host >= 128 {
+            u128::MAX
+        } else {
+            start | ((1u128 << host) - 1)
+        };
+        let i = self
+            .spans
+            .partition_point(|&(f, b, _)| (f, b) < (fam, start));
+        self.spans[i..]
+            .iter()
+            .take_while(|&&(f, b, _)| f == fam && b <= end)
+            .any(|&(_, _, len)| len >= cidr.len())
+    }
+
     /// Bytes reserved.
     pub(crate) fn bytes(&self) -> u64 {
         (self.nodes.capacity() * core::mem::size_of::<Node>()
+            + self.spans.capacity() * core::mem::size_of::<(u8, u128, u8)>()
             + self.leaves.capacity() * 4
             + self.links.capacity() * core::mem::size_of::<Link>()
             + self.entries.capacity() * core::mem::size_of::<Entry<V>>()) as u64

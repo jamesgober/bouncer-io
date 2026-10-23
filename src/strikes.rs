@@ -579,6 +579,38 @@ pub(crate) fn strike(
         return StrikeOutcome::ThresholdObserved { would_ban };
     }
     crate::metrics::meter!(shard.meters, thresholds_enforced);
+    if let BanKey::Address(src) = would_ban {
+        if shared.sources.is_shared(src, now) {
+            // Likely a NAT: throttle the address, ban the identities.
+            let secs = policy.unwrap_or_default().base_secs().max(1);
+            let client = match crate::keys::Cidr::host(src).family() {
+                crate::keys::Family::V4 => crate::keys::Cidr::host(src),
+                crate::keys::Family::V6 => crate::keys::Cidr::host(src)
+                    .parent(64)
+                    .unwrap_or(crate::keys::Cidr::host(src)),
+            };
+            shared
+                .budgets
+                .throttle(&client, 4, now.saturating_add(secs), now);
+            let mut banned = false;
+            for key in [
+                subject.session.map(BanKey::Session),
+                subject.account.map(BanKey::Account),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let spec = BanSpec::key(key)
+                    .by(Actor::Local)
+                    .because(Reason::STRIKE_THRESHOLD);
+                banned |= shared.ban(&spec, policy).is_ok();
+            }
+            if banned {
+                revoke_ticket();
+            }
+            return StrikeOutcome::Throttled;
+        }
+    }
     let spec = BanSpec::key(would_ban)
         .by(Actor::Local)
         .because(Reason::STRIKE_THRESHOLD);

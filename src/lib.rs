@@ -69,6 +69,7 @@ mod published;
 mod registry;
 mod revoke;
 mod share;
+mod sources;
 mod strikes;
 mod sync;
 mod ticket;
@@ -83,14 +84,16 @@ pub use crate::{
         OffenderRecord, Page, StrikeState,
     },
     allow::{AllowKind, AllowList},
-    bans::{BanDuration, BanId, BanSpec, DurationPolicy, LiftSpec, Lifted},
+    bans::{
+        BanDuration, BanId, BanSpec, DurationPolicy, LiftSpec, Lifted, escalate::EscalationPolicy,
+    },
     bouncer::{Bouncer, BouncerBuilder, Capacity},
     budgets::{Budgets, Rate},
     collected::Collected,
     directive::{
         Action, Actor, ActorKind, Applied, BanKeys, Directive, Evidence, EvidenceValue, Reason,
     },
-    door::{Provenance, Refusal},
+    door::{DatagramVerdict, Provenance, Refusal},
     error::{BouncerError, ConfigError, ConfigProblem},
     events::{Category, Event, EventSink, GENERATOR, NoSink, SignalId, Subject, signals},
     format::{DenialFormat, Ejected, FormatError, NoFormat},

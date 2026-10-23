@@ -995,7 +995,22 @@ impl Ticket {
             self.seen = SEEN_ALWAYS_CHECK;
             return self.deny(hit.code);
         }
-        self.checkpoint()
+        let verdict = self.checkpoint();
+        if verdict.is_pass() && (kind == table::KIND_SESSION || kind == table::KIND_ACCOUNT) {
+            if let Some(src) = source_of(cell) {
+                let now = shared.now().secs();
+                if shared.sources.note(src, hi.unwrap_or(0), lo, now) {
+                    let mut subject = Subject::default();
+                    subject.source = Some(src);
+                    events::Emit {
+                        subject,
+                        ..events::Emit::new(events::signals::SOURCE_SHARED_SUSPECTED)
+                    }
+                    .send(shared);
+                }
+            }
+        }
+        verdict
     }
 
     /// Reports misbehaviour seen by any layer (a failed handshake, malformed

@@ -10,10 +10,11 @@ use crate::{
     bans::{
         BanDuration, BanId, BanMemory, BanSpec, DurationPolicy, Guards, LiftSpec, Lifted,
         compiled::PrefixSet,
+        escalate::{EscalationPolicy, Plan},
     },
     budgets::{Budgets, DoorBudgets, IdentityBudgets, IdentityKey, IdentityKind},
     directive::{Action, Actor, Applied, BanKeys, Directive, Reason},
-    door::{Judgement, Provenance, Refusal},
+    door::{DatagramVerdict, Judgement, Provenance, Refusal},
     error::{BouncerError, ConfigError, ConfigProblem},
     events::{self, Emit, EventSink},
     hash::{HashKey, Seeds},
@@ -60,6 +61,7 @@ pub(crate) struct Shared {
     pub(crate) revocations: Revocations,
     pub(crate) budgets: DoorBudgets,
     pub(crate) identity: IdentityBudgets,
+    pub(crate) sources: crate::sources::Sources,
     /// 0 normal, 1 strict.
     posture: AtomicU32,
     strict_divisor: u32,
@@ -102,15 +104,19 @@ impl Shared {
     /// The offence history of a key.
     pub(crate) fn offender_record(
         &self,
-        _key: &BanKey,
-        _now_secs: u64,
+        key: &BanKey,
+        now_secs: u64,
     ) -> Option<crate::admin::OffenderRecord> {
-        None
+        let o = self.bans.offender(key, now_secs)?;
+        Some(crate::admin::OffenderRecord {
+            offences: o.score,
+            last: self.wall_at(o.last),
+        })
     }
 
     /// Whether an address is flagged as shared.
-    pub(crate) fn is_shared_source(&self, _addr: IpAddr, _now_secs: u64) -> bool {
-        false
+    pub(crate) fn is_shared_source(&self, addr: IpAddr, now_secs: u64) -> bool {
+        self.sources.is_shared(addr, now_secs)
     }
 
     /// Bookkeeping after bans were lifted outside `lift` (persistence).
@@ -154,9 +160,16 @@ impl Shared {
             immune: &allow,
             proxies: &self.proxies,
         };
-        let result = self.bans.ban_with(spec, &guards, self.now(), policy);
+        let planned = self.bans.ban_plan(spec, &guards, self.now(), policy);
+        let (result, plan) = match planned {
+            Ok((id, plan)) => (Ok(id), plan),
+            Err(e) => (Err(e), None),
+        };
         if result.is_ok() {
             meter!(self.meters, bans_added);
+        }
+        if let Some(plan) = plan {
+            self.escalate(plan, spec.actor, spec.reason);
         }
         if self.sink.is_some() {
             let signal = match &result {
@@ -186,6 +199,80 @@ impl Shared {
             }
         }
         result
+    }
+}
+
+impl Shared {
+    /// Escalates a parent prefix whose children are due, and the next level
+    /// up when that one is due too. Refused, with an event, over an
+    /// allow-list entry, a trusted proxy, or an address flagged as shared.
+    fn escalate(&self, mut plan: Plan, actor: Actor, reason: Reason) {
+        // The ladder has at most a few levels; the bound is a backstop.
+        for _ in 0..8 {
+            let now = self.now();
+            let secs = now.secs();
+            let parent = plan.parent;
+            let mut subject = events::Subject::default();
+            subject.prefix = Some(parent);
+            let blocked = self.allow.with(|s| s.overlaps(&parent))
+                || self.proxies.overlaps(&parent)
+                || self.sources.any_within(&parent, secs);
+            if blocked {
+                self.bans.refuse_escalation(&plan, secs);
+                Emit {
+                    actor,
+                    reason,
+                    subject,
+                    mode: crate::strikes::Mode::Observe,
+                    ..Emit::new(events::signals::BAN_ESCALATED)
+                }
+                .send(self);
+                return;
+            }
+            let duration = match self.bans.escalated_secs(&plan) {
+                Some(s) => BanDuration::Fixed(Duration::from_secs(s)),
+                None if actor.may_ban_permanently() => BanDuration::Permanent,
+                None => BanDuration::Fixed(Duration::from_secs(self.bans.max_secs())),
+            };
+            let parent_until = match duration {
+                BanDuration::Fixed(d) => {
+                    u32::try_from(secs.saturating_add(crate::time::ceil_secs(d)))
+                        .unwrap_or(u32::MAX)
+                }
+                _ => 0,
+            };
+            let spec = BanSpec {
+                duration,
+                ..BanSpec::prefix(parent).by(actor).because(reason)
+            };
+            let allow = self.allow.load();
+            let guards = Guards {
+                immune: &allow,
+                proxies: &self.proxies,
+            };
+            match self.bans.ban_plan(&spec, &guards, now, None) {
+                Ok((id, next)) => {
+                    self.bans.fold(&plan.children, parent_until);
+                    meter!(self.meters, bans_escalated);
+                    Emit {
+                        actor,
+                        reason,
+                        subject,
+                        reference: self.reference(id.get()),
+                        ..Emit::new(events::signals::BAN_ESCALATED)
+                    }
+                    .send(self);
+                    match next {
+                        Some(n) => plan = n,
+                        None => return,
+                    }
+                }
+                Err(_) => {
+                    self.bans.refuse_escalation(&plan, secs);
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -710,7 +797,10 @@ impl Bouncer {
     /// ```
     pub fn apply(&self, directive: Directive) -> Result<Applied, BouncerError> {
         let d = directive;
-        let low = d.confidence.is_some_and(|c| c < 30);
+        // Below the Medium band nothing bans by itself; a shared address
+        // (likely a NAT) is banned only by an administrator, the
+        // application, a gate, sentinel, or a confident policy.
+        let low = d.confidence.is_some_and(|c| c < 30) || self.shared_target(&d);
         let code = d.deny_with.unwrap_or(DenialCode::Forbidden);
         let mut applied = Applied::default();
         match d.action {
@@ -771,6 +861,26 @@ impl Bouncer {
             }
         }
         Ok(applied)
+    }
+
+    /// Whether `d` would ban a shared address on automation's word alone.
+    fn shared_target(&self, d: &Directive) -> bool {
+        let Target::Source(c) = d.target else {
+            return false;
+        };
+        let weak = match d.actor {
+            Actor::Local | Actor::Channel(_) => true,
+            Actor::Policy(_) => d.confidence.is_none_or(|c| c < 70),
+            _ => false,
+        };
+        let client_len = match c.family() {
+            crate::keys::Family::V4 => 32,
+            crate::keys::Family::V6 => 64,
+        };
+        weak && c.len() >= client_len && {
+            let shared = &self.inner.shared;
+            shared.sources.is_shared(c.network(), shared.now().secs())
+        }
     }
 
     fn ban_target(
@@ -1033,6 +1143,46 @@ impl Bouncer {
         self.inner.shared.posture()
     }
 
+    /// The per-datagram door for UDP: ban memory, then the rate budgets
+    /// (no concurrency). `verified` says the source has proven it receives
+    /// (a completed handshake, a returned cookie). An unverified source is
+    /// never struck or banned, and is charged only at its prefix, because a
+    /// UDP source address can be forged to frame a victim.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DatagramVerdict};
+    /// let bouncer = Bouncer::new();
+    /// let verdict = bouncer.datagram("198.51.100.20".parse()?, false, bouncer.now());
+    /// assert_eq!(verdict, DatagramVerdict::Accept);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn datagram(&self, source: IpAddr, verified: bool, now: Now) -> DatagramVerdict {
+        let shared = &self.inner.shared;
+        let source = normalize(source);
+        match shared.judge(source, Provenance::Socket, now) {
+            Judgement::ProxyHop => DatagramVerdict::Accept,
+            Judgement::Refuse(_) => {
+                meter!(shared.meters, refused_ban);
+                DatagramVerdict::Drop
+            }
+            Judgement::Admit { exempt: true, .. } => DatagramVerdict::Accept,
+            Judgement::Admit { .. } => {
+                match shared
+                    .budgets
+                    .datagram(source, verified, now, shared.door_divisor())
+                {
+                    Ok(()) => DatagramVerdict::Accept,
+                    Err(_) => {
+                        meter!(shared.meters, refused_budget);
+                        DatagramVerdict::Drop
+                    }
+                }
+            }
+        }
+    }
+
     /// The bouncer's monotonic time base, for the `_at` functions.
     #[must_use]
     pub fn now(&self) -> Now {
@@ -1087,6 +1237,7 @@ impl Bouncer {
             + shared.revocations.bytes()
             + shared.budgets.bytes()
             + shared.identity.bytes()
+            + shared.sources.bytes()
             + shared.counters.bytes();
         c
     }
@@ -1149,6 +1300,7 @@ pub struct BouncerBuilder {
     ipv4_lengths: Vec<u8>,
     ipv6_lengths: Vec<u8>,
     durations: DurationPolicy,
+    escalation: EscalationPolicy,
     allow: AllowList,
     trusted_proxies: Vec<Cidr>,
     budgets: Budgets,
@@ -1179,6 +1331,7 @@ impl Default for BouncerBuilder {
             ipv4_lengths: crate::DEFAULT_IPV4_LENGTHS.to_vec(),
             ipv6_lengths: crate::DEFAULT_IPV6_LENGTHS.to_vec(),
             durations: DurationPolicy::default(),
+            escalation: EscalationPolicy::default(),
             allow: AllowList::new(),
             trusted_proxies: Vec::new(),
             budgets: Budgets::default(),
@@ -1258,6 +1411,12 @@ impl BouncerBuilder {
     /// How long automatic bans last.
     pub fn durations(mut self, policy: DurationPolicy) -> Self {
         self.durations = policy;
+        self
+    }
+
+    /// Prefix escalation (default [`EscalationPolicy::default()`]).
+    pub fn escalation(mut self, policy: EscalationPolicy) -> Self {
+        self.escalation = policy;
         self
     }
 
@@ -1438,6 +1597,7 @@ impl BouncerBuilder {
             return Err(ConfigError::new("ipv6_lengths", ConfigProblem::InvalidLength).into());
         }
         self.durations.validate("durations")?;
+        self.escalation.validate()?;
         self.strikes.validate()?;
         self.denials.validate()?;
         self.budgets.validate()?;
@@ -1511,6 +1671,7 @@ impl BouncerBuilder {
                 &v4,
                 &v6,
                 self.durations,
+                self.escalation,
                 seeds.rng,
             ),
             allow: Published::new(allow),
@@ -1522,6 +1683,10 @@ impl BouncerBuilder {
             revocations: Revocations::new(self.revocation_capacity, derived(&mut rng)),
             budgets,
             identity,
+            sources: crate::sources::Sources::new(
+                self.budgets.capacity_keys().min(65_536),
+                derived(&mut rng),
+            ),
             posture: AtomicU32::new(0),
             strict_divisor: u32::from(self.strict_budget_divisor.max(1)),
             strict_revokes_unauthenticated: self.strict_revokes_unauthenticated,

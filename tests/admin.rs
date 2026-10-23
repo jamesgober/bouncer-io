@@ -285,8 +285,9 @@ fn test_health_reports_loads_tickets_and_maintainer() {
     assert!(!h.is_ok(), "registry above 90%");
     drop(held);
     b.release(tag);
+    // One per /24, so nothing escalates.
     for i in 0..60u8 {
-        b.ban(IpAddr::from([198, 51, 100, i])).unwrap();
+        b.ban(IpAddr::from([198, 51, i, 1])).unwrap();
     }
     let h = b.health();
     assert!(h.ban_load > 0.9 && !h.is_ok());
