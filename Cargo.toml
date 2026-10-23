@@ -1,47 +1,69 @@
+# =============================================================================
+#  R E P S   ·   bouncer-io
+# =============================================================================
 [package]
-name = "bouncer-io"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+name    = "bouncer-io"
+version = "0.2.0"
+
+# Minimum Supported Rust Version (MSRV)
+rust-version = "1.85"
+edition = "2024"
+
+# License
+license = "Apache-2.0 OR MIT"
+
+# Readme
 readme = "README.md"
-license = "Apache-2.0"
 
-authors = [
-    "James Gober <me@jamesgober.com>"
-]
+# Description
+description = "Connection gate for Rust services: admission by address, prefix, fingerprint, session, and account; in-flight revocation through cheap checkpoints; wipe, replace, and eject of revoked requests; ban memory with prefix escalation. Protocol-free."
 
-description = "Network access gate for Rust. Rate limiting, throttling, suspicious-activity detection, and active connection termination in one IO filter. Token bucket / leaky bucket / sliding window limiters, per-key / per-IP / global, with a hook to forcibly cut connections of misbehaving peers already past the gate."
+# Keywords (5 max)
+keywords = ["security", "firewall", "ban", "network", "gate"]
 
-keywords = [
-    "ratelimit",
-    "throttle",
-    "gate",
-    "firewall",
-    "io"
-]
+# Categories
+categories = ["network-programming"]
 
-categories = [
-    "network-programming",
-    "authentication",
-    "asynchronous"
-]
-
-documentation = "https://docs.rs/bouncer-io"
-repository    = "https://github.com/jamesgober/bouncer-io"
+# Links
 homepage      = "https://github.com/jamesgober/bouncer-io"
+repository    = "https://github.com/jamesgober/bouncer-io"
+documentation = "https://docs.rs/bouncer-io"
+
+# Authors
+authors = ["James Gober <me@jamesgober.com>"]
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[dependencies]
+[lib]
+name = "bouncer_io"
+path = "src/lib.rs"
 
+
+# FEATURE FLAGS
+# #################################
+[features]
+default = []
+
+
+# DEPENDENCIES
+# #################################
+[dependencies]
+# None yet. Planned dependencies and the reason for each are listed in
+# dev/PLAN.md; each is added with the first code that needs it.
+
+
+# DEV DEPENDENCIES
+# #################################
 [dev-dependencies]
 
-[features]
-default = ["std"]
-std = []
 
+# RELEASE PROFILE
+# #################################
 [profile.release]
-opt-level = 3
-lto = "thin"
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
