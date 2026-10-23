@@ -29,16 +29,26 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: design lock (<code>0.2.0</code>).</strong> The public API is written down in <a href="./docs/API.md"><code>docs/API.md</code></a>; the code lands version by version as <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a> lists, starting with the door and tickets in <code>0.3.0</code>. Design and decisions: <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>.
+        <strong>Status: <code>0.3.0</code> (core).</strong> The door, ban memory, tickets, and checkpoints work; in-flight revocation with wipe-replace-eject, strikes, budgets, and events land in <code>0.4.0</code>. The full planned API is in <a href="./docs/API.md"><code>docs/API.md</code></a>, the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
 <hr>
 <br>
 
+## Installation
+
+```toml
+[dependencies]
+bouncer-io = "0.3"
+```
+
+<hr>
+<br>
+
 ## Quick start
 
-The planned Tier 1 API (see [`docs/API.md`](./docs/API.md)): the door, a request, a revocation from another thread, and the checkpoint that throws the request out.
+The Tier 1 API (see [`docs/API.md`](./docs/API.md)): the door, a request, a revocation from another thread, and the checkpoint that throws the request out. `revoke` and `deny_and_eject` arrive in 0.4; the rest works in 0.3.
 
 ```rust
 use bouncer_io::{Bouncer, Collected, Reason, RequestId, Verdict};

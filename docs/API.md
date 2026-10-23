@@ -18,7 +18,7 @@
 
 The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every item lists its tier, its grade, the version that brings it, and what it costs. The rustdoc on [docs.rs](https://docs.rs/bouncer-io) becomes the exhaustive reference as each item lands; until then this file is the contract.
 
-> **Status: design lock (`0.2.0`).** Only [`VERSION`](#version) exists in code. Everything else here is the agreed shape, built version by version as [`../dev/ROADMAP.md`](../dev/ROADMAP.md) lists. The examples are written against this shape and become doctests when their items land.
+> **Status: `0.3.0` (core).** Built and tested: keys and prefixes, ban memory (bans, lifts, durations, the allow list, trusted proxies), the door, tickets with `request`, `checkpoint`, and `bind_client`, verdicts, errors, and `capacity`. Every item marked with a later version is the agreed shape, built version by version as [`../dev/ROADMAP.md`](../dev/ROADMAP.md) lists; its examples become doctests when it lands. The rustdoc of the built items has runnable examples for each.
 
 **Reading the item headers.** *Tier 1* is the simple surface (one-line constructors, no builder), *Tier 2* is configuration, *Tier 3* is the full surface for integrations and other libraries. *P0* is required for the crate's job, *P1* is what users of the best existing tools expect, *P2* is high value for serious deployments, *P3* comes after 1.0. Costs are targets, marked `[est.]` until they are measured at 0.6.
 
@@ -816,8 +816,10 @@ Everything bouncer bans, revokes, or budgets is one of these keys. Addresses are
 ### `Family`
 
 ```rust
-#[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Family { V4, V6 }
+impl Family { pub const fn max_len(self) -> u8; }   // 32 or 128
+impl Display for Family;                            // "IPv4", "IPv6"
 ```
 
 Tier 3 · P0 · 0.3
@@ -1272,7 +1274,7 @@ pub fn into_tag(self) -> TicketTag;
 
 Tier 3 · P0 · 0.4 · free
 
-`tag` names this ticket as a plain 64-bit value (shard, index, generation) without giving it up; a protocol engine passes a request's tag to the transport so the egress check judges exactly that request. `into_tag` gives up the handle and keeps the ticket live under its tag, for transports that store one `u64` per connection; release it later with [`Bouncer::release`](#release). A stale tag never reaches a reused cell: the generation in the tag must match.
+`tag` names this ticket as a plain 64-bit value (cell index and generation) without giving it up; a protocol engine passes a request's tag to the transport so the egress check judges exactly that request. `into_tag` gives up the handle and keeps the ticket live under its tag, for transports that store one `u64` per connection; release it later with [`Bouncer::release`](#release). A stale tag never reaches a reused cell: the generation in the tag must match.
 
 ### Release on drop
 
@@ -1630,7 +1632,7 @@ Tier 1 · P0 · 0.3
 #[non_exhaustive] #[derive(Clone, Debug)]
 pub struct BanRecord {
     pub id: BanId, pub key: BanKey, pub until: Option<SystemTime>, pub issued: SystemTime,
-    pub actor: Actor, pub reason: Reason, pub offences: u16, pub origin: Option<NodeId>,
+    pub actor: ActorKind, pub reason: Reason, pub offences: u16, pub origin: Option<NodeId>,
 }
 ```
 
@@ -1795,6 +1797,14 @@ Tier 2 · P0 · 0.4
 ```rust
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Actor { App, Admin(u64), Policy(u32), Sentinel, Gate, Channel(u64), Local }
+impl Actor {
+    pub const fn is_automated(&self) -> bool;          // every actor except App and Admin
+    pub const fn may_ban_permanently(&self) -> bool;   // App, Admin, Sentinel
+    pub const fn kind(&self) -> ActorKind;
+}
+impl Display for Actor;
+#[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ActorKind { App, Admin, Policy, Sentinel, Gate, Channel, Local }   // stored in compact records
 ```
 
 Tier 1 · P0 · 0.3
