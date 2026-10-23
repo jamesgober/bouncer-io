@@ -53,6 +53,7 @@ mod bans;
 mod bouncer;
 mod budgets;
 mod claims;
+mod codec;
 mod collected;
 mod directive;
 mod door;
@@ -65,11 +66,13 @@ mod keys;
 mod loom_models;
 mod maintain;
 mod metrics;
+mod persist;
 mod published;
 mod registry;
 mod revoke;
 mod share;
 mod sources;
+mod state;
 mod strikes;
 mod sync;
 mod ticket;
@@ -94,7 +97,7 @@ pub use crate::{
         Action, Actor, ActorKind, Applied, BanKeys, Directive, Evidence, EvidenceValue, Reason,
     },
     door::{DatagramVerdict, Provenance, Refusal},
-    error::{BouncerError, ConfigError, ConfigProblem},
+    error::{BouncerError, ConfigError, ConfigProblem, ImportError, PersistError},
     events::{Category, Event, EventSink, GENERATOR, NoSink, SignalId, Subject, signals},
     format::{DenialFormat, Ejected, FormatError, NoFormat},
     keys::{
@@ -102,8 +105,9 @@ pub use crate::{
         normalize, prefix_of,
     },
     maintain::{CloseKind, Ejector, MaintenanceReport},
+    persist::{FilePersistence, LoadFailure, Persistence, SNAPSHOT_FORMAT, SNAPSHOT_MAGIC},
     revoke::{Revocation, RevocationEpoch, RevokeMode, Target},
-    share::NodeId,
+    share::{Delta, ImportReport, NodeId, Sequence},
     strikes::{Enforcement, IgnoredBecause, Mode, Posture, StrikeKind, StrikeOutcome, StrikeRules},
     ticket::{LaneClass, Ticket, TicketId, TicketKind, TicketTag},
     time::Now,

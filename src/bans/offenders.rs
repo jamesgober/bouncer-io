@@ -40,6 +40,7 @@ impl Offenders {
         (self.map.capacity() * (core::mem::size_of::<(TableKey, Offence)>() + 1)) as u64
     }
 
+    #[cfg(all(test, not(bouncer_loom)))]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
     }

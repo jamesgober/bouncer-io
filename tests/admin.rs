@@ -21,8 +21,11 @@ fn c(s: &str) -> Cidr {
     s.parse().unwrap()
 }
 
+/// Signal id, source, and prefix of each event.
+type Seen = Vec<(u32, Option<IpAddr>, Option<Cidr>)>;
+
 #[derive(Default)]
-struct Sink(Mutex<Vec<(u32, Option<IpAddr>, Option<Cidr>)>>);
+struct Sink(Mutex<Seen>);
 impl EventSink for Sink {
     fn event(&self, e: &Event<'_>) {
         self.0

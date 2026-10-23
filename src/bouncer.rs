@@ -62,6 +62,9 @@ pub(crate) struct Shared {
     pub(crate) budgets: DoorBudgets,
     pub(crate) identity: IdentityBudgets,
     pub(crate) sources: crate::sources::Sources,
+    pub(crate) persist: Option<crate::persist::Persist>,
+    pub(crate) share: crate::share::Share,
+    pub(crate) max_clock_skew: Duration,
     /// 0 normal, 1 strict.
     posture: AtomicU32,
     strict_divisor: u32,
@@ -93,12 +96,16 @@ impl Shared {
 
     /// Persistence records queued and not yet written.
     pub(crate) fn journal_backlog(&self) -> u32 {
-        0
+        self.persist
+            .as_ref()
+            .map_or(0, crate::persist::Persist::backlog)
     }
 
     /// The last persistence failure, while the last write failed.
     pub(crate) fn last_persist_error(&self) -> Option<std::io::ErrorKind> {
-        None
+        self.persist
+            .as_ref()
+            .and_then(crate::persist::Persist::last_error)
     }
 
     /// The offence history of a key.
@@ -120,7 +127,10 @@ impl Shared {
     }
 
     /// Bookkeeping after bans were lifted outside `lift` (persistence).
-    pub(crate) fn after_lift(&self, _lifted: &[crate::bans::view::Held]) {}
+    pub(crate) fn after_lift(&self, lifted: &[crate::bans::view::Held]) {
+        let keys: Vec<BanKey> = lifted.iter().map(|h| h.key).collect();
+        self.log_removed(&keys);
+    }
 
     /// Whether an immune allow-list entry covers `cidr`.
     pub(crate) fn immune_covers(&self, cidr: &Cidr) -> bool {
@@ -162,11 +172,17 @@ impl Shared {
         };
         let planned = self.bans.ban_plan(spec, &guards, self.now(), policy);
         let (result, plan) = match planned {
-            Ok((id, plan)) => (Ok(id), plan),
+            Ok((id, plan, evicted)) => {
+                if let Some(k) = evicted {
+                    self.log_removed(&[k]);
+                }
+                (Ok(id), plan)
+            }
             Err(e) => (Err(e), None),
         };
         if result.is_ok() {
             meter!(self.meters, bans_added);
+            self.log_ban(&spec.key);
         }
         if let Some(plan) = plan {
             self.escalate(plan, spec.actor, spec.reason);
@@ -212,8 +228,10 @@ impl Shared {
             let now = self.now();
             let secs = now.secs();
             let parent = plan.parent;
-            let mut subject = events::Subject::default();
-            subject.prefix = Some(parent);
+            let subject = events::Subject {
+                prefix: Some(parent),
+                ..events::Subject::default()
+            };
             let blocked = self.allow.with(|s| s.overlaps(&parent))
                 || self.proxies.overlaps(&parent)
                 || self.sources.any_within(&parent, secs);
@@ -251,8 +269,13 @@ impl Shared {
                 proxies: &self.proxies,
             };
             match self.bans.ban_plan(&spec, &guards, now, None) {
-                Ok((id, next)) => {
-                    self.bans.fold(&plan.children, parent_until);
+                Ok((id, next, evicted)) => {
+                    if let Some(k) = evicted {
+                        self.log_removed(&[k]);
+                    }
+                    self.log_ban(&BanKey::Prefix(parent));
+                    let folded = self.bans.fold(&plan.children, parent_until);
+                    self.log_removed(&folded);
                     meter!(self.meters, bans_escalated);
                     Emit {
                         actor,
@@ -303,6 +326,8 @@ struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.shared.maintenance.stop();
+        // Best effort: what is queued reaches the store.
+        let _ = self.shared.persist_flush(self.shared.now(), true);
     }
 }
 
@@ -620,6 +645,9 @@ impl Bouncer {
         let shared = &self.inner.shared;
         let spec = spec.into();
         let result = shared.bans.lift(&spec);
+        if result.is_ok() {
+            shared.log_lift(&spec.key, spec.actor);
+        }
         if let Ok(l) = &result {
             meter!(shared.meters, bans_lifted, l.removed);
             Emit {
@@ -680,7 +708,7 @@ impl Bouncer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn revoke_with(
+    pub(crate) fn revoke_with(
         &self,
         target: &Target,
         actor: Actor,
@@ -693,12 +721,10 @@ impl Bouncer {
         let shared = &self.inner.shared;
         let target = match *target {
             Target::Source(c) => {
-                if actor.is_automated() {
-                    if shared.immune_covers(&c) {
-                        return Err(BouncerError::AllowListed {
-                            key: BanKey::Prefix(c),
-                        });
-                    }
+                if actor.is_automated() && shared.immune_covers(&c) {
+                    return Err(BouncerError::AllowListed {
+                        key: BanKey::Prefix(c),
+                    });
                 }
                 if shared.proxies.covers(&c) {
                     return Err(BouncerError::TrustedProxyTarget);
@@ -737,6 +763,7 @@ impl Bouncer {
                 maintain::direct_sweep(shared, &target, code, keep_connection);
                 shared.epoch.bump();
                 meter!(shared.meters, revocations);
+                shared.log_revoke(&target, mode, keep_connection, code, actor, reason);
                 maintain::report_revocation(shared, &target, actor, reason, reference, confidence);
                 return Err(BouncerError::RevocationTableFull {
                     capacity: shared.revocations.capacity(),
@@ -755,6 +782,7 @@ impl Bouncer {
             shared.maintenance.wake();
         }
         meter!(shared.meters, revocations);
+        shared.log_revoke(&target, mode, keep_connection, code, actor, reason);
         maintain::report_revocation(shared, &target, actor, reason, reference, confidence);
         Ok(Revocation {
             epoch,
@@ -1319,6 +1347,13 @@ pub struct BouncerBuilder {
     strict_budget_divisor: u8,
     strict_revokes_unauthenticated: bool,
     node: Option<NodeId>,
+    persistence: Option<Box<dyn crate::persist::Persistence>>,
+    mac_key: Option<[u8; 32]>,
+    on_load_failure: crate::persist::LoadFailure,
+    max_wall_jump: Duration,
+    strict_wall_jump: bool,
+    max_clock_skew: Duration,
+    channel_import_rate: u32,
 }
 
 impl Default for BouncerBuilder {
@@ -1350,6 +1385,13 @@ impl Default for BouncerBuilder {
             strict_budget_divisor: 2,
             strict_revokes_unauthenticated: false,
             node: None,
+            persistence: None,
+            mac_key: None,
+            on_load_failure: crate::persist::LoadFailure::Refuse,
+            max_wall_jump: Duration::from_secs(3600),
+            strict_wall_jump: false,
+            max_clock_skew: Duration::from_secs(300),
+            channel_import_rate: 100_000,
         }
     }
 }
@@ -1517,6 +1559,49 @@ impl BouncerBuilder {
         self
     }
 
+    /// Where bans, lift tombstones, and offender memory survive restarts.
+    /// State is loaded in `try_build`, before the first door check.
+    pub fn persistence(mut self, store: Box<dyn crate::persist::Persistence>) -> Self {
+        self.persistence = Some(store);
+        self
+    }
+
+    /// The key of the keyed BLAKE3 MAC over the snapshot and journal, from
+    /// the integrator's key store. Without it only CRC32C checks the bytes.
+    pub fn mac_key(mut self, key: [u8; 32]) -> Self {
+        self.mac_key = Some(key);
+        self
+    }
+
+    /// What to do when persisted state is corrupt or tampered with (default
+    /// [`LoadFailure::Refuse`](crate::LoadFailure::Refuse)).
+    pub fn on_load_failure(mut self, policy: crate::persist::LoadFailure) -> Self {
+        self.on_load_failure = policy;
+        self
+    }
+
+    /// A wall-clock jump between save and load larger than this is reported
+    /// (default 1 hour).
+    pub fn max_wall_jump(mut self, jump: Duration) -> Self {
+        self.max_wall_jump = jump;
+        self
+    }
+
+    /// Keep bans across a forward jump past `max_wall_jump` (counting their
+    /// time from the last save) instead of letting them expire (default
+    /// `false`).
+    pub fn strict_wall_jump(mut self, keep: bool) -> Self {
+        self.strict_wall_jump = keep;
+        self
+    }
+
+    /// Imported records stamped further in the future than this are refused
+    /// (default 5 minutes).
+    pub fn max_clock_skew(mut self, skew: Duration) -> Self {
+        self.max_clock_skew = skew;
+        self
+    }
+
     /// This node's id, stamped on every record it exports; required for
     /// `export_delta`. 0 is refused at `try_build`.
     pub fn node(mut self, id: NodeId) -> Self {
@@ -1609,9 +1694,18 @@ impl BouncerBuilder {
                 ConfigError::new("strict_budget_divisor", ConfigProblem::InvalidFactor).into(),
             );
         }
+        if self.max_clock_skew.is_zero() {
+            return Err(ConfigError::new("max_clock_skew", ConfigProblem::InvalidDuration).into());
+        }
         let allow = self.allow.compile()?;
         let maintainer = self.maintainer;
+        let (policy, jump, strict) = (
+            self.on_load_failure,
+            self.max_wall_jump,
+            self.strict_wall_jump,
+        );
         let bouncer = self.build_with(allow);
+        bouncer.inner.shared.load_persisted(policy, jump, strict)?;
         if maintainer {
             maintain::spawn(&bouncer.inner.shared).map_err(BouncerError::Spawn)?;
         }
@@ -1619,7 +1713,7 @@ impl BouncerBuilder {
     }
 
     /// Allocates every table from a validated configuration.
-    fn build_with(self, allow: PrefixSet<AllowKind>) -> Bouncer {
+    fn build_with(mut self, allow: PrefixSet<AllowKind>) -> Bouncer {
         let seeds = match self.seed {
             Some(s) => Seeds::from_bytes(s),
             None => Seeds::random(),
@@ -1664,6 +1758,12 @@ impl BouncerBuilder {
             start: clock.now(),
             start_wall: SystemTime::from(clock.wall()),
             node: self.node,
+            persist: self
+                .persistence
+                .take()
+                .map(|s| crate::persist::Persist::new(s, self.mac_key)),
+            share: crate::share::Share::new(self.channel_import_rate),
+            max_clock_skew: self.max_clock_skew,
             clock,
             bans: BanMemory::new(
                 self.ban_capacity,
@@ -1702,7 +1802,7 @@ impl BouncerBuilder {
                 .format
                 .clone()
                 .unwrap_or_else(|| Arc::new(crate::format::NoFormat)),
-            meters: Meters::default(),
+            meters: Meters::new(),
         });
         let shards: Box<[Arc<Shard>]> = (0..shard_count)
             .map(|i| {
@@ -1710,7 +1810,7 @@ impl BouncerBuilder {
                     id: i as u8,
                     epoch: Arc::clone(&epoch),
                     shared: Arc::clone(&shared),
-                    meters: Meters::default(),
+                    meters: Meters::new(),
                 })
             })
             .collect();
@@ -1722,6 +1822,9 @@ impl BouncerBuilder {
             table_bytes: 0,
             total_bytes: 0,
         };
+        if let Some(node) = shared.node {
+            shared.bans.set_node(node.0);
+        }
         Bouncer {
             inner: Arc::new(Inner {
                 shared,

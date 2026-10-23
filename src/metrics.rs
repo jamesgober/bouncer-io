@@ -41,8 +41,19 @@ macro_rules! meters {
 
         /// Without the feature: nothing.
         #[cfg(not(feature = "metrics"))]
-        #[derive(Default)]
         pub(crate) struct Meters;
+
+        impl Meters {
+            #[cfg(feature = "metrics")]
+            pub(crate) fn new() -> Meters {
+                Meters::default()
+            }
+
+            #[cfg(not(feature = "metrics"))]
+            pub(crate) const fn new() -> Meters {
+                Meters
+            }
+        }
 
         /// Counter totals at one moment. Counters only grow, except the
         /// gauges `bans_active` and `journal_queue`.

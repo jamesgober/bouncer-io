@@ -1000,8 +1000,10 @@ impl Ticket {
             if let Some(src) = source_of(cell) {
                 let now = shared.now().secs();
                 if shared.sources.note(src, hi.unwrap_or(0), lo, now) {
-                    let mut subject = Subject::default();
-                    subject.source = Some(src);
+                    let subject = Subject {
+                        source: Some(src),
+                        ..Subject::default()
+                    };
                     events::Emit {
                         subject,
                         ..events::Emit::new(events::signals::SOURCE_SHARED_SUSPECTED)

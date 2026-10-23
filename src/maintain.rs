@@ -173,10 +173,15 @@ pub(crate) fn run(shared: &Shared, now: Now) -> MaintenanceReport {
         report.swept = swept;
         report.ejected += ejected;
     }
+    if let Ok(n) = shared.persist_flush(now, false) {
+        report.journal_written = n;
+    }
+    let persist_due = shared.persist_due();
     if shared.revocations.is_empty() {
         if let Ok(mut s) = shared.maintenance.samples.lock() {
             s.clear();
         }
+        report.next_due = persist_due;
         return report;
     }
     // Idle tickets: checked by no checkpoint since an epoch that was current
@@ -229,11 +234,15 @@ pub(crate) fn run(shared: &Shared, now: Now) -> MaintenanceReport {
         min_seen = min_seen.min(seen);
     }
     report.reclaimed = shared.revocations.remove_born_by(min_seen);
-    report.next_due = (!shared.revocations.is_empty()).then(|| {
+    let revocations_due = (!shared.revocations.is_empty()).then(|| {
         Now::from_nanos(now.as_nanos().saturating_add(
             u64::try_from(shared.maintenance.interval.as_nanos()).unwrap_or(u64::MAX),
         ))
     });
+    report.next_due = match (revocations_due, persist_due) {
+        (Some(a), Some(b)) => Some(if a.as_nanos() <= b.as_nanos() { a } else { b }),
+        (a, b) => a.or(b),
+    };
     report
 }
 

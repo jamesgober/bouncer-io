@@ -9,6 +9,7 @@
 pub(crate) mod compiled;
 pub(crate) mod escalate;
 pub(crate) mod offenders;
+pub(crate) mod restore;
 pub(crate) mod table;
 pub(crate) mod view;
 
@@ -749,7 +750,8 @@ impl BanMemory {
         now: Now,
         policy: Option<DurationPolicy>,
     ) -> Result<BanId, BouncerError> {
-        self.ban_plan(spec, guards, now, policy).map(|(id, _)| id)
+        self.ban_plan(spec, guards, now, policy)
+            .map(|(id, _, _)| id)
     }
 
     /// Adds a ban and reports an escalation it makes due: the parent prefix
@@ -760,7 +762,7 @@ impl BanMemory {
         guards: &Guards<'_>,
         now: Now,
         policy: Option<DurationPolicy>,
-    ) -> Result<(BanId, Option<Plan>), BouncerError> {
+    ) -> Result<(BanId, Option<Plan>, Option<BanKey>), BouncerError> {
         let key = spec.key.normalized();
         self.guard(&key, guards)?;
         let placement = self.place(&key, spec.actor)?;
@@ -808,7 +810,7 @@ impl BanMemory {
         // explicit ban is stored anyway, so lifting the prefix keeps it.
         if let (Placement::Dynamic(tkey), true) = (&placement, spec.actor.is_automated()) {
             if let Some(covering) = self.covering_wider(tkey, until, now_secs) {
-                return Ok((BanId(covering), None));
+                return Ok((BanId(covering), None, None));
             }
         }
         let id = w.next_id;
@@ -837,10 +839,14 @@ impl BanMemory {
                     .insert(&mut writer.table, entry, now_secs, |old| {
                         merge(old, &entry, now_secs)
                     });
+                let mut gone = None;
                 let id = match result {
                     Ok(Inserted::Merged { previous }) => BanId(previous.id),
                     Ok(Inserted::New { removed, evicted }) => {
                         if let Some(r) = removed {
+                            if evicted {
+                                gone = self.key_of(writer, &r.key);
+                            }
                             self.count(writer, &r.key, false);
                             let counter = if evicted {
                                 &self.evicted
@@ -863,7 +869,7 @@ impl BanMemory {
                 };
                 writer.offenders.record(tkey, now_secs);
                 let plan = self.plan(writer, &tkey, now_secs);
-                Ok((id, plan))
+                Ok((id, plan, gone))
             }
             Placement::Admin(cidr) => {
                 let entry = AdminEntry {
@@ -893,7 +899,7 @@ impl BanMemory {
                     }
                 };
                 self.publish_admin(&writer.admin);
-                Ok((BanId(id), None))
+                Ok((BanId(id), None, None))
             }
         }
     }
@@ -956,22 +962,27 @@ impl BanMemory {
 
     /// Removes children folded into a parent that ends at `parent_until`
     /// (0 = permanent). A child that outlasts the parent stays.
-    pub(crate) fn fold(&self, children: &[TableKey], parent_until: u32) -> u32 {
+    pub(crate) fn fold(&self, children: &[TableKey], parent_until: u32) -> Vec<BanKey> {
         let mut w = self.lock();
         let writer = &mut *w;
-        let mut n = 0;
+        let mut n = Vec::new();
         for k in children {
             let Some(e) = self.table.get_owned(k) else {
                 continue;
             };
-            let outlasts =
-                e.until == 0 && parent_until != 0 || (parent_until != 0 && e.until > parent_until);
+            let outlasts = parent_until != 0 && (e.until == 0 || e.until > parent_until);
             if outlasts {
                 continue;
             }
             if self.table.remove(&mut writer.table, k).is_some() {
                 self.count(writer, k, false);
-                n += 1;
+                if let Some(c) = view::cidr_of(k) {
+                    n.push(if c.len() == c.family().max_len() {
+                        BanKey::Address(c.network())
+                    } else {
+                        BanKey::Prefix(c)
+                    });
+                }
             }
         }
         n
@@ -995,12 +1006,13 @@ impl BanMemory {
             let excess = held.len() - quota;
             let mut kept = Vec::new();
             for e in held {
-                if dropped < excess as u32 && e.evictable() {
-                    if self.table.remove(&mut writer.table, &e.key).is_some() {
-                        self.count(writer, &e.key, false);
-                        dropped += 1;
-                        continue;
-                    }
+                if dropped < excess as u32
+                    && e.evictable()
+                    && self.table.remove(&mut writer.table, &e.key).is_some()
+                {
+                    self.count(writer, &e.key, false);
+                    dropped += 1;
+                    continue;
                 }
                 kept.push(e);
             }
@@ -1304,9 +1316,9 @@ impl BanMemory {
         self.admin.read().ok().map(|g| Arc::clone(&g))
     }
 
-    /// Bytes held by the administrator set.
+    /// Bytes held by the administrator set and offender memory.
     pub(crate) fn admin_bytes(&self) -> u64 {
-        self.read_admin().map_or(0, |s| s.bytes())
+        self.read_admin().map_or(0, |s| s.bytes()) + self.lock().offenders.bytes()
     }
 }
 
@@ -1333,7 +1345,10 @@ fn merge(old: &Entry, new: &Entry, now_secs: u64) -> Entry {
         },
         offences: old.offences.saturating_add(1),
         until: longer(old.until, new.until),
-        issued: new.issued,
+        // The later issue time: a lift stamped between two bans of the key
+        // must not remove the later one (merges from other nodes arrive in
+        // any order).
+        issued: old.issued.max(new.issued),
         id: old.id,
     }
 }

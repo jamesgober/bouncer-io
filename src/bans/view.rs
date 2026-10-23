@@ -37,15 +37,6 @@ impl Held {
         }
     }
 
-    /// The prefix this ban covers, for address and prefix keys.
-    pub(crate) fn cidr(&self) -> Option<Cidr> {
-        match self.key {
-            BanKey::Address(a) => Some(Cidr::host(a)),
-            BanKey::Prefix(c) | BanKey::FingerprintIn(_, c) => Some(c),
-            _ => None,
-        }
-    }
-
     pub(crate) fn expired(&self, now_secs: u64) -> bool {
         self.until != 0 && u64::from(self.until) <= now_secs
     }
@@ -68,7 +59,7 @@ pub(crate) fn cidr_of(key: &TableKey) -> Option<Cidr> {
 impl BanMemory {
     /// The ban key a table key was made from. Compound fingerprint keys are
     /// digests; their originals are kept beside the table.
-    fn key_of(&self, w: &Writer, key: &TableKey) -> Option<BanKey> {
+    pub(super) fn key_of(&self, w: &Writer, key: &TableKey) -> Option<BanKey> {
         Some(match key.kind {
             table::KIND_V4 | table::KIND_V6 => {
                 let c = cidr_of(key)?;

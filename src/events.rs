@@ -183,6 +183,7 @@ const fn catalog(id: u32) -> (&'static str, Category, f32) {
         40 => ("bouncer.source.shared_suspected", Category::Anomaly, 1.0),
         50 => ("bouncer.persist.failed", Category::Integrity, 6.0),
         51 => ("bouncer.import.rejected", Category::Integrity, 5.0),
+        52 => ("bouncer.persist.wall_jump", Category::Integrity, 5.0),
         60 => ("bouncer.table.reseeded", Category::Abuse, 6.0),
         _ => ("bouncer.unknown", Category::Unknown, 0.0),
     }
@@ -245,6 +246,9 @@ pub mod signals {
     pub const PERSIST_FAILED: SignalId = SignalId::new(50);
     /// An import delta failed validation.
     pub const IMPORT_REJECTED: SignalId = SignalId::new(51);
+    /// The wall clock jumped between save and load (backwards, or forwards
+    /// past `max_wall_jump`).
+    pub const PERSIST_WALL_JUMP: SignalId = SignalId::new(52);
     /// A table was rebuilt with a new seed.
     pub const TABLE_RESEEDED: SignalId = SignalId::new(60);
 }
