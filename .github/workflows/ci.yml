@@ -92,11 +92,11 @@ jobs:
           tool: cargo-fuzz
       - name: Build the fuzz targets
         working-directory: fuzz
-        run: cargo fuzz build
+        run: cargo fuzz build --target x86_64-unknown-linux-gnu
         env:
           RUSTFLAGS: ""
       - name: Run cidr_parse for 60 seconds
         working-directory: fuzz
-        run: cargo fuzz run cidr_parse -- -max_total_time=60
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu cidr_parse -- -max_total_time=60
         env:
           RUSTFLAGS: ""
