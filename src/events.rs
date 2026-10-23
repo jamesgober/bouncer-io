@@ -347,7 +347,7 @@ impl Emit<'_> {
             severity: self.signal.severity(),
             confidence: self.confidence,
             at: shared.now(),
-            wall: SystemTime::now(),
+            wall: shared.wall(),
             actor: self.actor,
             reason: self.reason,
             subject: self.subject,

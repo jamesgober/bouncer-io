@@ -47,6 +47,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod admin;
 mod allow;
 mod bans;
 mod bouncer;
@@ -63,15 +64,24 @@ mod keys;
 #[cfg(all(test, bouncer_loom))]
 mod loom_models;
 mod maintain;
+mod metrics;
+mod published;
 mod registry;
 mod revoke;
+mod share;
 mod strikes;
 mod sync;
 mod ticket;
 mod time;
 mod verdict;
 
+#[cfg(feature = "metrics")]
+pub use crate::metrics::MetricsSnapshot;
 pub use crate::{
+    admin::{
+        BanRecord, BudgetState, Explanation, Filter, Health, Listing, MaintainerState,
+        OffenderRecord, Page, StrikeState,
+    },
     allow::{AllowKind, AllowList},
     bans::{BanDuration, BanId, BanSpec, DurationPolicy, LiftSpec, Lifted},
     bouncer::{Bouncer, BouncerBuilder, Capacity},
@@ -90,6 +100,7 @@ pub use crate::{
     },
     maintain::{CloseKind, Ejector, MaintenanceReport},
     revoke::{Revocation, RevocationEpoch, RevokeMode, Target},
+    share::NodeId,
     strikes::{Enforcement, IgnoredBecause, Mode, Posture, StrikeKind, StrikeOutcome, StrikeRules},
     ticket::{LaneClass, Ticket, TicketId, TicketKind, TicketTag},
     time::Now,

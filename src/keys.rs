@@ -234,7 +234,6 @@ impl Cidr {
     }
 
     /// `true` when `other` lies entirely inside this prefix.
-    #[cfg(test)]
     pub(crate) fn covers(&self, other: &Cidr) -> bool {
         other.family == self.family
             && other.len >= self.len
@@ -286,6 +285,23 @@ impl Cidr {
     /// The prefix bits, right-aligned in a `u128` (IPv4 in the low 32 bits).
     pub(crate) fn bits(&self) -> u128 {
         self.bits
+    }
+
+    /// A prefix from stored parts; host bits are cleared. `None` for a
+    /// length beyond the family's.
+    pub(crate) fn from_parts(family: Family, len: u8, bits: u128) -> Option<Cidr> {
+        if len > family.max_len() {
+            return None;
+        }
+        let bits = match family {
+            Family::V4 => bits & 0xffff_ffff,
+            Family::V6 => bits,
+        };
+        Some(Cidr {
+            family,
+            len,
+            bits: mask(bits, len, family),
+        })
     }
 
     /// Builds the prefix and reports whether host bits had to be cleared.
@@ -614,6 +630,15 @@ macro_rules! digest_key {
             #[must_use]
             pub const fn from_digest(bytes: [u8; 16]) -> $name {
                 $name(bytes)
+            }
+
+            /// The digest from the two words of [`words`](Self::words).
+            pub(crate) fn from_words(hi: u64, lo: u64) -> $name {
+                let (h, l) = (hi.to_be_bytes(), lo.to_be_bytes());
+                $name([
+                    h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
+                    l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7],
+                ])
             }
 
             /// The digest as two words, for the tables.

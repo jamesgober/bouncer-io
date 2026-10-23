@@ -8,9 +8,11 @@
 
 pub(crate) mod compiled;
 pub(crate) mod table;
+pub(crate) mod view;
 
 use core::{cell::RefCell, time::Duration};
 use std::{
+    collections::HashMap,
     net::IpAddr,
     sync::{Arc, Mutex, MutexGuard, RwLock},
 };
@@ -43,6 +45,10 @@ use crate::{
 pub struct BanId(u64);
 
 impl BanId {
+    pub(crate) const fn from_raw(id: u64) -> BanId {
+        BanId(id)
+    }
+
     /// The raw value.
     #[must_use]
     pub const fn get(self) -> u64 {
@@ -405,6 +411,9 @@ struct Writer {
     counts_v6: [u32; 129],
     counts_ident: [u32; 16],
     admin: Vec<(Cidr, AdminEntry)>,
+    /// The originals of compound fingerprint keys (stored as digests), by
+    /// (length, digest words): for listings, persistence, and sharing.
+    compound: HashMap<(u8, u64, u64), (crate::keys::FingerprintKey, Cidr)>,
     rng: Rng,
     next_id: u64,
 }
@@ -434,6 +443,9 @@ pub(crate) struct BanMemory {
     host_v6: u8,
     policy: DurationPolicy,
     fingerprint_keys: (HashKey, HashKey),
+    /// Expired entries reclaimed by inserts, and entries evicted.
+    expired: std::sync::atomic::AtomicU64,
+    evicted: std::sync::atomic::AtomicU64,
 }
 
 /// The allow and trusted-proxy sets a ban is checked against.
@@ -485,6 +497,7 @@ impl BanMemory {
                 counts_v6: [0; 129],
                 counts_ident: [0; 16],
                 admin: Vec::new(),
+                compound: HashMap::new(),
                 rng,
                 next_id: 1,
             }),
@@ -493,7 +506,21 @@ impl BanMemory {
             host_v6,
             policy,
             fingerprint_keys,
+            expired: std::sync::atomic::AtomicU64::new(0),
+            evicted: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Expired entries reclaimed so far.
+    #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
+    pub(crate) fn expired_total(&self) -> u64 {
+        self.expired.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Entries evicted so far.
+    #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
+    pub(crate) fn evicted_total(&self) -> u64 {
+        self.evicted.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn lock(&self) -> MutexGuard<'_, Writer> {
@@ -742,11 +769,20 @@ impl BanMemory {
                     });
                 match result {
                     Ok(Inserted::Merged { previous }) => Ok(BanId(previous.id)),
-                    Ok(Inserted::New { removed, .. }) => {
+                    Ok(Inserted::New { removed, evicted }) => {
                         if let Some(r) = removed {
                             self.count(writer, &r.key, false);
+                            let counter = if evicted {
+                                &self.evicted
+                            } else {
+                                &self.expired
+                            };
+                            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         self.count(writer, &tkey, true);
+                        if let BanKey::FingerprintIn(fp, c) = key {
+                            self.remember_compound(writer, &tkey, fp, c);
+                        }
                         Ok(BanId(id))
                     }
                     Err(()) => Err(BouncerError::BanTableFull {

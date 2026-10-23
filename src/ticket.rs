@@ -21,6 +21,7 @@ use crate::{
     format::{DenialFormat, Ejected},
     keys::{AccountKey, ConnId, FingerprintKey, RequestId, SessionKey, TenantKey, normalize},
     maintain::CloseKind,
+    metrics::meter,
     registry::{
         CHILD_MASK, CODE_SHIFT, Cell, F_CANCELLED, F_CHARGED, F_CLIENT_BOUND, F_DETACHED, F_IMMUNE,
         F_KEEP_CONNECTION, F_LIVE, F_PENDING_CLIENT, F_PROXY_HOP, F_REVOKED, F_TENANT_CHARGED,
@@ -219,6 +220,9 @@ pub struct Ticket {
     seen: u64,
     kind: TicketKind,
     detached: bool,
+    /// Fast checkpoints not yet added to the shard's counter.
+    #[cfg(feature = "metrics")]
+    fast: u32,
 }
 
 /// What a new cell starts with.
@@ -276,6 +280,8 @@ impl Ticket {
             seen,
             kind: issue.kind,
             detached: false,
+            #[cfg(feature = "metrics")]
+            fast: 0,
         };
         // A revocation that landed while the cell was being filled is caught
         // here rather than at the next epoch move.
@@ -424,14 +430,28 @@ impl Ticket {
     pub fn checkpoint(&mut self) -> Verdict {
         let now = self.shard.epoch.load();
         if now == self.seen {
+            #[cfg(feature = "metrics")]
+            {
+                self.fast = self.fast.wrapping_add(1);
+            }
             return Verdict::Pass;
         }
         self.slow_path(now)
     }
 
+    /// Adds this handle's fast checkpoints to its shard's counter.
+    #[cfg(feature = "metrics")]
+    fn flush_meters(&mut self) {
+        let n = core::mem::take(&mut self.fast);
+        meter!(self.shard.meters, checkpoints_fast, n);
+    }
+
     #[cold]
     #[inline(never)]
     fn slow_path(&mut self, now: u64) -> Verdict {
+        #[cfg(feature = "metrics")]
+        self.flush_meters();
+        meter!(self.shard.meters, checkpoints_slow);
         match check_cell(self.shared(), self.index, self.generation, now) {
             Ok(()) => {
                 self.seen = now;
@@ -473,6 +493,7 @@ impl Ticket {
             self.slow_path(now)
         };
         if let Verdict::Deny(d) = verdict {
+            meter!(self.shard.meters, commits_blocked);
             events::emit_ticket(
                 self.shared(),
                 events::signals::COMMIT_BLOCKED,
@@ -874,7 +895,11 @@ impl Ticket {
         if cell.state.load(Ordering::Acquire) & F_IMMUNE != 0 {
             return true;
         }
-        source_of(cell).is_some_and(|a| crate::allow::lookup(&shared.allow, a).is_some())
+        source_of(cell).is_some_and(|a| {
+            shared
+                .allow
+                .with(|set| crate::allow::lookup(set, a).is_some())
+        })
     }
 
     /// Denies this ticket for an identity budget: `TooManyRequests`, and a
@@ -889,6 +914,7 @@ impl Ticket {
             });
         }
         self.seen = SEEN_ALWAYS_CHECK;
+        meter!(self.shard.meters, budget_refused);
         let verdict = self.deny(DenialCode::TooManyRequests);
         if let Verdict::Deny(d) = &verdict {
             events::emit_ticket(shared, events::signals::BUDGET_REFUSED, cell, d.reference);
@@ -1051,6 +1077,7 @@ impl Ticket {
     ) -> Ejected {
         let shard = Arc::clone(&self.shard);
         let shared = &shard.shared;
+        meter!(shard.meters, denials);
         let cell = shared.registry.cell(self.index);
         let generation_now = self.generation;
         // 1. Cancel, and revoke if nothing revoked it yet.
@@ -1113,6 +1140,7 @@ impl Ticket {
                 };
                 ejector.eject(conn, kind);
                 out.ejected = true;
+                meter!(shared.meters, ejections);
             }
         }
         // 5. Remember.
@@ -1356,6 +1384,7 @@ fn egress_slow(shared: &Shared, index: u32, gen_: u32, epoch: u64) -> Verdict {
         Ok(()) => Verdict::Pass,
         Err(code) => {
             let d = denial(shared, index, gen_, code);
+            meter!(shared.meters, egress_blocked);
             events::emit_ticket(shared, events::signals::EGRESS_BLOCKED, cell, d.reference);
             Verdict::Deny(d)
         }
@@ -1519,6 +1548,8 @@ fn uncount_child(shared: &Shared, parent: u32, parent_gen: u32) {
 
 impl Drop for Ticket {
     fn drop(&mut self) {
+        #[cfg(feature = "metrics")]
+        self.flush_meters();
         if !self.detached {
             release_cell(&self.shard, self.index, self.generation);
         }
@@ -1587,6 +1618,8 @@ mod tests {
             seen: SEEN_ALWAYS_CHECK,
             kind: TicketKind::Connection,
             detached: false,
+            #[cfg(feature = "metrics")]
+            fast: 0,
         };
         assert!(
             matches!(stale.checkpoint(), Verdict::Deny(d) if d.code == DenialCode::Unavailable)

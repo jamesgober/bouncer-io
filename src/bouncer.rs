@@ -1,7 +1,7 @@
 //! The bouncer and its builder.
 
 use core::{cell::Cell as StdCell, fmt, time::Duration};
-use std::{net::IpAddr, sync::Arc};
+use std::{net::IpAddr, sync::Arc, time::SystemTime};
 
 use clock_lib::{Clock, Monotonic, SystemClock};
 
@@ -19,11 +19,14 @@ use crate::{
     hash::{HashKey, Seeds},
     keys::{BanKey, Cidr, ConnId, RequestId, normalize},
     maintain::{self, Ejector, Maintenance, MaintenanceReport},
+    metrics::{Meters, meter},
+    published::Published,
     registry::{
         F_CHARGED, F_DETACHED, F_IMMUNE, F_LIVE, F_PROXY_HOP, KIND_CONNECTION, KIND_REQUEST,
         P_SESSION, Registry, Shard, generation,
     },
     revoke::{Record, Revocation, RevocationEpoch, Revocations, RevokeMode, Target, target_key},
+    share::NodeId,
     strikes::{Counters, Enforcement, Posture, StrikeRules},
     sync::{AtomicU32, Ordering},
     ticket::{self, Issue, Ticket, TicketKind, TicketTag, mark_revoked, subject_of},
@@ -43,8 +46,12 @@ const MAX_BAN_CAPACITY: u32 = 1 << 26;
 pub(crate) struct Shared {
     clock: Arc<dyn Clock>,
     start: Monotonic,
+    /// Wall time when the bouncer started: `start` on the wall clock.
+    pub(crate) start_wall: SystemTime,
+    /// This node, when sharing is configured.
+    pub(crate) node: Option<NodeId>,
     pub(crate) bans: BanMemory,
-    pub(crate) allow: PrefixSet<AllowKind>,
+    pub(crate) allow: Published<PrefixSet<AllowKind>>,
     pub(crate) proxies: PrefixSet<()>,
     pub(crate) references: HashKey,
     pub(crate) tickets_capacity: u32,
@@ -66,6 +73,9 @@ pub(crate) struct Shared {
     pub(crate) maintenance: Maintenance,
     pub(crate) revocation_rate: Option<rate_net::Gcra>,
     pub(crate) format: Arc<dyn crate::format::DenialFormat>,
+    /// Counters of cold paths (bans, revocations, maintenance).
+    #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
+    pub(crate) meters: Meters,
 }
 
 impl Shared {
@@ -74,11 +84,44 @@ impl Shared {
         Now::from_duration(self.clock.now().saturating_duration_since(self.start))
     }
 
-    fn guards(&self) -> Guards<'_> {
-        Guards {
-            immune: &self.allow,
-            proxies: &self.proxies,
-        }
+    /// The wall clock now.
+    pub(crate) fn wall(&self) -> SystemTime {
+        SystemTime::from(self.clock.wall())
+    }
+
+    /// Persistence records queued and not yet written.
+    pub(crate) fn journal_backlog(&self) -> u32 {
+        0
+    }
+
+    /// The last persistence failure, while the last write failed.
+    pub(crate) fn last_persist_error(&self) -> Option<std::io::ErrorKind> {
+        None
+    }
+
+    /// The offence history of a key.
+    pub(crate) fn offender_record(
+        &self,
+        _key: &BanKey,
+        _now_secs: u64,
+    ) -> Option<crate::admin::OffenderRecord> {
+        None
+    }
+
+    /// Whether an address is flagged as shared.
+    pub(crate) fn is_shared_source(&self, _addr: IpAddr, _now_secs: u64) -> bool {
+        false
+    }
+
+    /// Bookkeeping after bans were lifted outside `lift` (persistence).
+    pub(crate) fn after_lift(&self, _lifted: &[crate::bans::view::Held]) {}
+
+    /// Whether an immune allow-list entry covers `cidr`.
+    pub(crate) fn immune_covers(&self, cidr: &Cidr) -> bool {
+        self.allow.with(|set| {
+            set.find_covering_map(cidr, |k| (*k == AllowKind::Immune).then_some(()))
+                .is_some()
+        })
     }
 
     #[inline]
@@ -106,7 +149,15 @@ impl Shared {
         spec: &BanSpec,
         policy: Option<DurationPolicy>,
     ) -> Result<BanId, BouncerError> {
-        let result = self.bans.ban_with(spec, &self.guards(), self.now(), policy);
+        let allow = self.allow.load();
+        let guards = Guards {
+            immune: &allow,
+            proxies: &self.proxies,
+        };
+        let result = self.bans.ban_with(spec, &guards, self.now(), policy);
+        if result.is_ok() {
+            meter!(self.meters, bans_added);
+        }
         if self.sink.is_some() {
             let signal = match &result {
                 Ok(_) => Some(events::signals::BAN_ADDED),
@@ -230,6 +281,17 @@ fn shard_hint() -> u32 {
 }
 
 impl Bouncer {
+    /// The state every shard reads.
+    pub(crate) fn shared(&self) -> &Shared {
+        &self.inner.shared
+    }
+
+    /// The shards.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn shards(&self) -> &[Arc<Shard>] {
+        &self.inner.shards
+    }
+
     /// A bouncer with safe defaults: 65,536 tickets, 1,048,576 ban entries,
     /// 65,536 revocation entries, automatic keys at IPv4 /32 and /24 and IPv6
     /// /64, /56, /48, door budgets of 20 connections per second (burst 40)
@@ -376,7 +438,10 @@ impl Bouncer {
             },
         );
         match issued {
-            Some(t) => Ok(t),
+            Some(t) => {
+                meter!(shard.meters, admitted);
+                Ok(t)
+            }
             None => {
                 if charge {
                     shared.budgets.release_connection(Some(peer), now);
@@ -390,6 +455,12 @@ impl Bouncer {
     #[cold]
     fn report_refusal(&self, refusal: Refusal, peer: IpAddr) {
         let shared = &self.inner.shared;
+        match refusal {
+            Refusal::Banned { .. } => meter!(shared.meters, refused_ban),
+            Refusal::OverBudget { .. } => meter!(shared.meters, refused_budget),
+            Refusal::RegistryFull => meter!(shared.meters, refused_registry_full),
+            Refusal::Posture => meter!(shared.meters, refused_posture),
+        }
         if shared.sink.is_none() {
             return;
         }
@@ -463,6 +534,7 @@ impl Bouncer {
         let spec = spec.into();
         let result = shared.bans.lift(&spec);
         if let Ok(l) = &result {
+            meter!(shared.meters, bans_lifted, l.removed);
             Emit {
                 actor: spec.actor,
                 reason: spec.reason,
@@ -535,11 +607,7 @@ impl Bouncer {
         let target = match *target {
             Target::Source(c) => {
                 if actor.is_automated() {
-                    let immune = shared
-                        .allow
-                        .find_covering_map(&c, |k| (*k == AllowKind::Immune).then_some(()))
-                        .is_some();
-                    if immune {
+                    if shared.immune_covers(&c) {
                         return Err(BouncerError::AllowListed {
                             key: BanKey::Prefix(c),
                         });
@@ -581,6 +649,7 @@ impl Bouncer {
             Err(()) => {
                 maintain::direct_sweep(shared, &target, code, keep_connection);
                 shared.epoch.bump();
+                meter!(shared.meters, revocations);
                 maintain::report_revocation(shared, &target, actor, reason, reference, confidence);
                 return Err(BouncerError::RevocationTableFull {
                     capacity: shared.revocations.capacity(),
@@ -598,6 +667,7 @@ impl Bouncer {
             // Schedule cleanup of the entry.
             shared.maintenance.wake();
         }
+        meter!(shared.meters, revocations);
         maintain::report_revocation(shared, &target, actor, reason, reference, confidence);
         Ok(Revocation {
             epoch,
@@ -1012,7 +1082,7 @@ impl Bouncer {
         c.total_bytes = c.table_bytes
             + shared.bans.admin_bytes()
             + shared.registry.bytes()
-            + shared.allow.bytes()
+            + shared.allow.with(PrefixSet::bytes)
             + shared.proxies.bytes()
             + shared.revocations.bytes()
             + shared.budgets.bytes()
@@ -1096,6 +1166,7 @@ pub struct BouncerBuilder {
     revocation_rate_limit: u32,
     strict_budget_divisor: u8,
     strict_revokes_unauthenticated: bool,
+    node: Option<NodeId>,
 }
 
 impl Default for BouncerBuilder {
@@ -1125,6 +1196,7 @@ impl Default for BouncerBuilder {
             revocation_rate_limit: 10_000,
             strict_budget_divisor: 2,
             strict_revokes_unauthenticated: false,
+            node: None,
         }
     }
 }
@@ -1286,6 +1358,13 @@ impl BouncerBuilder {
         self
     }
 
+    /// This node's id, stamped on every record it exports; required for
+    /// `export_delta`. 0 is refused at `try_build`.
+    pub fn node(mut self, id: NodeId) -> Self {
+        self.node = Some(id);
+        self
+    }
+
     /// How much [`Posture::Strict`] divides the door budgets by (default 2):
     /// each admission costs that many tokens and the concurrency limits
     /// shrink by it. Zero is refused at `try_build`.
@@ -1362,6 +1441,9 @@ impl BouncerBuilder {
         self.strikes.validate()?;
         self.denials.validate()?;
         self.budgets.validate()?;
+        if self.node == Some(NodeId(0)) {
+            return Err(ConfigError::new("node", ConfigProblem::TooSmall { min: 1 }).into());
+        }
         if self.strict_budget_divisor == 0 {
             return Err(
                 ConfigError::new("strict_budget_divisor", ConfigProblem::InvalidFactor).into(),
@@ -1420,6 +1502,8 @@ impl BouncerBuilder {
 
         let shared = Arc::new(Shared {
             start: clock.now(),
+            start_wall: SystemTime::from(clock.wall()),
+            node: self.node,
             clock,
             bans: BanMemory::new(
                 self.ban_capacity,
@@ -1429,7 +1513,7 @@ impl BouncerBuilder {
                 self.durations,
                 seeds.rng,
             ),
-            allow,
+            allow: Published::new(allow),
             proxies,
             references: seeds.references,
             tickets_capacity: tickets,
@@ -1453,6 +1537,7 @@ impl BouncerBuilder {
                 .format
                 .clone()
                 .unwrap_or_else(|| Arc::new(crate::format::NoFormat)),
+            meters: Meters::default(),
         });
         let shards: Box<[Arc<Shard>]> = (0..shard_count)
             .map(|i| {
@@ -1460,6 +1545,7 @@ impl BouncerBuilder {
                     id: i as u8,
                     epoch: Arc::clone(&epoch),
                     shared: Arc::clone(&shared),
+                    meters: Meters::default(),
                 })
             })
             .collect();

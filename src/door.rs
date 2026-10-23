@@ -161,7 +161,7 @@ impl Shared {
                 })
             };
         }
-        let allowed = allow::lookup(&self.allow, peer);
+        let allowed = self.allow.with(|set| allow::lookup(set, peer));
         if allowed == Some(AllowKind::Immune) {
             return Judgement::Admit {
                 immune: true,

@@ -200,6 +200,28 @@ impl Reason {
     }
 }
 
+impl fmt::Display for Reason {
+    /// The catalog name, or `custom(code)`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self.0 {
+            1 => "admin",
+            2 => "logout",
+            3 => "logout_everywhere",
+            4 => "password_changed",
+            5 => "standing_changed",
+            6 => "policy",
+            7 => "strike_threshold",
+            8 => "decoy",
+            9 => "imported",
+            10 => "connection_closed",
+            11 => "lockdown",
+            12 => "budget",
+            code => return write!(f, "custom({code})"),
+        };
+        f.write_str(name)
+    }
+}
+
 /// One evidence value. There is no variant for session or fingerprint
 /// digests, so secrets cannot end up in evidence.
 #[non_exhaustive]

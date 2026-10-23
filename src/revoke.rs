@@ -364,6 +364,11 @@ impl Revocations {
         self.table.bytes()
     }
 
+    /// Live entries.
+    pub(crate) fn live(&self) -> u32 {
+        self.lock().table.live()
+    }
+
     /// `true` when nothing is recorded: checks skip every probe.
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {

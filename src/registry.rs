@@ -226,6 +226,8 @@ pub(crate) struct Shard {
     pub(crate) id: u8,
     pub(crate) epoch: Arc<Epoch>,
     pub(crate) shared: Arc<crate::bouncer::Shared>,
+    #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
+    pub(crate) meters: crate::metrics::Meters,
 }
 
 impl Shard {

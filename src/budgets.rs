@@ -544,6 +544,79 @@ impl DoorBudgets {
         }
     }
 
+    /// The fullest table's load, 0 to 1.
+    pub(crate) fn load(&self) -> f32 {
+        let rate = self.rate.iter().flatten().map(|t| t.claims.load());
+        let conc = self.concurrency.iter().flatten().map(|t| t.claims.load());
+        rate.chain(conc).fold(0.0, f32::max)
+    }
+
+    /// The door budget states of an address, for `explain`.
+    pub(crate) fn state(&self, addr: IpAddr, now: Now) -> Vec<crate::admin::BudgetState> {
+        use crate::{admin::BudgetState, keys::BanKey};
+        let host = Cidr::host(addr);
+        let (client, prefix) = match host.family() {
+            Family::V4 => (32, 24),
+            Family::V6 => (64, 48),
+        };
+        let as_key = |len: u8| {
+            let c = host.parent(len).unwrap_or(host);
+            if c.len() == c.family().max_len() {
+                BanKey::Address(c.network())
+            } else {
+                BanKey::Prefix(c)
+            }
+        };
+        let names = [
+            (
+                "door.rate.client",
+                "door.concurrency.client",
+                as_key(client),
+            ),
+            (
+                "door.rate.prefix",
+                "door.concurrency.prefix",
+                as_key(prefix),
+            ),
+        ];
+        let keys = self.keys(addr);
+        let now_d = Duration::from_nanos(now.as_nanos());
+        let mut out = Vec::new();
+        if let Some(tiers) = &self.rate {
+            for ((tier, key), (rate, _, bk)) in tiers.iter().zip(keys).zip(names) {
+                let (remaining, retry) = match tier.claims.find(key) {
+                    Some(slot) => {
+                        let s = tier.cells[slot].peek_at(now_d);
+                        let r = s.remaining();
+                        (r, (r == 0).then(|| s.reset_after()))
+                    }
+                    None => (tier.burst, None),
+                };
+                out.push(BudgetState {
+                    class: rate,
+                    key: bk,
+                    remaining,
+                    retry_after: retry,
+                });
+            }
+        }
+        if let Some(tiers) = &self.concurrency {
+            for ((tier, key), (_, conc, bk)) in tiers.iter().zip(keys).zip(names) {
+                let used = tier
+                    .claims
+                    .find(key)
+                    .map_or(0, |s| tier.counts[s].load(Ordering::Acquire));
+                out.push(BudgetState {
+                    class: conc,
+                    key: bk,
+                    remaining: tier.limit.saturating_sub(used),
+                    retry_after: None,
+                });
+            }
+        }
+        out
+    }
+
     /// Live connections counted for an address (tests and `explain`).
     #[cfg(all(test, not(bouncer_loom)))]
     pub(crate) fn concurrent(&self, addr: IpAddr) -> u32 {
@@ -830,6 +903,19 @@ impl IdentityBudgets {
                 }
             }
         }
+    }
+
+    /// The fullest table's load, 0 to 1.
+    pub(crate) fn load(&self) -> f32 {
+        let lanes = self.lanes.iter().flatten().map(|t| t.claims.load());
+        let tenant = self.tenant.iter().map(|t| t.claims.load());
+        let flight = self.in_flight.iter().map(|c| c.claims.load());
+        lanes.chain(tenant).chain(flight).fold(0.0, f32::max)
+    }
+
+    /// The tenant in-flight limit, when configured.
+    pub(crate) fn tenant_limit(&self) -> Option<u32> {
+        self.in_flight.as_ref().map(|c| c.limit)
     }
 
     /// Requests in flight counted for a tenant (`explain`, tests).

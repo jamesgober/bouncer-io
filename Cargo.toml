@@ -48,6 +48,8 @@ path = "src/lib.rs"
 # #################################
 [features]
 default = []
+# Per-shard counters and `Bouncer::metrics`; without it the counters do not exist.
+metrics = []
 
 
 # DEPENDENCIES
