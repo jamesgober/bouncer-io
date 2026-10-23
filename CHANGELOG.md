@@ -11,6 +11,10 @@
 
 ## [Unreleased]
 
+---
+
+## [0.2.0] - 2026-10-22
+
 The design lock: the full public API, the plan rewritten from the crate's
 specification, and the move to the portfolio template. No functional code yet.
 
@@ -61,5 +65,6 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jamesgober/bouncer-io/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/bouncer-io/releases/tag/v0.1.0
