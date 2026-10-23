@@ -11,7 +11,9 @@ fuzz_target!(|data: &[u8]| {
         let b = Bouncer::builder()
             .node(NodeId(9))
             .ban_capacity(1024)
+            .revocation_capacity(64)
             .tickets(64)
+            .budgets(bouncer_io::Budgets::off())
             .try_build()
             .unwrap();
         let _ = b.import(&delta, Actor::Channel(1));

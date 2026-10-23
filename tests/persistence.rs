@@ -325,7 +325,9 @@ fn kill_child() {
         .budgets(bouncer_io::Budgets::off())
         .try_build()
         .unwrap();
-    for i in 0u32.. {
+    // Runs until the parent kills it.
+    let mut i = 0u32;
+    loop {
         let addr = IpAddr::from((0x0a00_0000 | (i & 0x00ff_ffff)).to_be_bytes());
         // Spread over /24s so nothing escalates.
         let addr = match addr {
@@ -340,6 +342,7 @@ fn kill_child() {
             b.flush().unwrap();
             println!("flushed {i}");
         }
+        i = i.wrapping_add(1);
     }
 }
 

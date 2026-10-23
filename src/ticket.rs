@@ -1463,6 +1463,18 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
         TicketKind::Request => {
             let link = cell.link.load(Ordering::Relaxed);
             let (pi, pg) = ((link >> 32) as u32, link as u32);
+            if st & F_PENDING_CLIENT != 0 && shared.sink.is_some() {
+                // A proxied request ended without its real client: the
+                // adapter never called `bind_client`.
+                events::Emit {
+                    subject: Subject {
+                        conn: Some(ConnId(cell.conn.load(Ordering::Relaxed))),
+                        ..Subject::default()
+                    },
+                    ..events::Emit::new(events::signals::DOOR_PROXY_HOP_UNRESOLVED)
+                }
+                .send(shared);
+            }
             uncount_child(shared, pi, pg);
             // Forget it as the connection's latest request.
             let me = u64::from(index);

@@ -34,7 +34,9 @@ fuzz_target!(|data: &[u8]| {
     };
     let mut builder = Bouncer::builder()
         .ban_capacity(1024)
+        .revocation_capacity(64)
         .tickets(64)
+        .budgets(bouncer_io::Budgets::off())
         .persistence(Box::new(Bytes(Some(rest.to_vec()))));
     if mode & 1 != 0 {
         builder = builder.mac_key([mode; 32]);

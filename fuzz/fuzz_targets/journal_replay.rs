@@ -33,12 +33,21 @@ impl Persistence for Store {
     }
 }
 
+/// Small tables, so each run is cheap.
+fn small() -> bouncer_io::BouncerBuilder {
+    Bouncer::builder()
+        .ban_capacity(1024)
+        .revocation_capacity(64)
+        .tickets(64)
+        .budgets(bouncer_io::Budgets::off())
+}
+
 /// A snapshot with a few bans in it, and a journal batch to learn from.
 fn seed() -> &'static (Vec<u8>, Vec<u8>) {
     static SEED: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
     SEED.get_or_init(|| {
         let store = Store::default();
-        let b = Bouncer::builder().persistence(Box::new(store.clone())).try_build().unwrap();
+        let b = small().persistence(Box::new(store.clone())).try_build().unwrap();
         b.ban("192.0.2.1".parse::<std::net::IpAddr>().unwrap()).unwrap();
         b.flush().unwrap();
         drop(b);
@@ -60,7 +69,7 @@ fuzz_target!(|data: &[u8]| {
             data.to_vec()
         };
     }
-    if let Ok(b) = Bouncer::builder().persistence(Box::new(store)).try_build() {
+    if let Ok(b) = small().persistence(Box::new(store)).try_build() {
         let _ = b.door("192.0.2.2".parse().unwrap());
     }
 });

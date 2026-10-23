@@ -458,6 +458,10 @@ thread_local! {
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// What a ban did: its id, an escalation now due, and a ban the insert
+/// took out (`true` when evicted, `false` when expired).
+pub(crate) type Planned = (BanId, Option<Plan>, Option<(BanKey, bool)>);
+
 /// The ban memory of one bouncer.
 pub(crate) struct BanMemory {
     table: Table,
@@ -762,7 +766,7 @@ impl BanMemory {
         guards: &Guards<'_>,
         now: Now,
         policy: Option<DurationPolicy>,
-    ) -> Result<(BanId, Option<Plan>, Option<BanKey>), BouncerError> {
+    ) -> Result<Planned, BouncerError> {
         let key = spec.key.normalized();
         self.guard(&key, guards)?;
         let placement = self.place(&key, spec.actor)?;
@@ -844,9 +848,7 @@ impl BanMemory {
                     Ok(Inserted::Merged { previous }) => BanId(previous.id),
                     Ok(Inserted::New { removed, evicted }) => {
                         if let Some(r) = removed {
-                            if evicted {
-                                gone = self.key_of(writer, &r.key);
-                            }
+                            gone = self.key_of(writer, &r.key).map(|k| (k, evicted));
                             self.count(writer, &r.key, false);
                             let counter = if evicted {
                                 &self.evicted

@@ -191,3 +191,48 @@ fn test_blocking_sink_never_slows_checkpoints() {
         started.elapsed()
     );
 }
+
+#[derive(Default)]
+struct Ids(std::sync::Mutex<Vec<u32>>);
+impl EventSink for Ids {
+    fn event(&self, e: &Event<'_>) {
+        self.0.lock().unwrap().push(e.signal.id);
+    }
+}
+
+#[test]
+fn test_eviction_expiry_and_unresolved_proxy_hops_report() {
+    use bouncer_io::{Actor, Cidr, signals};
+    let ids = Arc::new(Ids::default());
+    let clock = Arc::new(ManualClock::new());
+    let b = Bouncer::builder()
+        .clock(clock.clone())
+        .ban_capacity(16)
+        .trusted_proxies(&["10.0.0.0/8".parse::<Cidr>().unwrap()])
+        .event_sink(ids.clone())
+        .try_build()
+        .unwrap();
+    // Fill with evictable bans, one per /24, then one more: an eviction.
+    for i in 0..17u8 {
+        let spec = BanSpec::address(IpAddr::from([198, 51, i, 1]))
+            .by(Actor::Local)
+            .for_duration(Duration::from_secs(60 + u64::from(i)));
+        b.ban(spec).unwrap();
+    }
+    // Let them expire, then insert: the slot of an expired one is reclaimed.
+    clock.advance(Duration::from_secs(200));
+    for i in 100..110u8 {
+        b.ban(IpAddr::from([203, 0, i, 1])).unwrap();
+    }
+    // A proxied request that never bound its client.
+    let hop = b.door(ip("10.1.2.3")).unwrap();
+    drop(hop.request(RequestId(1)).unwrap());
+    let seen = ids.0.lock().unwrap();
+    for (signal, name) in [
+        (signals::BAN_EVICTED, "evicted"),
+        (signals::BAN_EXPIRED, "expired"),
+        (signals::DOOR_PROXY_HOP_UNRESOLVED, "proxy hop"),
+    ] {
+        assert!(seen.contains(&signal.id), "{name} not reported");
+    }
+}

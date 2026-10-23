@@ -10,6 +10,8 @@
         <a href="./API.md" title="API reference"><b>API</b></a>
         <span>&nbsp;│&nbsp;</span>
         <span>INTEGRATION</span>
+        <span>&nbsp;│&nbsp;</span>
+        <a href="./ARCHITECTURE.md" title="Architecture"><b>ARCHITECTURE</b></a>
     </sup>
 </div>
 <br>

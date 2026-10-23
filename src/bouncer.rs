@@ -126,6 +126,26 @@ impl Shared {
         self.sources.is_shared(addr, now_secs)
     }
 
+    /// Reports a ban an insert took out: evicted from a full table (journaled
+    /// as removed), or expired and reclaimed.
+    fn report_gone(&self, gone: Option<(BanKey, bool)>) {
+        let Some((key, evicted)) = gone else {
+            return;
+        };
+        if evicted {
+            self.log_removed(&[key]);
+        }
+        Emit {
+            subject: subject_of_key(&key),
+            ..Emit::new(if evicted {
+                events::signals::BAN_EVICTED
+            } else {
+                events::signals::BAN_EXPIRED
+            })
+        }
+        .send(self);
+    }
+
     /// Bookkeeping after bans were lifted outside `lift` (persistence).
     pub(crate) fn after_lift(&self, lifted: &[crate::bans::view::Held]) {
         let keys: Vec<BanKey> = lifted.iter().map(|h| h.key).collect();
@@ -172,10 +192,8 @@ impl Shared {
         };
         let planned = self.bans.ban_plan(spec, &guards, self.now(), policy);
         let (result, plan) = match planned {
-            Ok((id, plan, evicted)) => {
-                if let Some(k) = evicted {
-                    self.log_removed(&[k]);
-                }
+            Ok((id, plan, gone)) => {
+                self.report_gone(gone);
                 (Ok(id), plan)
             }
             Err(e) => (Err(e), None),
@@ -269,10 +287,8 @@ impl Shared {
                 proxies: &self.proxies,
             };
             match self.bans.ban_plan(&spec, &guards, now, None) {
-                Ok((id, next, evicted)) => {
-                    if let Some(k) = evicted {
-                        self.log_removed(&[k]);
-                    }
+                Ok((id, next, gone)) => {
+                    self.report_gone(gone);
                     self.log_ban(&BanKey::Prefix(parent));
                     let folded = self.bans.fold(&plan.children, parent_until);
                     self.log_removed(&folded);
