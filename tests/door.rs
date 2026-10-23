@@ -511,8 +511,9 @@ fn test_lift_prefix_leaves_covering_ban() {
 #[test]
 fn test_ban_table_full_only_unevictable_left() {
     let b = Bouncer::builder().ban_capacity(16).try_build().unwrap();
+    // One per /24, so nothing escalates.
     for i in 0..16u8 {
-        b.ban(IpAddr::from([192, 0, 2, i])).unwrap();
+        b.ban(IpAddr::from([192, 0, i, 2])).unwrap();
     }
     assert_eq!(
         b.ban(BanSpec::address(ip("198.51.100.1")).by(Actor::Local)),
@@ -520,7 +521,7 @@ fn test_ban_table_full_only_unevictable_left() {
     );
     for i in 0..16u8 {
         assert!(
-            b.door(IpAddr::from([192, 0, 2, i])).is_err(),
+            b.door(IpAddr::from([192, 0, i, 2])).is_err(),
             "admin ban {i} kept"
         );
     }

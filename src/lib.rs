@@ -47,11 +47,13 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod admin;
 mod allow;
 mod bans;
 mod bouncer;
 mod budgets;
 mod claims;
+mod codec;
 mod collected;
 mod directive;
 mod door;
@@ -63,25 +65,39 @@ mod keys;
 #[cfg(all(test, bouncer_loom))]
 mod loom_models;
 mod maintain;
+mod metrics;
+mod persist;
+mod published;
 mod registry;
 mod revoke;
+mod share;
+mod sources;
+mod state;
 mod strikes;
 mod sync;
 mod ticket;
 mod time;
 mod verdict;
 
+#[cfg(feature = "metrics")]
+pub use crate::metrics::MetricsSnapshot;
 pub use crate::{
+    admin::{
+        BanRecord, BudgetState, Explanation, Filter, Health, Listing, MaintainerState,
+        OffenderRecord, Page, StrikeState,
+    },
     allow::{AllowKind, AllowList},
-    bans::{BanDuration, BanId, BanSpec, DurationPolicy, LiftSpec, Lifted},
+    bans::{
+        BanDuration, BanId, BanSpec, DurationPolicy, LiftSpec, Lifted, escalate::EscalationPolicy,
+    },
     bouncer::{Bouncer, BouncerBuilder, Capacity},
     budgets::{Budgets, Rate},
     collected::Collected,
     directive::{
         Action, Actor, ActorKind, Applied, BanKeys, Directive, Evidence, EvidenceValue, Reason,
     },
-    door::{Provenance, Refusal},
-    error::{BouncerError, ConfigError, ConfigProblem},
+    door::{DatagramVerdict, Provenance, Refusal},
+    error::{BouncerError, ConfigError, ConfigProblem, ImportError, PersistError},
     events::{Category, Event, EventSink, GENERATOR, NoSink, SignalId, Subject, signals},
     format::{DenialFormat, Ejected, FormatError, NoFormat},
     keys::{
@@ -89,9 +105,11 @@ pub use crate::{
         normalize, prefix_of,
     },
     maintain::{CloseKind, Ejector, MaintenanceReport},
+    persist::{FilePersistence, LoadFailure, Persistence, SNAPSHOT_FORMAT, SNAPSHOT_MAGIC},
     revoke::{Revocation, RevocationEpoch, RevokeMode, Target},
+    share::{Delta, ImportReport, NodeId, Sequence},
     strikes::{Enforcement, IgnoredBecause, Mode, Posture, StrikeKind, StrikeOutcome, StrikeRules},
-    ticket::{Ticket, TicketId, TicketKind, TicketTag},
+    ticket::{LaneClass, Ticket, TicketId, TicketKind, TicketTag},
     time::Now,
     verdict::{Denial, DenialCode, DenialTable, Reference, Verdict},
 };

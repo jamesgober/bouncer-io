@@ -51,12 +51,12 @@ Exit:
 Also: identity throttles (moved from 0.4, PLAN D-052); `set_posture` and its effects (PLAN D-053); `health` reporting revocation load and detached tickets.
 Items: `BanRecord`; escalation, offender memory, shared-address detection; lane and tenant budgets, `bind_lane`; throttle directives; posture; `explain`, `list`, `replace_allow`; `health`; persistence (snapshot, journal, MAC, `FilePersistence`, `LoadFailure`, wall-jump rules); sharing (`NodeId`, `Delta`, `Sequence`, `ImportReport`, HLC stamps, revocation records, skew bound); `metrics`; `datagram`; `docs/ARCHITECTURE.md`.
 Exit:
-- [ ] Bans survive a restart (kill tests pass on Linux, macOS, Windows).
-- [ ] Two in-process bouncers exchanging deltas converge under every permutation; each keeps enforcing when the other is gone; a revocation on one stops a running request on the other.
-- [ ] Every P0, P1, and P2 item of `docs/API.md` exists.
-- [ ] Edge cases 48 to 68 pass.
-- [ ] Threat tests T-3, T-4, T-5, T-15, T-16, T-17, T-19, T-20, T-25, T-27.
-- [ ] Fuzz targets `snapshot_decode`, `journal_replay`, `delta_decode`.
+- [x] Bans survive a restart; the kill test (`tests/persistence.rs`) runs in CI on Linux, macOS, and Windows, 12 rounds per run and 1,000 before a release (PLAN D-078).
+- [x] Two in-process bouncers exchanging deltas converge under every permutation, each delivered twice; each keeps enforcing when the other is gone; a revocation on one stops a running request on the other (`tests/share.rs`).
+- [x] Every P0, P1, and P2 item of `docs/API.md` exists, except `TABLE_RESEEDED`, which belongs to the table rebuild moved to 0.6 (PLAN D-038).
+- [x] Edge cases 48 to 67 pass (the list ends at 67).
+- [x] Threat tests T-3, T-4, T-5, T-15, T-16, T-17, T-19, T-20, T-25, T-27.
+- [x] Fuzz targets `snapshot_decode`, `journal_replay`, `delta_decode`, run in CI with the others.
 
 ## v0.6.0 - Optimisation
 Items: the door under 100 ns p99 with 1,000,000 bans (moved from 0.3); T-12, p99 checkpoint under 100,000 revocations per second (moved from 0.4); table rebuild with a fresh seed at the probe bound (moved from 0.3); 8-byte keys and 32-byte slots; the benchmarks of PLAN 11 against the named competitors; prefix structure confirmed or changed (O-4); keyed hash chosen (O-8); shard `Arc` confirmed (O-5); `#[track_caller]` cost on `checkpoint` measured (0.2 defence idea); `docs/PERFORMANCE.md`.

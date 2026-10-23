@@ -56,6 +56,20 @@ pub enum StrikeKind {
 const KINDS: usize = 11;
 
 impl StrikeKind {
+    /// Every kind except `Custom`.
+    pub(crate) const BUILT_IN: [StrikeKind; 10] = [
+        StrikeKind::HandshakeFailed,
+        StrikeKind::ProxyViolation,
+        StrikeKind::TlsAlert,
+        StrikeKind::Malformed,
+        StrikeKind::ContractViolation,
+        StrikeKind::SlowPeer,
+        StrikeKind::LoginFailed,
+        StrikeKind::AuthzDenied,
+        StrikeKind::TombstoneReuse,
+        StrikeKind::DecoyTouched,
+    ];
+
     const fn index(self) -> usize {
         match self {
             StrikeKind::HandshakeFailed => 0,
@@ -231,6 +245,11 @@ impl StrikeRules {
         Ok(())
     }
 
+    /// The threshold of a kind.
+    pub(crate) fn threshold(&self, kind: StrikeKind) -> u16 {
+        self.rules[kind.index()].threshold
+    }
+
     pub(crate) fn durations(&self, kind: StrikeKind) -> Option<DurationPolicy> {
         self.rules[kind.index()].durations
     }
@@ -365,6 +384,25 @@ impl Counters {
         Claims::key(self.key.hash3((kind.code() << 8) | (tag << 56), k0, k1))
     }
 
+    /// The weighted count in the current window (0 when none).
+    pub(crate) fn peek(
+        &self,
+        rules: &StrikeRules,
+        kind: StrikeKind,
+        key: u64,
+        now_secs: u64,
+    ) -> u16 {
+        let window = rules.rules[kind.index()].window.as_secs().max(1);
+        self.claims.find(key).map_or(0, |slot| {
+            let v = self.cells[slot].load(Ordering::Acquire);
+            if v == 0 || (v >> 32) + window <= now_secs {
+                0
+            } else {
+                (v & 0xffff_ffff).min(u64::from(u16::MAX)) as u16
+            }
+        })
+    }
+
     /// Adds `weight` within the rule's window; reports whether the threshold
     /// is reached by this strike (exactly once per window).
     pub(crate) fn add(
@@ -443,6 +481,7 @@ pub(crate) fn strike(
     if st & F_IMMUNE != 0 {
         return StrikeOutcome::Ignored(IgnoredBecause::AllowListed);
     }
+    crate::metrics::meter!(shard.meters, strikes);
     let subject = subject_of(cell);
     let mode = shared.enforcement.mode(kind, shared.posture());
     if shared.sink.is_some() {
@@ -536,7 +575,41 @@ pub(crate) fn strike(
         .send(shared);
     }
     if mode == Mode::Observe {
+        crate::metrics::meter!(shard.meters, thresholds_observed);
         return StrikeOutcome::ThresholdObserved { would_ban };
+    }
+    crate::metrics::meter!(shard.meters, thresholds_enforced);
+    if let BanKey::Address(src) = would_ban {
+        if shared.sources.is_shared(src, now) {
+            // Likely a NAT: throttle the address, ban the identities.
+            let secs = policy.unwrap_or_default().base_secs().max(1);
+            let client = match crate::keys::Cidr::host(src).family() {
+                crate::keys::Family::V4 => crate::keys::Cidr::host(src),
+                crate::keys::Family::V6 => crate::keys::Cidr::host(src)
+                    .parent(64)
+                    .unwrap_or(crate::keys::Cidr::host(src)),
+            };
+            shared
+                .budgets
+                .throttle(&client, 4, now.saturating_add(secs), now);
+            let mut banned = false;
+            for key in [
+                subject.session.map(BanKey::Session),
+                subject.account.map(BanKey::Account),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let spec = BanSpec::key(key)
+                    .by(Actor::Local)
+                    .because(Reason::STRIKE_THRESHOLD);
+                banned |= shared.ban(&spec, policy).is_ok();
+            }
+            if banned {
+                revoke_ticket();
+            }
+            return StrikeOutcome::Throttled;
+        }
     }
     let spec = BanSpec::key(would_ban)
         .by(Actor::Local)

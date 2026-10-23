@@ -7,7 +7,7 @@
 
 use std::net::IpAddr;
 
-use bouncer_io::{Bouncer, Budgets, Directive, Reason, RequestId, SessionKey, Ticket};
+use bouncer_io::{Bouncer, Budgets, Directive, EscalationPolicy, Reason, RequestId, SessionKey, Ticket};
 use libfuzzer_sys::fuzz_target;
 
 const ADDRS: usize = 8;
@@ -30,7 +30,14 @@ struct Live {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let b = Bouncer::builder().budgets(Budgets::off()).tickets(256).ban_capacity(64).try_build().unwrap();
+    // Escalation off: the model bans exactly the addresses it was told to.
+    let b = Bouncer::builder()
+        .budgets(Budgets::off())
+        .escalation(EscalationPolicy::default().off())
+        .tickets(256)
+        .ban_capacity(64)
+        .try_build()
+        .unwrap();
     let mut banned = [false; ADDRS];
     let mut revoked_sessions = [false; SESSIONS];
     let mut live: Vec<Live> = Vec::new();

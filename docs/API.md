@@ -18,7 +18,7 @@
 
 The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every item lists its tier, its grade, the version that brings it, and what it costs. The rustdoc on [docs.rs](https://docs.rs/bouncer-io) becomes the exhaustive reference as each item lands; until then this file is the contract.
 
-> **Status: `0.4.0` (extended).** Built and tested: everything of 0.3 (keys, ban memory, the door, tickets), plus in-flight revocation by every target, before-commit, identity binds, tags and the egress check, `Collected` and wipe-replace-eject, directives, strikes (observe by default), door budgets, events and the signal catalog, and maintenance. Items marked with a later version are the agreed shape, built version by version as [`../dev/ROADMAP.md`](../dev/ROADMAP.md) lists; their examples become doctests when they land.
+> **Status: `0.5.0` (feature complete).** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. Items marked with a later version (the net-io feature at 0.8) are the agreed shape; their examples become doctests when they land.
 
 **Reading the item headers.** *Tier 1* is the simple surface (one-line constructors, no builder), *Tier 2* is configuration, *Tier 3* is the full surface for integrations and other libraries. *P0* is required for the crate's job, *P1* is what users of the best existing tools expect, *P2* is high value for serious deployments, *P3* comes after 1.0. Costs are targets, marked `[est.]` until they are measured at 0.6.
 
@@ -304,7 +304,7 @@ pub fn datagram(&self, source: IpAddr, verified: bool, now: Now) -> DatagramVerd
 
 Tier 2 · P2 · 0.5 · 30-60 ns [est.]
 
-Per-datagram door for UDP. The source is checked against ban memory and its prefix budget. `verified` says whether the source has proven it can receive (a completed handshake or a returned cookie); an unverified source is never struck or banned, because UDP source addresses can be forged to frame a victim.
+Per-datagram door for UDP. The source is checked against ban memory, then the door rate budgets (no concurrency). `verified` says whether the source has proven it can receive (a completed handshake or a returned cookie). An unverified source is charged only at its prefix, never at its own client budget, and is never struck or banned, because UDP source addresses can be forged to frame a victim.
 
 ```rust
 use bouncer_io::{Bouncer, DatagramVerdict};
@@ -417,7 +417,7 @@ The single entry for decisions made elsewhere: the security signals policy, sent
 
 Rules that hold whatever the directive says: automated actors never touch allow-listed keys or trusted proxies; a directive below the Medium confidence band (under 30) cannot ban by itself (it may throttle); every applied directive is an event naming its cause.
 
-**Errors:** as [`ban`](#ban) and [`revoke`](#revoke), plus `InvalidTarget` when the action does not fit the target (a lift of a connection id; at 0.4, a throttle of anything but a source). A ban directive below confidence 30 is not an error: it is applied as a throttle and `Applied::downgraded` says so.
+**Errors:** as [`ban`](#ban) and [`revoke`](#revoke), plus `InvalidTarget` when the action does not fit the target (a lift or a throttle of a connection or request id). A throttle of a session, account, tenant, or fingerprint divides that key's lane and tenant budgets; with no identity budget configured it has nothing to divide. A ban directive below confidence 30 is not an error: it is applied as a throttle and `Applied::downgraded` says so.
 
 ```rust
 use bouncer_io::{Actor, Bouncer, Directive, Reason, SessionKey};
@@ -586,7 +586,7 @@ pub fn posture(&self) -> Posture;
 
 Tier 2 · P2 · 0.5 · one atomic store or load
 
-Switches between `Posture::Normal` and `Posture::Strict` (lockdown). The integrator calls it when its security core raises a lockdown (for example from an urgent alert line read at the top of each worker loop). Strict halves the door budgets (`BouncerBuilder::strict_budget_divisor`, default 2) and switches the strike categories listed in `Enforcement::strict` from observe to enforce. Refusing whole listeners during a lockdown is the transport's job (net-io refuses listeners not marked for lockdown). Changing posture revokes nothing already admitted unless `BouncerBuilder::strict_revokes_unauthenticated(true)` is set, in which case every ticket with no bound session is revoked.
+Switches between `Posture::Normal` and `Posture::Strict` (lockdown). The integrator calls it when its security core raises a lockdown (for example from an urgent alert line read at the top of each worker loop). Strict halves the door budgets (`BouncerBuilder::strict_budget_divisor`, default 2) and switches the strike categories listed in `Enforcement::strict` from observe to enforce. Refusing whole listeners during a lockdown is the transport's job (net-io refuses listeners not marked for lockdown). Changing posture revokes nothing already admitted unless `BouncerBuilder::strict_revokes_unauthenticated(true)` is set, in which case every request ticket with no bound session is revoked (connections are not: they carry authenticated requests too). A change is reported as `bouncer.posture.changed`.
 
 ```rust
 use bouncer_io::{Bouncer, Posture};
@@ -1652,6 +1652,7 @@ impl DurationPolicy {
     pub fn step_cap(self, n: u8) -> Self;       // default 20
     pub fn max(self, d: Duration) -> Self;      // default 7 days
     pub fn jitter(self, d: Duration) -> Self;   // default 60 seconds
+    pub fn half_life(self, d: Duration) -> Self; // default 24 hours: offender memory decay
 }
 impl Default for DurationPolicy;
 ```
@@ -1831,7 +1832,7 @@ impl Reason {
     pub const ADMIN: Reason; pub const LOGOUT: Reason; pub const LOGOUT_EVERYWHERE: Reason;
     pub const PASSWORD_CHANGED: Reason; pub const STANDING_CHANGED: Reason; pub const POLICY: Reason;
     pub const STRIKE_THRESHOLD: Reason; pub const DECOY: Reason; pub const IMPORTED: Reason;
-    pub const CONNECTION_CLOSED: Reason;
+    pub const CONNECTION_CLOSED: Reason; pub const LOCKDOWN: Reason; pub const BUDGET: Reason;
     pub const fn custom(code: u16) -> Reason;   // project codes, 1000 and above (lower values are clamped up)
     pub const fn code(self) -> u16;
 }
@@ -1985,7 +1986,6 @@ impl Budgets {
 }
 impl Default for Budgets;   // door: 20/s burst 40 and 64 concurrent per client; 200/s and 512 concurrent per prefix
 // A client is an IPv4 address or an IPv6 /64 (one host controls its /64); its prefix is the IPv4 /24 or IPv6 /48.
-// Lane and tenant budgets arrive at 0.5.
 ```
 
 Tier 2 · P1 (lanes and tenants P2) · 0.4 / 0.5 · door share 20-30 ns [est.]
@@ -2075,7 +2075,7 @@ impl Filter {
     pub fn permanent_only(self) -> Filter;
 }
 #[derive(Clone, Copy, Debug)] pub struct Page { /* after, limit */ }
-impl Page { pub fn first(limit: u16) -> Page; }   // limit capped at 1,000
+impl Page { pub fn first(limit: u16) -> Page; pub const fn limit(&self) -> u16; }   // limit 1 to 1,000
 #[non_exhaustive] #[derive(Clone, Debug)]
 pub struct Listing { pub items: Vec<BanRecord>, pub next: Option<Page>, pub total: u64 }
 ```
@@ -2175,12 +2175,14 @@ pub mod signals { pub const DOOR_REFUSED_BAN: SignalId; /* one constant per row 
 | 1 | `DOOR_REFUSED_BAN` | `bouncer.door.refused.ban` | access | 3.0 | a banned source tried to connect (sampled) |
 | 2 | `DOOR_REFUSED_BUDGET` | `bouncer.door.refused.budget` | abuse | 2.0 | over accept rate or concurrency (sampled) |
 | 3 | `DOOR_REFUSED_REGISTRY_FULL` | `bouncer.door.refused.registry_full` | abuse | 4.0 | no free ticket (sampled) |
-| 4 | `DOOR_PROXY_HOP_UNRESOLVED` | `bouncer.door.proxy_hop_unresolved` | integrity | 5.0 | a proxied connection never bound a real client |
+| 4 | `DOOR_PROXY_HOP_UNRESOLVED` | `bouncer.door.proxy_hop_unresolved` | integrity | 5.0 | a proxied request ended without binding its real client |
+| 5 | `BUDGET_REFUSED` | `bouncer.budget.refused` | abuse | 2.0 | over a lane, tenant rate, or tenant in-flight budget |
 | 10 | `REVOKE_APPLIED` | `bouncer.revoke.applied` | access | from the directive | any revocation |
 | 11 | `DENIAL_WIPE_EJECT` | `bouncer.denial.wipe_eject` | access | from the directive | a request was wiped, denied, and ejected |
 | 12 | `COMMIT_BLOCKED` | `bouncer.commit.blocked` | integrity | 6.0 | a before-commit checkpoint denied |
 | 13 | `EGRESS_BLOCKED` | `bouncer.egress.blocked` | integrity | 6.0 | a transport egress check denied |
 | 14 | `CHECKPOINT_MISSING` | `bouncer.checkpoint.missing` | integrity | 5.0 | a revoked ticket went `max_unchecked` without crossing a checkpoint (a pipeline gap) |
+| 15 | `POSTURE_CHANGED` | `bouncer.posture.changed` | policy | 4.0 | the posture changed |
 | 20 | `BAN_ADDED` | `bouncer.ban.added` | access | from the directive | ban inserted |
 | 21 | `BAN_ESCALATED` | `bouncer.ban.escalated` | access | 5.0 | prefix escalation |
 | 22 | `BAN_LIFTED` | `bouncer.ban.lifted` | policy | 1.0 | lift |
@@ -2192,8 +2194,9 @@ pub mod signals { pub const DOOR_REFUSED_BAN: SignalId; /* one constant per row 
 | 31 | `THRESHOLD_REACHED` | `bouncer.threshold.reached` | per kind | per kind | a local threshold fired (observe or enforce) |
 | 40 | `SOURCE_SHARED_SUSPECTED` | `bouncer.source.shared_suspected` | anomaly | 1.0 | an address was flagged shared |
 | 50 | `PERSIST_FAILED` | `bouncer.persist.failed` | integrity | 6.0 | write or load failure |
-| 51 | `IMPORT_REJECTED` | `bouncer.import.rejected` | integrity | 5.0 | a delta failed validation |
-| 60 | `TABLE_RESEEDED` | `bouncer.table.reseeded` | abuse | 6.0 | a probe sequence passed its bound; the table was rebuilt with a new seed |
+| 51 | `IMPORT_REJECTED` | `bouncer.import.rejected` | integrity | 5.0 | a delta or one of its records was refused |
+| 52 | `PERSIST_WALL_JUMP` | `bouncer.persist.wall_jump` | integrity | 5.0 | the wall clock moved backwards, or forwards past `max_wall_jump`, between save and load |
+| 60 | `TABLE_RESEEDED` | `bouncer.table.reseeded` | abuse | 6.0 | a probe sequence passed its bound; the table was rebuilt with a new seed (arrives at 0.6) |
 
 Ids never change meaning; a changed detection bumps the revision.
 
@@ -2285,12 +2288,12 @@ pub struct Delta { /* encoded records, at most 16 MiB */ }
 impl Delta { pub fn as_bytes(&self) -> &[u8]; pub fn from_bytes(bytes: &[u8]) -> Result<Delta, BouncerError>; pub fn last(&self) -> Sequence; }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Sequence(u64);
-impl Sequence { pub const START: Sequence; }
+impl Sequence { pub const START: Sequence; pub const fn next(self) -> Sequence; pub const fn get(self) -> u64; pub const fn from_raw(raw: u64) -> Sequence; }
 ```
 
 Tier 3 · P2 · 0.5 · the decoder is fuzzed
 
-A delta holds ban, lift, offender, escalation, and revocation records, each stamped with its origin node, origin sequence, and a hybrid logical clock stamp (wall time plus a counter). Pass `delta.last()` as `since` next time.
+A delta holds ban, lift, offender, and revocation records (an escalation travels as the parent's ban), each stamped with its origin node, origin sequence, and a hybrid logical clock stamp (Unix milliseconds in the top 48 bits, a counter in the low 16). Pass `delta.last()` as `since` next time; when `since` is older than the outbound log keeps (65,536 records), `export_delta` returns everything instead. Revocations of connection and request ids stay on their node.
 
 ### `ImportReport`
 
@@ -2308,7 +2311,9 @@ Tier 3 · P2 · 0.5
 - A lift is a tombstone stamped with its clock: it removes bans of that key stamped before it, and a ban stamped after it wins.
 - Revocation records are applied to the running requests here, then kept only as long as they can still match a live ticket.
 - Stamps more than `max_clock_skew` (default 5 minutes) in the future are refused (`ClockSkew`), so a node with a broken clock cannot pin a ban forever or lift everything.
-- Imports from `Actor::Channel` are rate limited and can never touch the allow list; a channel can lift only bans that originated on that channel's node.
+- Imports from `Actor::Channel` are rate limited (100,000 records per second) and can never touch the allow list; a channel can lift only bans that originated on that channel's node.
+- A ban is compared with a lift by its issue time, at one-second resolution; a merged ban keeps the later issue time.
+- A refused record (allow list, clock skew, foreign lift) counts in `ImportReport::rejected` and is reported; a refused delta (corrupt, too large, newer format, rate limited) is an error.
 
 The result is a last-writer-wins map per key with "latest end" for concurrent bans: any order and any repetition of delivery gives the same table on every node.
 
@@ -2381,7 +2386,7 @@ pub struct MetricsSnapshot {
     pub commits_blocked: u64, pub egress_blocked: u64,
     pub bans_active: u64, pub bans_added: u64, pub bans_expired: u64, pub bans_evicted: u64, pub bans_escalated: u64, pub bans_lifted: u64,
     pub strikes: u64, pub thresholds_observed: u64, pub thresholds_enforced: u64,
-    pub sweeps: u64, pub journal_queue: u64,
+    pub budget_refused: u64, pub sweeps: u64, pub journal_queue: u64,
 }
 ```
 
@@ -2507,7 +2512,7 @@ Tier 3 · P0 · 0.4 · on either, the denial bytes are skipped and the eject pro
 pub enum ImportError { Corrupt { offset: u64 }, TooLarge, UnsupportedFormat(u16), RateLimited, AllowListTouched, ClockSkew, ForeignLift }
 ```
 
-Tier 3 · P2 · 0.5 · every rejection is also an `import.rejected` event
+Tier 3 · P2 · 0.5 · every rejection is also an `import.rejected` event; `AllowListTouched`, `ClockSkew`, and `ForeignLift` refuse single records (counted in `ImportReport::rejected`), the others the whole delta
 
 ---
 

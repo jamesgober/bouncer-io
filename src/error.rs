@@ -96,6 +96,150 @@ pub enum BouncerError {
     InvalidCommit,
     /// A configuration value out of range.
     Config(ConfigError),
+    /// Sharing needs this node's id. Set `BouncerBuilder::node`.
+    NodeIdUnset,
+    /// Persisted state could not be loaded or written.
+    Persist(PersistError),
+    /// A delta was refused.
+    Import(ImportError),
+}
+
+/// Why persisted state could not be loaded or written.
+///
+/// # Examples
+///
+/// ```
+/// use bouncer_io::PersistError;
+/// assert!(PersistError::Mac.to_string().contains("key"));
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistError {
+    /// The store failed. Check the disk and permissions.
+    Io(std::io::ErrorKind),
+    /// A checksum failed at `offset`.
+    Corrupt {
+        /// Byte offset of the failing part.
+        offset: u64,
+    },
+    /// The snapshot ends early.
+    Truncated,
+    /// Written by a newer format version.
+    UnsupportedFormat(u16),
+    /// Bigger than the configured tables.
+    TooLarge,
+    /// The MAC does not match: tampered, or the wrong key (or a key is
+    /// missing on one side).
+    Mac,
+}
+
+impl fmt::Display for PersistError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(kind) => write!(
+                f,
+                "the persistence store failed ({kind:?}): check the disk and permissions"
+            ),
+            Self::Corrupt { offset } => write!(
+                f,
+                "persisted state is corrupt at byte {offset}: restore from another node, or start with `LoadFailure::LoadEmpty` knowingly"
+            ),
+            Self::Truncated => write!(
+                f,
+                "the snapshot ends early: restore it, or start with `LoadFailure::LoadEmpty` knowingly"
+            ),
+            Self::UnsupportedFormat(v) => write!(
+                f,
+                "persisted state uses format {v}, newer than this version: upgrade"
+            ),
+            Self::TooLarge => write!(
+                f,
+                "persisted state is larger than the configured tables: raise `ban_capacity`"
+            ),
+            Self::Mac => write!(
+                f,
+                "the snapshot or journal MAC does not match: treat it as tampering and check the `mac_key`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PersistError {}
+
+impl From<PersistError> for BouncerError {
+    fn from(err: PersistError) -> Self {
+        Self::Persist(err)
+    }
+}
+
+/// Why a delta was refused.
+///
+/// # Examples
+///
+/// ```
+/// use bouncer_io::{BouncerError, Delta, ImportError};
+/// assert!(matches!(
+///     Delta::from_bytes(b"not a delta"),
+///     Err(BouncerError::Import(ImportError::Corrupt { .. }))
+/// ));
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportError {
+    /// A checksum or structure check failed at `offset`.
+    Corrupt {
+        /// Byte offset of the failing part.
+        offset: u64,
+    },
+    /// Larger than 16 MiB.
+    TooLarge,
+    /// Written by a newer format version.
+    UnsupportedFormat(u16),
+    /// Too many records from this channel this second; deliver later.
+    RateLimited,
+    /// A record would act on an allow-listed key or a trusted proxy.
+    AllowListTouched,
+    /// A record is stamped further in the future than `max_clock_skew`.
+    ClockSkew,
+    /// A channel tried to lift a ban that another node issued.
+    ForeignLift,
+}
+
+impl fmt::Display for ImportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Corrupt { offset } => write!(
+                f,
+                "the delta is corrupt at byte {offset}: ask the sender again"
+            ),
+            Self::TooLarge => write!(f, "the delta is larger than 16 MiB: export smaller deltas"),
+            Self::UnsupportedFormat(v) => write!(
+                f,
+                "the delta uses format {v}, newer than this version: upgrade"
+            ),
+            Self::RateLimited => write!(
+                f,
+                "too many records from this channel: deliver the delta later"
+            ),
+            Self::AllowListTouched => write!(
+                f,
+                "a record would act on an allow-listed key or a trusted proxy"
+            ),
+            Self::ClockSkew => write!(
+                f,
+                "a record is stamped too far in the future: check the sender's clock"
+            ),
+            Self::ForeignLift => write!(f, "a channel may lift only bans its own node issued"),
+        }
+    }
+}
+
+impl std::error::Error for ImportError {}
+
+impl From<ImportError> for BouncerError {
+    fn from(err: ImportError) -> Self {
+        Self::Import(err)
+    }
 }
 
 impl fmt::Display for BouncerError {
@@ -174,6 +318,12 @@ impl fmt::Display for BouncerError {
                 "could not start the maintainer thread ({kind:?}): call `maintain` yourself"
             ),
             Self::Config(err) => write!(f, "{err}"),
+            Self::NodeIdUnset => write!(
+                f,
+                "sharing needs this node's id: set `BouncerBuilder::node`"
+            ),
+            Self::Persist(err) => write!(f, "{err}"),
+            Self::Import(err) => write!(f, "{err}"),
         }
     }
 }
