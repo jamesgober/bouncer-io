@@ -178,6 +178,10 @@ impl Reason {
     pub const IMPORTED: Reason = Reason(9);
     /// The connection closed while the request was live.
     pub const CONNECTION_CLOSED: Reason = Reason(10);
+    /// The strict posture (a lockdown).
+    pub const LOCKDOWN: Reason = Reason(11);
+    /// Over a budget.
+    pub const BUDGET: Reason = Reason(12);
 
     /// A project's own code; values below 1000 are raised to 1000.
     #[must_use]
@@ -193,6 +197,28 @@ impl Reason {
 
     pub(crate) const fn from_code(code: u16) -> Reason {
         Reason(code)
+    }
+}
+
+impl fmt::Display for Reason {
+    /// The catalog name, or `custom(code)`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self.0 {
+            1 => "admin",
+            2 => "logout",
+            3 => "logout_everywhere",
+            4 => "password_changed",
+            5 => "standing_changed",
+            6 => "policy",
+            7 => "strike_threshold",
+            8 => "decoy",
+            9 => "imported",
+            10 => "connection_closed",
+            11 => "lockdown",
+            12 => "budget",
+            code => return write!(f, "custom({code})"),
+        };
+        f.write_str(name)
     }
 }
 

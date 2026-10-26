@@ -1,24 +1,30 @@
 //! Budgets: "is this source over its allowance", one input to the door. Not
 //! the purpose of the crate.
 //!
-//! The rate math is rate-net's GCRA (without default features, so it brings
-//! no third-party crate); the keyed storage is bouncer's own bounded table.
+//! The rate math is rate-net's GCRA and better-bucket's token bucket (both
+//! without default features, so neither brings a third-party crate); the
+//! keyed storage is bouncer's own bounded table.
 //! Eviction never resets a limit: a cell is taken over only once it has
 //! fully recovered and holds no connections.
 
 use core::time::Duration;
 use std::net::IpAddr;
 
+use better_bucket::{BucketConfig, BucketCore};
 use rate_net::{Decision, Gcra, Quota};
 
 use crate::{
     claims::Claims,
     error::{BouncerError, ConfigError, ConfigProblem},
     hash::HashKey,
-    keys::{Cidr, Family},
+    keys::{Cidr, Family, TenantKey},
     sync::{AtomicU32, AtomicU64, Ordering},
+    ticket::LaneClass,
     time::Now,
 };
+
+/// Most tenant plans one bouncer holds.
+const MAX_PLANS: usize = 65_536;
 
 /// A rate: `limit` events per `period`, with a burst.
 ///
@@ -108,24 +114,50 @@ impl Rate {
             .map(|q| q.with_burst(self.burst))
             .map_err(|_| ConfigError::new(field, ConfigProblem::InvalidDuration))
     }
+
+    /// The token-bucket form: capacity = burst, refilled `limit` per period.
+    fn bucket(&self, field: &'static str) -> Result<BucketConfig, ConfigError> {
+        BucketConfig::new(self.burst, self.limit, self.period, self.burst)
+            .map_err(|_| ConfigError::new(field, ConfigProblem::TooSmall { min: 1 }))
+    }
 }
 
-/// Budget configuration.
+/// Budget configuration: door, lane, and tenant budgets.
+///
+/// | Budget | Key | Checked at |
+/// |---|---|---|
+/// | accept rate | client, then prefix | door |
+/// | concurrency | client, then prefix | door; returned on release |
+/// | lane rate | session, else client, per lane | [`Ticket::bind_lane`](crate::Ticket::bind_lane) |
+/// | tenant rate (token bucket, per-tenant plans) | tenant | [`Ticket::bind_tenant`](crate::Ticket::bind_tenant) |
+/// | tenant in-flight | tenant | `bind_tenant`; returned on release |
 ///
 /// # Examples
 ///
 /// ```
-/// use bouncer_io::{Bouncer, Budgets, Rate};
+/// use bouncer_io::{Bouncer, Budgets, LaneClass, Rate, TenantKey};
 /// let bouncer = Bouncer::builder()
-///     .budgets(Budgets::default().door_rate(Rate::per_second(50).burst(100), Rate::per_second(500)).door_concurrency(32, 256))
+///     .budgets(
+///         Budgets::default()
+///             .door_rate(Rate::per_second(50).burst(100), Rate::per_second(500))
+///             .door_concurrency(32, 256)
+///             .lane_rate(LaneClass::Auth, Rate::per_minute(10))
+///             .tenant_rate(Rate::per_second(200))
+///             .tenant_plan(TenantKey(7), Rate::per_second(2_000).burst(4_000))
+///             .tenant_in_flight(64),
+///     )
 ///     .try_build()?;
 /// # let _ = bouncer;
 /// # Ok::<(), bouncer_io::BouncerError>(())
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Budgets {
     door_rate: Option<(Rate, Rate)>,
     door_concurrency: Option<(u32, u32)>,
+    lanes: [Option<Rate>; LaneClass::COUNT],
+    tenant_rate: Option<Rate>,
+    tenant_plans: Vec<(TenantKey, Rate)>,
+    tenant_in_flight: Option<u32>,
     capacity: u32,
 }
 
@@ -137,6 +169,10 @@ impl Default for Budgets {
         Budgets {
             door_rate: Some((Rate::per_second(20).burst(40), Rate::per_second(200))),
             door_concurrency: Some((64, 512)),
+            lanes: [None; LaneClass::COUNT],
+            tenant_rate: None,
+            tenant_plans: Vec::new(),
+            tenant_in_flight: None,
             capacity: 65_536,
         }
     }
@@ -149,6 +185,10 @@ impl Budgets {
         Budgets {
             door_rate: None,
             door_concurrency: None,
+            lanes: [None; LaneClass::COUNT],
+            tenant_rate: None,
+            tenant_plans: Vec::new(),
+            tenant_in_flight: None,
             capacity: 16,
         }
     }
@@ -167,11 +207,48 @@ impl Budgets {
         self
     }
 
+    /// The rate of one lane, per session (or per client when no session is
+    /// bound), charged at [`Ticket::bind_lane`](crate::Ticket::bind_lane).
+    #[must_use]
+    pub fn lane_rate(mut self, lane: LaneClass, per_key: Rate) -> Budgets {
+        self.lanes[lane.index()] = Some(per_key);
+        self
+    }
+
+    /// The default rate per tenant (a token bucket), charged at
+    /// [`Ticket::bind_tenant`](crate::Ticket::bind_tenant).
+    #[must_use]
+    pub fn tenant_rate(mut self, default: Rate) -> Budgets {
+        self.tenant_rate = Some(default);
+        self
+    }
+
+    /// A tenant's own rate (its plan), replacing the default for that
+    /// tenant. A later plan for the same tenant replaces an earlier one.
+    #[must_use]
+    pub fn tenant_plan(mut self, tenant: TenantKey, rate: Rate) -> Budgets {
+        self.tenant_plans.retain(|(t, _)| *t != tenant);
+        self.tenant_plans.push((tenant, rate));
+        self
+    }
+
+    /// Requests in flight per tenant, taken at `bind_tenant` and returned
+    /// when the ticket is released.
+    #[must_use]
+    pub fn tenant_in_flight(mut self, default: u32) -> Budgets {
+        self.tenant_in_flight = Some(default);
+        self
+    }
+
     /// Keys the budget tables hold at most (default 65,536).
     #[must_use]
     pub fn capacity(mut self, keys: u32) -> Budgets {
         self.capacity = keys;
         self
+    }
+
+    pub(crate) fn capacity_keys(&self) -> u32 {
+        self.capacity.max(1024)
     }
 
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
@@ -192,6 +269,29 @@ impl Budgets {
                     ConfigProblem::TooSmall { min: 1 },
                 ));
             }
+        }
+        for lane in self.lanes.iter().flatten() {
+            lane.quota("budgets")?;
+        }
+        if let Some(r) = &self.tenant_rate {
+            r.bucket("budgets")?;
+        }
+        if self.tenant_plans.len() > MAX_PLANS {
+            return Err(ConfigError::new(
+                "budgets",
+                ConfigProblem::TooLarge {
+                    max: MAX_PLANS as u64,
+                },
+            ));
+        }
+        for (_, r) in &self.tenant_plans {
+            r.bucket("budgets")?;
+        }
+        if self.tenant_in_flight == Some(0) {
+            return Err(ConfigError::new(
+                "budgets",
+                ConfigProblem::TooSmall { min: 1 },
+            ));
         }
         Ok(())
     }
@@ -216,6 +316,50 @@ struct Throttles {
     claims: Claims,
     /// factor (8) | until secs (32)
     cells: Box<[AtomicU64]>,
+}
+
+impl Throttles {
+    fn new(capacity: u32) -> Throttles {
+        let claims = Claims::new(capacity);
+        let cells = (0..claims.len()).map(|_| AtomicU64::new(0)).collect();
+        Throttles { claims, cells }
+    }
+
+    fn bytes(&self) -> u64 {
+        self.claims.bytes() + (self.cells.len() * 8) as u64
+    }
+
+    /// The factor in force for a key now (1 when none).
+    fn factor(&self, key: u64, now_secs: u64) -> u32 {
+        match self.claims.find(key) {
+            Some(slot) => {
+                let v = self.cells[slot].load(Ordering::Acquire);
+                if (v & 0xffff_ffff) > now_secs {
+                    (v >> 32) as u32 & 0xff
+                } else {
+                    1
+                }
+            }
+            None => 1,
+        }
+        .max(1)
+    }
+
+    /// Sets a factor until `until_secs`. `false` when the table is full of
+    /// throttles still in force.
+    fn set(&self, key: u64, factor: u8, until_secs: u64, now_secs: u64) -> bool {
+        let cells = &self.cells;
+        let now_idle = |slot: usize| cells[slot].load(Ordering::Acquire) & 0xffff_ffff <= now_secs;
+        let Some((slot, _)) = self
+            .claims
+            .find_or_claim(key, now_idle, |s| cells[s].store(0, Ordering::Release))
+        else {
+            return false;
+        };
+        let until = until_secs.min(u64::from(u32::MAX));
+        cells[slot].store((u64::from(factor.max(1)) << 32) | until, Ordering::Release);
+        true
+    }
 }
 
 /// The door budgets of one bouncer.
@@ -263,13 +407,11 @@ impl DoorBudgets {
                 };
                 [tier(a), tier(p)]
             });
-        let claims = Claims::new(cap.min(16_384));
-        let cells = (0..claims.len()).map(|_| AtomicU64::new(0)).collect();
         DoorBudgets {
             key,
             rate,
             concurrency,
-            throttles: Throttles { claims, cells },
+            throttles: Throttles::new(cap.min(16_384)),
         }
     }
 
@@ -284,7 +426,7 @@ impl DoorBudgets {
                 .map(|c| c.claims.bytes() + (c.counts.len() * 4) as u64)
                 .sum()
         });
-        rate + conc + self.throttles.claims.bytes() + (self.throttles.cells.len() * 8) as u64
+        rate + conc + self.throttles.bytes()
     }
 
     pub(crate) fn capacity(&self) -> u32 {
@@ -316,18 +458,15 @@ impl DoorBudgets {
 
     /// The throttle factor in force for a key now (1 when none).
     fn factor(&self, key: u64, now_secs: u64) -> u32 {
-        match self.throttles.claims.find(key) {
-            Some(slot) => {
-                let v = self.throttles.cells[slot].load(Ordering::Acquire);
-                if (v & 0xffff_ffff) > now_secs {
-                    (v >> 32) as u32 & 0xff
-                } else {
-                    1
-                }
-            }
-            None => 1,
-        }
-        .max(1)
+        self.throttles.factor(key, now_secs)
+    }
+
+    /// The throttle factor in force on an address: the larger of its client
+    /// and prefix throttles.
+    pub(crate) fn source_factor(&self, addr: IpAddr, now_secs: u64) -> u32 {
+        let [client, prefix] = self.keys(addr);
+        self.factor(client, now_secs)
+            .max(self.factor(prefix, now_secs))
     }
 
     /// Sets a throttle on the client or prefix key of `cidr`.
@@ -337,31 +476,22 @@ impl DoorBudgets {
             self.key
                 .hash3(meta, (cidr.bits() >> 64) as u64, cidr.bits() as u64),
         );
-        let cells = &self.throttles.cells;
-        let now_idle = |slot: usize| cells[slot].load(Ordering::Acquire) & 0xffff_ffff <= now_secs;
-        let Some((slot, _)) = self
-            .throttles
-            .claims
-            .find_or_claim(key, now_idle, |s| cells[s].store(0, Ordering::Release))
-        else {
-            return false;
-        };
-        let until = until_secs.min(u64::from(u32::MAX));
-        cells[slot].store((u64::from(factor.max(1)) << 32) | until, Ordering::Release);
-        true
+        self.throttles.set(key, factor, until_secs, now_secs)
     }
 
     /// The door's budget step for an admitted address: rate, then
     /// concurrency. On success the connection holds one concurrency slot per
     /// tier until [`release_connection`](Self::release_connection).
+    /// `divisor` is 1, or the strict posture's divisor: each admission costs
+    /// that many tokens and the concurrency limits shrink by it.
     #[inline]
-    pub(crate) fn admit(&self, addr: IpAddr, now: Now) -> Result<(), OverBudget> {
+    pub(crate) fn admit(&self, addr: IpAddr, now: Now, divisor: u32) -> Result<(), OverBudget> {
         let keys = self.keys(addr);
         let now_d = Duration::from_nanos(now.as_nanos());
         let now_secs = now.secs();
         if let Some(tiers) = &self.rate {
             for (tier, &key) in tiers.iter().zip(keys.iter()) {
-                let n = self.factor(key, now_secs);
+                let n = self.factor(key, now_secs).saturating_mul(divisor);
                 let cells = &tier.cells;
                 let burst = tier.burst;
                 let idle = |slot: usize| cells[slot].peek_at(now_d).remaining() >= burst;
@@ -382,7 +512,7 @@ impl DoorBudgets {
                 let idle = |slot: usize| counts[slot].load(Ordering::Acquire) == 0;
                 if let Some((slot, _)) = tier.claims.find_or_claim(key, idle, |_| {}) {
                     let before = counts[slot].fetch_add(1, Ordering::AcqRel);
-                    if before >= tier.limit {
+                    if before >= (tier.limit / divisor.max(1)).max(1) {
                         counts[slot].fetch_sub(1, Ordering::AcqRel);
                         for (j, s) in taken.iter().enumerate().take(i) {
                             if let Some(s) = s {
@@ -392,6 +522,37 @@ impl DoorBudgets {
                         return Err(OverBudget(Duration::ZERO));
                     }
                     taken[i] = Some(slot);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The datagram budget step: the rate tiers only (no concurrency). An
+    /// unverified source is charged at its prefix only, so a forged address
+    /// cannot spend a real client's budget.
+    pub(crate) fn datagram(
+        &self,
+        addr: IpAddr,
+        verified: bool,
+        now: Now,
+        divisor: u32,
+    ) -> Result<(), OverBudget> {
+        let Some(tiers) = &self.rate else {
+            return Ok(());
+        };
+        let keys = self.keys(addr);
+        let now_d = Duration::from_nanos(now.as_nanos());
+        let now_secs = now.secs();
+        let first = usize::from(!verified);
+        for (tier, &key) in tiers.iter().zip(keys.iter()).skip(first) {
+            let n = self.factor(key, now_secs).saturating_mul(divisor);
+            let cells = &tier.cells;
+            let burst = tier.burst;
+            let idle = |slot: usize| cells[slot].peek_at(now_d).remaining() >= burst;
+            if let Some((slot, _)) = tier.claims.find_or_claim(key, idle, |s| cells[s].reset()) {
+                if let Decision::Deny { retry_after } = cells[slot].check_n_at(n, now_d) {
+                    return Err(OverBudget(retry_after));
                 }
             }
         }
@@ -418,6 +579,79 @@ impl DoorBudgets {
         }
     }
 
+    /// The fullest table's load, 0 to 1.
+    pub(crate) fn load(&self) -> f32 {
+        let rate = self.rate.iter().flatten().map(|t| t.claims.load());
+        let conc = self.concurrency.iter().flatten().map(|t| t.claims.load());
+        rate.chain(conc).fold(0.0, f32::max)
+    }
+
+    /// The door budget states of an address, for `explain`.
+    pub(crate) fn state(&self, addr: IpAddr, now: Now) -> Vec<crate::admin::BudgetState> {
+        use crate::{admin::BudgetState, keys::BanKey};
+        let host = Cidr::host(addr);
+        let (client, prefix) = match host.family() {
+            Family::V4 => (32, 24),
+            Family::V6 => (64, 48),
+        };
+        let as_key = |len: u8| {
+            let c = host.parent(len).unwrap_or(host);
+            if c.len() == c.family().max_len() {
+                BanKey::Address(c.network())
+            } else {
+                BanKey::Prefix(c)
+            }
+        };
+        let names = [
+            (
+                "door.rate.client",
+                "door.concurrency.client",
+                as_key(client),
+            ),
+            (
+                "door.rate.prefix",
+                "door.concurrency.prefix",
+                as_key(prefix),
+            ),
+        ];
+        let keys = self.keys(addr);
+        let now_d = Duration::from_nanos(now.as_nanos());
+        let mut out = Vec::new();
+        if let Some(tiers) = &self.rate {
+            for ((tier, key), (rate, _, bk)) in tiers.iter().zip(keys).zip(names) {
+                let (remaining, retry) = match tier.claims.find(key) {
+                    Some(slot) => {
+                        let s = tier.cells[slot].peek_at(now_d);
+                        let r = s.remaining();
+                        (r, (r == 0).then(|| s.reset_after()))
+                    }
+                    None => (tier.burst, None),
+                };
+                out.push(BudgetState {
+                    class: rate,
+                    key: bk,
+                    remaining,
+                    retry_after: retry,
+                });
+            }
+        }
+        if let Some(tiers) = &self.concurrency {
+            for ((tier, key), (_, conc, bk)) in tiers.iter().zip(keys).zip(names) {
+                let used = tier
+                    .claims
+                    .find(key)
+                    .map_or(0, |s| tier.counts[s].load(Ordering::Acquire));
+                out.push(BudgetState {
+                    class: conc,
+                    key: bk,
+                    remaining: tier.limit.saturating_sub(used),
+                    retry_after: None,
+                });
+            }
+        }
+        out
+    }
+
     /// Live connections counted for an address (tests and `explain`).
     #[cfg(all(test, not(bouncer_loom)))]
     pub(crate) fn concurrent(&self, addr: IpAddr) -> u32 {
@@ -429,6 +663,304 @@ impl DoorBudgets {
             .claims
             .find(key)
             .map_or(0, |s| tiers[0].counts[s].load(Ordering::Acquire))
+    }
+}
+
+/// Who a lane or throttle key belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityKind {
+    Session = 1,
+    Account = 2,
+    Tenant = 3,
+    Fingerprint = 4,
+    /// A client address: IPv4 /32 or IPv6 /64.
+    Client = 5,
+}
+
+/// One identity key: its kind and two words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IdentityKey {
+    pub(crate) kind: IdentityKind,
+    pub(crate) k0: u64,
+    pub(crate) k1: u64,
+}
+
+impl IdentityKey {
+    /// The client key of an address (IPv4 /32, IPv6 /64).
+    pub(crate) fn client(addr: IpAddr) -> IdentityKey {
+        let host = Cidr::host(addr);
+        let c = match host.family() {
+            Family::V4 => host,
+            Family::V6 => host.parent(64).unwrap_or(host),
+        };
+        IdentityKey {
+            kind: IdentityKind::Client,
+            k0: (c.bits() >> 64) as u64 | (u64::from(c.family() == Family::V6) << 63),
+            k1: c.bits() as u64,
+        }
+    }
+}
+
+/// The tenant token buckets: planned tenants in their own sorted table,
+/// every other tenant in the keyed table under the default rate.
+struct TenantTier {
+    claims: Claims,
+    cells: Box<[BucketCore]>,
+    capacity: u32,
+    /// (tenant, bucket), sorted by tenant.
+    plans: Box<[(u64, BucketCore)]>,
+}
+
+/// Lane, tenant, and identity-throttle budgets, checked at `bind_lane` and
+/// `bind_tenant`. Charged once per call; a refusal is a `TooManyRequests`
+/// denial of that ticket.
+pub(crate) struct IdentityBudgets {
+    key: HashKey,
+    lanes: [Option<RateTier>; LaneClass::COUNT],
+    tenant: Option<TenantTier>,
+    in_flight: Option<ConcurrencyTier>,
+    throttles: Throttles,
+}
+
+impl IdentityBudgets {
+    /// Allocates the configured tables. `cfg` was validated.
+    pub(crate) fn new(cfg: &Budgets, key: HashKey, now: Now) -> IdentityBudgets {
+        let cap = cfg.capacity.clamp(1, 1 << 24);
+        let now_d = Duration::from_nanos(now.as_nanos());
+        let lanes = core::array::from_fn(|i| {
+            let r = cfg.lanes[i]?;
+            let q = r.quota("budgets").ok()?;
+            let claims = Claims::new(cap);
+            let cells = (0..claims.len()).map(|_| Gcra::new(q)).collect();
+            Some(RateTier {
+                claims,
+                cells,
+                burst: r.burst,
+            })
+        });
+        let plans = || -> Box<[(u64, BucketCore)]> {
+            let mut v: Vec<(u64, BucketCore)> = cfg
+                .tenant_plans
+                .iter()
+                .filter_map(|(t, r)| Some((t.0, BucketCore::new(r.bucket("budgets").ok()?, now_d))))
+                .collect();
+            v.sort_unstable_by_key(|(t, _)| *t);
+            v.into_boxed_slice()
+        };
+        let tenant = match cfg.tenant_rate.and_then(|r| r.bucket("budgets").ok()) {
+            Some(b) => {
+                let claims = Claims::new(cap);
+                let cells = (0..claims.len())
+                    .map(|_| BucketCore::new(b, now_d))
+                    .collect();
+                Some(TenantTier {
+                    claims,
+                    cells,
+                    capacity: b.capacity(),
+                    plans: plans(),
+                })
+            }
+            None if !cfg.tenant_plans.is_empty() => Some(TenantTier {
+                claims: Claims::new(1),
+                cells: Box::new([]),
+                capacity: 0,
+                plans: plans(),
+            }),
+            None => None,
+        };
+        let in_flight = cfg.tenant_in_flight.filter(|&n| n > 0).map(|limit| {
+            let claims = Claims::new(cap);
+            let counts = (0..claims.len()).map(|_| AtomicU32::new(0)).collect();
+            ConcurrencyTier {
+                claims,
+                counts,
+                limit,
+            }
+        });
+        IdentityBudgets {
+            key,
+            lanes,
+            tenant,
+            in_flight,
+            throttles: Throttles::new(cap.min(16_384)),
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        let lanes: u64 = self
+            .lanes
+            .iter()
+            .flatten()
+            .map(|r| r.claims.bytes() + (r.cells.len() * core::mem::size_of::<Gcra>()) as u64)
+            .sum();
+        let tenant = self.tenant.as_ref().map_or(0, |t| {
+            t.claims.bytes()
+                + ((t.cells.len() + t.plans.len()) * core::mem::size_of::<BucketCore>()) as u64
+        });
+        let flight = self
+            .in_flight
+            .as_ref()
+            .map_or(0, |c| c.claims.bytes() + (c.counts.len() * 4) as u64);
+        lanes + tenant + flight + self.throttles.bytes()
+    }
+
+    /// Whether any lane budget is configured.
+    pub(crate) fn has_lanes(&self) -> bool {
+        self.lanes.iter().any(Option::is_some)
+    }
+
+    /// Whether `bind_tenant` charges anything.
+    pub(crate) fn has_tenant(&self) -> bool {
+        self.tenant.is_some() || self.in_flight.is_some()
+    }
+
+    fn hashed(&self, tag: u64, id: IdentityKey) -> u64 {
+        Claims::key(self.key.hash3((tag << 8) | id.kind as u64, id.k0, id.k1))
+    }
+
+    /// The identity throttle factor in force on a key now (1 when none).
+    pub(crate) fn factor(&self, id: IdentityKey, now_secs: u64) -> u32 {
+        self.throttles.factor(self.hashed(0, id), now_secs)
+    }
+
+    /// Throttles an identity key. `false` when the table is full of
+    /// throttles still in force.
+    pub(crate) fn throttle(
+        &self,
+        id: IdentityKey,
+        factor: u8,
+        until_secs: u64,
+        now_secs: u64,
+    ) -> bool {
+        self.throttles
+            .set(self.hashed(0, id), factor, until_secs, now_secs)
+    }
+
+    /// Charges one request to a lane under `who`, `factor` tokens at once.
+    pub(crate) fn lane(
+        &self,
+        lane: LaneClass,
+        who: IdentityKey,
+        factor: u32,
+        now: Now,
+    ) -> Result<(), OverBudget> {
+        let Some(tier) = &self.lanes[lane.index()] else {
+            return Ok(());
+        };
+        let key = self.hashed(1 + lane.index() as u64, who);
+        let now_d = Duration::from_nanos(now.as_nanos());
+        let cells = &tier.cells;
+        let burst = tier.burst;
+        let idle = |slot: usize| cells[slot].peek_at(now_d).remaining() >= burst;
+        // A full table leaves the request unmetered by its lane; the door
+        // budgets still hold. Nothing that has not recovered is ever reset.
+        if let Some((slot, _)) = tier.claims.find_or_claim(key, idle, |s| cells[s].reset()) {
+            if let Decision::Deny { retry_after } = cells[slot].check_n_at(factor.max(1), now_d) {
+                return Err(OverBudget(retry_after));
+            }
+        }
+        Ok(())
+    }
+
+    /// Charges one request to a tenant: rate, then in flight. Returns
+    /// whether an in-flight slot was taken (to return with
+    /// [`release_tenant`](Self::release_tenant)).
+    pub(crate) fn tenant(&self, tenant: u64, factor: u32, now: Now) -> Result<bool, OverBudget> {
+        let now_d = Duration::from_nanos(now.as_nanos());
+        let n = factor.max(1);
+        if let Some(t) = &self.tenant {
+            let bucket = match t.plans.binary_search_by_key(&tenant, |(k, _)| *k) {
+                Ok(i) => Some(&t.plans[i].1),
+                Err(_) if t.cells.is_empty() => None,
+                Err(_) => {
+                    let key = self.hashed(
+                        0x40,
+                        IdentityKey {
+                            kind: IdentityKind::Tenant,
+                            k0: 0,
+                            k1: tenant,
+                        },
+                    );
+                    let cells = &t.cells;
+                    let full = t.capacity;
+                    let idle = |slot: usize| cells[slot].available_at(now_d) >= full;
+                    t.claims
+                        .find_or_claim(key, idle, |s| cells[s].reset_at(now_d))
+                        .map(|(slot, _)| &cells[slot])
+                }
+            };
+            if let Some(b) = bucket {
+                if let better_bucket::Decision::Denied { retry_after } = b.acquire_at(n, now_d) {
+                    return Err(OverBudget(retry_after));
+                }
+            }
+        }
+        let Some(c) = &self.in_flight else {
+            return Ok(false);
+        };
+        let key = self.flight_key(tenant);
+        let counts = &c.counts;
+        let idle = |slot: usize| counts[slot].load(Ordering::Acquire) == 0;
+        let Some((slot, _)) = c.claims.find_or_claim(key, idle, |_| {}) else {
+            return Ok(false);
+        };
+        let before = counts[slot].fetch_add(1, Ordering::AcqRel);
+        if before >= c.limit {
+            counts[slot].fetch_sub(1, Ordering::AcqRel);
+            return Err(OverBudget(Duration::ZERO));
+        }
+        Ok(true)
+    }
+
+    fn flight_key(&self, tenant: u64) -> u64 {
+        self.hashed(
+            0x41,
+            IdentityKey {
+                kind: IdentityKind::Tenant,
+                k0: 0,
+                k1: tenant,
+            },
+        )
+    }
+
+    /// Returns a tenant's in-flight slot.
+    pub(crate) fn release_tenant(&self, tenant: u64) {
+        let Some(c) = &self.in_flight else {
+            return;
+        };
+        if let Some(slot) = c.claims.find(self.flight_key(tenant)) {
+            let count = &c.counts[slot];
+            let mut v = count.load(Ordering::Acquire);
+            while v > 0 {
+                match count.compare_exchange_weak(v, v - 1, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => break,
+                    Err(actual) => v = actual,
+                }
+            }
+        }
+    }
+
+    /// The fullest table's load, 0 to 1.
+    pub(crate) fn load(&self) -> f32 {
+        let lanes = self.lanes.iter().flatten().map(|t| t.claims.load());
+        let tenant = self.tenant.iter().map(|t| t.claims.load());
+        let flight = self.in_flight.iter().map(|c| c.claims.load());
+        lanes.chain(tenant).chain(flight).fold(0.0, f32::max)
+    }
+
+    /// The tenant in-flight limit, when configured.
+    pub(crate) fn tenant_limit(&self) -> Option<u32> {
+        self.in_flight.as_ref().map(|c| c.limit)
+    }
+
+    /// Requests in flight counted for a tenant (`explain`, tests).
+    pub(crate) fn tenant_in_flight(&self, tenant: u64) -> u32 {
+        let Some(c) = &self.in_flight else {
+            return 0;
+        };
+        c.claims
+            .find(self.flight_key(tenant))
+            .map_or(0, |s| c.counts[s].load(Ordering::Acquire))
     }
 }
 
@@ -452,15 +984,17 @@ mod tests {
         );
         let t0 = Now::from_nanos(1_000_000_000);
         for _ in 0..3 {
-            assert!(b.admit(ip("192.0.2.1"), t0).is_ok());
+            assert!(b.admit(ip("192.0.2.1"), t0, 1).is_ok());
         }
-        assert!(matches!(b.admit(ip("192.0.2.1"), t0), Err(OverBudget(d)) if d > Duration::ZERO));
         assert!(
-            b.admit(ip("192.0.2.2"), t0).is_ok(),
+            matches!(b.admit(ip("192.0.2.1"), t0, 1), Err(OverBudget(d)) if d > Duration::ZERO)
+        );
+        assert!(
+            b.admit(ip("192.0.2.2"), t0, 1).is_ok(),
             "another address has its own budget"
         );
         assert!(
-            b.admit(ip("192.0.2.1"), Now::from_nanos(2_000_000_000))
+            b.admit(ip("192.0.2.1"), Now::from_nanos(2_000_000_000), 1)
                 .is_ok()
         );
     }
@@ -471,12 +1005,12 @@ mod tests {
             budgets(Budgets::off().door_rate(Rate::per_second(100), Rate::per_second(5).burst(5)));
         let now = Now::from_nanos(1_000_000_000);
         let ok = (0..20u8)
-            .filter(|i| b.admit(IpAddr::from([198, 51, 100, *i]), now).is_ok())
+            .filter(|i| b.admit(IpAddr::from([198, 51, 100, *i]), now, 1).is_ok())
             .count();
         assert_eq!(ok, 5, "rotating inside one /24 shares the prefix budget");
         let ok6 = (0..20u16)
             .filter(|i| {
-                b.admit(IpAddr::from([0x2001, 0xdb8, 1, *i, 0, 0, 0, 1]), now)
+                b.admit(IpAddr::from([0x2001, 0xdb8, 1, *i, 0, 0, 0, 1]), now, 1)
                     .is_ok()
             })
             .count();
@@ -491,21 +1025,21 @@ mod tests {
         let b =
             budgets(Budgets::off().door_rate(Rate::per_second(2).burst(2), Rate::per_second(1000)));
         let now = Now::from_nanos(1_000_000_000);
-        assert!(b.admit(ip("2001:db8::1"), now).is_ok());
-        assert!(b.admit(ip("2001:db8::ffff"), now).is_ok());
-        assert!(b.admit(ip("2001:db8::abcd"), now).is_err(), "same /64");
+        assert!(b.admit(ip("2001:db8::1"), now, 1).is_ok());
+        assert!(b.admit(ip("2001:db8::ffff"), now, 1).is_ok());
+        assert!(b.admit(ip("2001:db8::abcd"), now, 1).is_err(), "same /64");
     }
 
     #[test]
     fn test_concurrency_limit_and_release() {
         let b = budgets(Budgets::off().door_concurrency(2, 100));
         let now = Now::default();
-        assert!(b.admit(ip("192.0.2.1"), now).is_ok());
-        assert!(b.admit(ip("192.0.2.1"), now).is_ok());
-        assert!(b.admit(ip("192.0.2.1"), now).is_err());
+        assert!(b.admit(ip("192.0.2.1"), now, 1).is_ok());
+        assert!(b.admit(ip("192.0.2.1"), now, 1).is_ok());
+        assert!(b.admit(ip("192.0.2.1"), now, 1).is_err());
         assert_eq!(b.concurrent(ip("192.0.2.1")), 2);
         b.release_connection(Some(ip("192.0.2.1")), now);
-        assert!(b.admit(ip("192.0.2.1"), now).is_ok());
+        assert!(b.admit(ip("192.0.2.1"), now, 1).is_ok());
         // Releases never go below zero.
         for _ in 0..5 {
             b.release_connection(Some(ip("192.0.2.1")), now);
@@ -517,8 +1051,8 @@ mod tests {
     fn test_prefix_concurrency_refusal_returns_address_slot() {
         let b = budgets(Budgets::off().door_concurrency(10, 1));
         let now = Now::default();
-        assert!(b.admit(ip("192.0.2.1"), now).is_ok());
-        assert!(b.admit(ip("192.0.2.2"), now).is_err());
+        assert!(b.admit(ip("192.0.2.1"), now, 1).is_ok());
+        assert!(b.admit(ip("192.0.2.2"), now, 1).is_err());
         assert_eq!(
             b.concurrent(ip("192.0.2.2")),
             0,
@@ -533,7 +1067,7 @@ mod tests {
         let now = Now::from_nanos(1_000_000_000);
         assert!(b.throttle(&Cidr::host(ip("192.0.2.7")), 4, 100, 1));
         let ok = (0..8)
-            .filter(|_| b.admit(ip("192.0.2.7"), now).is_ok())
+            .filter(|_| b.admit(ip("192.0.2.7"), now, 1).is_ok())
             .count();
         assert_eq!(ok, 2, "factor 4 leaves a quarter");
     }

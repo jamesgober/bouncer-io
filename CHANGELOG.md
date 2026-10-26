@@ -13,6 +13,65 @@
 
 ---
 
+## [0.5.0] - 2026-10-23
+
+Feature complete: persistence, sharing across nodes, escalation, offender
+memory, shared addresses, lane and tenant budgets, posture, administration.
+
+### Added
+
+- Persistence: `Persistence`, `FilePersistence`, `LoadFailure`,
+  `PersistError`, `SNAPSHOT_MAGIC`, `SNAPSHOT_FORMAT`; builder `persistence`,
+  `mac_key`, `on_load_failure`, `max_wall_jump`, `strict_wall_jump`;
+  `Bouncer::flush`. Bans, lift tombstones, and offender memory survive a
+  restart, loaded before the first door check. A snapshot plus a journal,
+  CRC32C on every record, an optional keyed BLAKE3 MAC chained across journal
+  batches, crash-safe snapshot replacement, and a tolerated torn tail.
+- Sharing: `NodeId`, `Delta`, `Sequence`, `ImportReport`, `ImportError`;
+  `Bouncer::export_delta`, `export_snapshot`, `import`; builder `node` and
+  `max_clock_skew`. Bans, lifts, offender records, and revocations merge in
+  any order with hybrid logical clock stamps; a revocation on one node stops
+  running requests on the others.
+- Escalation (`EscalationPolicy`, builder `escalation`): enough banned
+  children of a prefix ban the parent and fold the children, never across an
+  allow-list entry, a trusted proxy, or a shared address.
+- Offender memory with decay (`DurationPolicy::half_life`): a returning
+  offender's next ban is longer, forgotten over time.
+- Shared-address detection: an address with many sessions or accounts is
+  treated as a NAT; automation bans identities and throttles the address
+  (`StrikeOutcome::Throttled`).
+- Lane and tenant budgets: `Budgets::lane_rate`, `tenant_rate`,
+  `tenant_plan`, `tenant_in_flight`; `Ticket::bind_lane`; `LaneClass`.
+  Identity throttles on sessions, accounts, tenants, and fingerprints.
+- Posture: `Bouncer::set_posture` and `posture`; builder
+  `strict_budget_divisor` and `strict_revokes_unauthenticated`.
+- Administration: `Bouncer::explain` (`Explanation`, `OffenderRecord`,
+  `BudgetState`, `StrikeState`), `list` (`Filter`, `Page`, `Listing`,
+  `BanRecord`), `replace_allow`, `health` (`Health`, `MaintainerState`).
+- `metrics` feature: `Bouncer::metrics` and `MetricsSnapshot`, per-shard
+  counters; the checkpoint fast path stays one load.
+- `Bouncer::datagram` and `DatagramVerdict` for UDP.
+- Signals `bouncer.budget.refused`, `bouncer.posture.changed`,
+  `bouncer.persist.wall_jump`; reasons `LOCKDOWN` and `BUDGET`; ban expiry,
+  eviction, and unresolved proxy hops now report.
+- `docs/ARCHITECTURE.md`.
+- Tests: persistence (with a kill test), sharing, escalation, administration,
+  posture, edge cases; fuzz targets `snapshot_decode`, `journal_replay`,
+  `delta_decode`.
+
+### Changed
+
+- `Budgets` is no longer `Copy` (it holds tenant plans).
+- Events take their wall time from the bouncer's clock.
+- A merged ban keeps the later issue time.
+- An automated ban that a wider, longer ban already covers is not stored.
+
+### Dependencies
+
+- `better-bucket` 1.1 (default features off) for tenant token buckets.
+
+---
+
 ## [0.4.0] - 2026-10-23
 
 In-flight revocation, wipe, replace, eject, strikes, budgets, and events.
@@ -169,7 +228,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/bouncer-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/bouncer-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/bouncer-io/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/bouncer-io/compare/v0.1.0...v0.2.0

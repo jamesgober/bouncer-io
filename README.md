@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: <code>0.4.0</code> (extended).</strong> The door, ban memory, in-flight revocation, wipe-replace-eject, strikes, door budgets, and events work. Persistence, sharing across nodes, escalation, and administration land in <code>0.5.0</code>. See <a href="./docs/API.md"><code>docs/API.md</code></a>, <a href="./docs/INTEGRATION.md"><code>docs/INTEGRATION.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: <code>0.5.0</code> (feature complete).</strong> The door, ban memory, in-flight revocation, wipe-replace-eject, strikes, budgets, events, persistence, sharing across nodes, escalation, and administration work. Optimisation and hardening come next, then the net-io integration. See <a href="./docs/API.md"><code>docs/API.md</code></a>, <a href="./docs/INTEGRATION.md"><code>docs/INTEGRATION.md</code></a>, <a href="./docs/ARCHITECTURE.md"><code>docs/ARCHITECTURE.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -40,7 +40,7 @@
 
 ```toml
 [dependencies]
-bouncer-io = "0.4"
+bouncer-io = "0.5"
 ```
 
 <hr>

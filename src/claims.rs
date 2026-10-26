@@ -33,6 +33,16 @@ impl Claims {
         self.keys.len()
     }
 
+    /// Claimed slots, 0 to 1 of the table (a full scan).
+    pub(crate) fn load(&self) -> f32 {
+        let used = self
+            .keys
+            .iter()
+            .filter(|k| k.load(Ordering::Relaxed) != 0)
+            .count();
+        used as f32 / self.keys.len() as f32
+    }
+
     /// A key hash usable as a slot key: never zero.
     #[inline]
     pub(crate) fn key(h: u64) -> u64 {

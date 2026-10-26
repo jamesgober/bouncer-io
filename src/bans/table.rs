@@ -264,7 +264,7 @@ pub(crate) struct TableWriter {
 }
 
 impl TableWriter {
-    #[cfg(all(test, not(bouncer_loom)))]
+    /// Live entries, expired ones not yet reclaimed included.
     pub(crate) fn live(&self) -> u32 {
         self.live
     }
@@ -572,6 +572,17 @@ impl Table {
             }
         }
         out
+    }
+
+    /// Calls `f` on every stored entry, expired or not. A full scan, for
+    /// administration and persistence; the caller holds the writer lock.
+    pub(crate) fn for_each(&self, mut f: impl FnMut(&Entry)) {
+        for slot in self.slots.iter() {
+            let raw = slot.read_owned();
+            if raw.kind() >= KIND_V4 {
+                f(&raw.entry());
+            }
+        }
     }
 
     /// The entry under `key` for the writer, expired or not.

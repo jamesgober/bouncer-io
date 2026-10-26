@@ -32,6 +32,8 @@ pub(crate) const F_DETACHED: u64 = 1 << 23;
 pub(crate) const F_CHARGED: u64 = 1 << 27;
 /// A request revoked by a revocation that keeps its connection open.
 pub(crate) const F_KEEP_CONNECTION: u64 = 1 << 28;
+/// The ticket holds a tenant in-flight slot, returned on release.
+pub(crate) const F_TENANT_CHARGED: u64 = 1 << 29;
 /// Provenance, three bits at 24..27.
 pub(crate) const PROVENANCE_SHIFT: u32 = 24;
 pub(crate) const PROVENANCE_MASK: u64 = 0b111 << PROVENANCE_SHIFT;
@@ -224,6 +226,8 @@ pub(crate) struct Shard {
     pub(crate) id: u8,
     pub(crate) epoch: Arc<Epoch>,
     pub(crate) shared: Arc<crate::bouncer::Shared>,
+    #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
+    pub(crate) meters: crate::metrics::Meters,
 }
 
 impl Shard {

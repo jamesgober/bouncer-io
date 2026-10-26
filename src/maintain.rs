@@ -103,6 +103,8 @@ pub(crate) struct Maintenance {
     sweep_requested: AtomicU64,
     thread: Mutex<Option<std::thread::Thread>>,
     stop: AtomicU64,
+    /// 0 not started, 1 parked, 2 running, 3 stopped.
+    state: AtomicU64,
     pub(crate) max_unchecked: Duration,
     pub(crate) interval: Duration,
 }
@@ -114,6 +116,7 @@ impl Maintenance {
             sweep_requested: AtomicU64::new(0),
             thread: Mutex::new(None),
             stop: AtomicU64::new(0),
+            state: AtomicU64::new(0),
             max_unchecked,
             interval: Duration::from_secs(10).min(max_unchecked),
         }
@@ -133,6 +136,21 @@ impl Maintenance {
         }
     }
 
+    /// The maintainer thread's state.
+    pub(crate) fn state(&self) -> crate::admin::MaintainerState {
+        use crate::admin::MaintainerState;
+        match self.state.load(Ordering::Acquire) {
+            1 => MaintainerState::Parked,
+            2 => MaintainerState::Running,
+            3 => MaintainerState::Stopped,
+            _ => MaintainerState::NotStarted,
+        }
+    }
+
+    fn set_state(&self, s: u64) {
+        self.state.store(s, Ordering::Release);
+    }
+
     pub(crate) fn request_sweep(&self) {
         self.sweep_requested.fetch_add(1, Ordering::AcqRel);
         self.wake();
@@ -146,6 +164,7 @@ impl Maintenance {
 
 /// One bounded maintenance step.
 pub(crate) fn run(shared: &Shared, now: Now) -> MaintenanceReport {
+    crate::metrics::meter!(shared.meters, sweeps);
     let mut report = MaintenanceReport::default();
     let epoch = shared.epoch.load();
     let sweep = shared.maintenance.sweep_requested.swap(0, Ordering::AcqRel) > 0;
@@ -154,10 +173,15 @@ pub(crate) fn run(shared: &Shared, now: Now) -> MaintenanceReport {
         report.swept = swept;
         report.ejected += ejected;
     }
+    if let Ok(n) = shared.persist_flush(now, false) {
+        report.journal_written = n;
+    }
+    let persist_due = shared.persist_due();
     if shared.revocations.is_empty() {
         if let Ok(mut s) = shared.maintenance.samples.lock() {
             s.clear();
         }
+        report.next_due = persist_due;
         return report;
     }
     // Idle tickets: checked by no checkpoint since an epoch that was current
@@ -210,11 +234,15 @@ pub(crate) fn run(shared: &Shared, now: Now) -> MaintenanceReport {
         min_seen = min_seen.min(seen);
     }
     report.reclaimed = shared.revocations.remove_born_by(min_seen);
-    report.next_due = (!shared.revocations.is_empty()).then(|| {
+    let revocations_due = (!shared.revocations.is_empty()).then(|| {
         Now::from_nanos(now.as_nanos().saturating_add(
             u64::try_from(shared.maintenance.interval.as_nanos()).unwrap_or(u64::MAX),
         ))
     });
+    report.next_due = match (revocations_due, persist_due) {
+        (Some(a), Some(b)) => Some(if a.as_nanos() <= b.as_nanos() { a } else { b }),
+        (a, b) => a.or(b),
+    };
     report
 }
 
@@ -291,6 +319,7 @@ fn eject_revoked(shared: &Shared, index: u32, idle: bool) -> u32 {
         return 0;
     }
     ejector.eject(conn, crate::maintain::CloseKind::Abort);
+    crate::metrics::meter!(shared.meters, ejections);
     1
 }
 
@@ -339,13 +368,25 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> Result<(), std::io::ErrorKind> {
     let handle = std::thread::Builder::new()
         .name("bouncer-maintainer".into())
         .spawn(move || {
+            // Marks the state stopped however the loop ends, a panic included.
+            struct Stopped(Weak<Shared>);
+            impl Drop for Stopped {
+                fn drop(&mut self) {
+                    if let Some(shared) = self.0.upgrade() {
+                        shared.maintenance.set_state(3);
+                    }
+                }
+            }
+            let _stopped = Stopped(weak.clone());
             loop {
                 let Some(shared) = weak.upgrade() else { return };
                 if shared.maintenance.stop.load(Ordering::Acquire) != 0 {
                     return;
                 }
+                shared.maintenance.set_state(2);
                 let now = shared.now();
                 let report = run(&shared, now);
+                shared.maintenance.set_state(1);
                 drop(shared);
                 match report.next_due {
                     None => std::thread::park(),
@@ -361,6 +402,11 @@ pub(crate) fn spawn(shared: &Arc<Shared>) -> Result<(), std::io::ErrorKind> {
         .thread
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle.thread().clone());
+    // Parked until its first run says otherwise (it may already be running).
+    let _ = shared
+        .maintenance
+        .state
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
     Ok(())
 }
 
