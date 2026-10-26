@@ -20,7 +20,14 @@ use crate::{
 #[inline]
 pub(crate) fn hash_key(key: &HashKey, k: &TableKey) -> u64 {
     let meta = u64::from(k.kind) | (u64::from(k.len) << 8);
-    key.hash3(meta, k.k0, k.k1)
+    // A prefix key has one word that is always zero (IPv4 bits live in
+    // `k1`; an IPv6 prefix of /64 or shorter in `k0`): two words suffice.
+    // The kind and length in `meta` keep the classes apart.
+    match k.kind {
+        KIND_V4 => key.hash2(meta, k.k1),
+        KIND_V6 if k.len <= 64 => key.hash2(meta, k.k0),
+        _ => key.hash3(meta, k.k0, k.k1),
+    }
 }
 
 /// Slot kinds stored in the low byte of the meta word.

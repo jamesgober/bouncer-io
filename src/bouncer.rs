@@ -53,6 +53,8 @@ pub(crate) struct Shared {
     pub(crate) node: Option<NodeId>,
     pub(crate) bans: BanMemory,
     pub(crate) allow: Published<PrefixSet<AllowKind>>,
+    /// Entries in the allow list now: the door skips the list when zero.
+    pub(crate) allow_len: AtomicU32,
     pub(crate) proxies: PrefixSet<()>,
     pub(crate) references: HashKey,
     pub(crate) tickets_capacity: u32,
@@ -1793,6 +1795,7 @@ impl BouncerBuilder {
                 self.escalation,
                 seeds.rng,
             ),
+            allow_len: AtomicU32::new(allow.len() as u32),
             allow: Published::new(allow),
             proxies,
             references: seeds.references,

@@ -1219,15 +1219,8 @@ impl BanMemory {
                 }
             }
         }
-        let mut keys = [TableKey {
-            kind: 0,
-            len: 0,
-            k0: 0,
-            k1: 0,
-        }; PROBE_BATCH];
         let mut starts = [(0usize, 0u8); PROBE_BATCH];
         for i in 0..count {
-            keys[i] = Self::prefix_key(&host.parent(lengths[i]).unwrap_or(host));
             starts[i] = self.table.locate_hash(hashes.get(lengths[i]));
         }
         let mut tags = [0u64; PROBE_BATCH];
@@ -1235,9 +1228,11 @@ impl BanMemory {
             tags[i] = self.table.first_tags(starts[i].0);
         }
         for i in 0..count {
+            // The full key is only compared on a tag match.
+            let key = Self::prefix_key(&host.parent(lengths[i]).unwrap_or(host));
             match self
                 .table
-                .find_at(&keys[i], starts[i].0, starts[i].1, tags[i], now_secs)
+                .find_at(&key, starts[i].0, starts[i].1, tags[i], now_secs)
             {
                 Probe::Hit(e) => return Lookup::Banned(e.id),
                 Probe::Busy => busy = true,

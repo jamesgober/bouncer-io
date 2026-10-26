@@ -7,6 +7,7 @@ use crate::{
     allow::{self, AllowKind},
     bans::Lookup,
     bouncer::Shared,
+    sync::Ordering,
     time::Now,
     verdict::Reference,
 };
@@ -197,7 +198,11 @@ impl Shared {
                 })
             };
         }
-        let allowed = self.allow.with(|set| allow::lookup(set, peer));
+        let allowed = if self.allow_len.load(Ordering::Acquire) == 0 {
+            None
+        } else {
+            self.allow.with(|set| allow::lookup(set, peer))
+        };
         if allowed == Some(AllowKind::Immune) {
             return Judgement::Admit {
                 immune: true,

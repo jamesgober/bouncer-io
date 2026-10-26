@@ -28,6 +28,15 @@ impl HashKey {
         self.hash3_rounds::<1, 3>(a, b, c)
     }
 
+    /// SipHash-1-3 over two words.
+    #[inline]
+    pub(crate) fn hash2(&self, a: u64, b: u64) -> u64 {
+        let mut s = State::new(self.k0, self.k1);
+        s.word::<1>(a);
+        s.word::<1>(b);
+        s.finish::<1, 3>(16)
+    }
+
     #[inline]
     fn hash3_rounds<const C: usize, const D: usize>(&self, a: u64, b: u64, c: u64) -> u64 {
         let mut s = State::new(self.k0, self.k1);

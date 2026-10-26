@@ -53,7 +53,7 @@ fn row(name: &str, (best, median): (f64, f64)) {
 fn main() {
     // `cargo bench` passes `--bench`; anything else filters nothing.
     let rate = Rate::per_second(1_000_000_000).burst(1_000_000_000);
-    let f = fixture::fixture_with(Budgets::off().door_rate(rate, rate));
+    let f = fixture::fixture_with(Budgets::off().door_rate(rate, rate).capacity(1 << 20));
     let lookup = LookupOnly::new(&f.prefixes);
     let equal = EqualJob::new(&f.prefixes);
     let mut m = Mix(77);
@@ -135,6 +135,16 @@ fn main() {
             black_box(t.is_ok());
         }),
     );
+    row(
+        "judge only: 1m bans and admin set",
+        measure(|i| {
+            let _ = black_box(no_rate.bouncer.datagram(
+                black_box(no_rate.admitted[i & 4095]),
+                true,
+                now,
+            ));
+        }),
+    );
     drop(no_rate);
     let no_admin = fixture::build(Budgets::off(), 0);
     row(
@@ -149,7 +159,41 @@ fn main() {
             black_box(t.is_ok());
         }),
     );
+    row(
+        "judge only: 1m bans",
+        measure(|i| {
+            let _ = black_box(no_admin.bouncer.datagram(
+                black_box(no_admin.admitted[i & 4095]),
+                true,
+                now,
+            ));
+        }),
+    );
     drop(no_admin);
+    let lists = Bouncer::builder()
+        .budgets(Budgets::off())
+        .tickets(64)
+        .ban_capacity(1024)
+        .allow(
+            fixture::cidrs(&fixture::ALLOW)
+                .into_iter()
+                .fold(bouncer_io::AllowList::new(), |l, c| l.immune(c, "bench")),
+        )
+        .trusted_proxies(&fixture::cidrs(&fixture::PROXIES))
+        .try_build()
+        .unwrap();
+    row(
+        "judge only: allow list and proxies",
+        measure(|i| {
+            let _ = black_box(lists.datagram(black_box(f.admitted[i & 4095]), true, now));
+        }),
+    );
+    row(
+        "judge only: nothing configured",
+        measure(|i| {
+            let _ = black_box(empty.datagram(black_box(f.admitted[i & 4095]), true, now));
+        }),
+    );
     row(
         "ticket only (empty bouncer)",
         measure(|i| {
