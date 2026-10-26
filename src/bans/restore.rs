@@ -35,6 +35,27 @@ impl BanMemory {
         guards: &Guards<'_>,
         now_secs: u64,
     ) -> Result<(), BouncerError> {
+        self.put(r, guards, now_secs, false)
+    }
+
+    /// Sets the ban under the key to exactly `r` (a sharing node's merge of
+    /// every origin's ban, computed by the ledger).
+    pub(crate) fn replace(
+        &self,
+        r: &Restore,
+        guards: &Guards<'_>,
+        now_secs: u64,
+    ) -> Result<(), BouncerError> {
+        self.put(r, guards, now_secs, true)
+    }
+
+    fn put(
+        &self,
+        r: &Restore,
+        guards: &Guards<'_>,
+        now_secs: u64,
+        exact: bool,
+    ) -> Result<(), BouncerError> {
         let key = r.key.normalized();
         self.guard(&key, guards)?;
         // Placement as the application: stored bans of every kind go back.
@@ -66,7 +87,11 @@ impl BanMemory {
                 match self
                     .table
                     .insert(&mut writer.table, entry, now_secs, |old| {
-                        super::merge(old, &entry, now_secs)
+                        if exact {
+                            entry
+                        } else {
+                            super::merge(old, &entry, now_secs)
+                        }
                     }) {
                     Ok(Inserted::New { removed, .. }) => {
                         if let Some(old) = removed {
@@ -86,6 +111,15 @@ impl BanMemory {
             }
             Placement::Admin(cidr) => {
                 match writer.admin.iter_mut().find(|(c, _)| *c == cidr) {
+                    Some((_, e)) if exact => {
+                        *e = AdminEntry {
+                            id: r.id,
+                            until: r.until,
+                            issued: r.issued,
+                            actor: r.actor,
+                            reason: r.reason,
+                        };
+                    }
                     Some((_, e)) => e.until = super::longer(e.until, r.until),
                     None => {
                         if writer.admin.len() >= super::MAX_ADMIN_PREFIXES {

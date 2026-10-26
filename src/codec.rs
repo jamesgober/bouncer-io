@@ -21,6 +21,9 @@ const T_LIFT: u8 = 2;
 const T_REMOVE: u8 = 3;
 const T_OFFENCE: u8 = 4;
 const T_REVOKE: u8 = 5;
+/// A lift with its scope (format 2). Type 2 is the format-1 lift, read as a
+/// lift of every origin (what it meant then).
+const T_LIFT_SCOPED: u8 = 6;
 
 /// One state change.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,8 +41,14 @@ pub(crate) enum Rec {
         id: u64,
         stamp: u64,
     },
-    /// A lift: a tombstone stamped with its clock.
-    Lift { key: BanKey, stamp: u64, actor: u8 },
+    /// A lift: a tombstone stamped with its clock. `all`: it covers every
+    /// origin's bans (an administrator's lift), not only its own origin's.
+    Lift {
+        key: BanKey,
+        stamp: u64,
+        actor: u8,
+        all: bool,
+    },
     /// A ban removed without a lift (folded, evicted, or allow-listed).
     Remove { key: BanKey },
     /// An offender record: the decayed score as of `last` (Unix seconds).
@@ -316,7 +325,7 @@ pub(crate) fn encode(out: &mut Vec<u8>, env: &Envelope) -> bool {
     let mut w = Writer(out);
     let ty = match env.rec {
         Rec::Ban { .. } => T_BAN,
-        Rec::Lift { .. } => T_LIFT,
+        Rec::Lift { .. } => T_LIFT_SCOPED,
         Rec::Remove { .. } => T_REMOVE,
         Rec::Offence { .. } => T_OFFENCE,
         Rec::Revoke { .. } => T_REVOKE,
@@ -346,10 +355,16 @@ pub(crate) fn encode(out: &mut Vec<u8>, env: &Envelope) -> bool {
             w.u64(id);
             w.u64(stamp);
         }
-        Rec::Lift { key, stamp, actor } => {
+        Rec::Lift {
+            key,
+            stamp,
+            actor,
+            all,
+        } => {
             put_key(&mut w, &key);
             w.u64(stamp);
             w.u8(actor);
+            w.u8(u8::from(all));
         }
         Rec::Remove { key } => put_key(&mut w, &key),
         Rec::Offence { key, score, last } => {
@@ -417,7 +432,24 @@ pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Envelope, Bad> {
             key: get_key(&mut b)?,
             stamp: b.u64()?,
             actor: b.u8()?,
+            all: true,
         },
+        T_LIFT_SCOPED => {
+            let key = get_key(&mut b)?;
+            let stamp = b.u64()?;
+            let actor = b.u8()?;
+            let all = match b.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(Bad(at)),
+            };
+            Rec::Lift {
+                key,
+                stamp,
+                actor,
+                all,
+            }
+        }
         T_REMOVE => Rec::Remove {
             key: get_key(&mut b)?,
         },
@@ -501,6 +533,17 @@ mod tests {
                 key: keys[0],
                 stamp: 5,
                 actor: 1,
+                all: false,
+            },
+        });
+        v.push(Envelope {
+            origin: 3,
+            seq: 98,
+            rec: Rec::Lift {
+                key: keys[1],
+                stamp: 6,
+                actor: 2,
+                all: true,
             },
         });
         v.push(Envelope {
@@ -544,6 +587,38 @@ mod tests {
             assert_eq!(decode(&mut r).unwrap(), e);
         }
         assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn test_codec_reads_format_1_lifts_as_lifts_of_every_origin() {
+        // A format-1 lift (type 2: key, stamp, actor) as 0.6 wrote it.
+        let key = BanKey::Address("192.0.2.1".parse().unwrap());
+        let mut body = Vec::new();
+        let mut w = Writer(&mut body);
+        w.u8(T_LIFT);
+        w.u16(4);
+        w.u64(17);
+        put_key(&mut w, &key);
+        w.u64(5 << 16);
+        w.u8(1);
+        let mut buf = (body.len() as u32).to_le_bytes().to_vec();
+        buf.extend_from_slice(&body);
+        buf.extend_from_slice(&crc32c(&body).to_le_bytes());
+        let mut r = Reader::new(&buf, 0);
+        let e = decode(&mut r).unwrap();
+        assert_eq!(
+            e,
+            Envelope {
+                origin: 4,
+                seq: 17,
+                rec: Rec::Lift {
+                    key,
+                    stamp: 5 << 16,
+                    actor: 1,
+                    all: true,
+                },
+            }
+        );
     }
 
     #[test]

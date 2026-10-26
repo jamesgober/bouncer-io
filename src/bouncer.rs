@@ -69,6 +69,10 @@ pub(crate) struct Shared {
     pub(crate) sources: crate::sources::Sources,
     pub(crate) persist: Option<crate::persist::Persist>,
     pub(crate) share: crate::share::Share,
+    /// Each node's ban per key and the lifts covering them: on a node that
+    /// shares (it has a node id), the source of truth the ban table follows
+    /// (D-096).
+    pub(crate) ledger: Option<std::sync::Mutex<crate::ledger::Ledger>>,
     pub(crate) max_clock_skew: Duration,
     /// 0 normal, 1 strict.
     posture: AtomicU32,
@@ -159,6 +163,7 @@ impl Shared {
         if evicted {
             self.log_removed(&[key]);
         }
+        self.forget_shared(&[key]);
         Emit {
             subject: subject_of_key(&key),
             ..Emit::new(if evicted {
@@ -174,6 +179,7 @@ impl Shared {
     pub(crate) fn after_lift(&self, lifted: &[crate::bans::view::Held]) {
         let keys: Vec<BanKey> = lifted.iter().map(|h| h.key).collect();
         self.log_removed(&keys);
+        self.forget_shared(&keys);
     }
 
     /// Whether an immune allow-list entry covers `cidr`.
@@ -216,16 +222,14 @@ impl Shared {
         };
         let planned = self.bans.ban_plan(spec, &guards, self.now(), policy);
         let (result, plan) = match planned {
-            Ok((id, plan, gone)) => {
+            Ok((id, plan, gone, own)) => {
                 self.report_gone(gone);
+                meter!(self.meters, bans_added);
+                self.record_ban(&spec.key, id, own.as_ref());
                 (Ok(id), plan)
             }
             Err(e) => (Err(e), None),
         };
-        if result.is_ok() {
-            meter!(self.meters, bans_added);
-            self.log_ban(&spec.key);
-        }
         if let Some(plan) = plan {
             self.escalate(plan, spec.actor, spec.reason);
         }
@@ -311,11 +315,11 @@ impl Shared {
                 proxies: &self.proxies,
             };
             match self.bans.ban_plan(&spec, &guards, now, None) {
-                Ok((id, next, gone)) => {
+                Ok((id, next, gone, own)) => {
                     self.report_gone(gone);
-                    self.log_ban(&BanKey::Prefix(parent));
+                    self.record_ban(&BanKey::Prefix(parent), id, own.as_ref());
                     let folded = self.bans.fold(&plan.children, parent_until);
-                    self.log_removed(&folded);
+                    self.record_folded(&folded);
                     meter!(self.meters, bans_escalated);
                     Emit {
                         actor,
@@ -686,10 +690,15 @@ impl Bouncer {
     pub fn lift(&self, spec: impl Into<LiftSpec>) -> Result<Lifted, BouncerError> {
         let shared = &self.inner.shared;
         let spec = spec.into();
-        let result = shared.bans.lift(&spec);
-        if result.is_ok() {
-            shared.log_lift(&spec.key, spec.actor);
-        }
+        let result = if shared.ledger.is_some() {
+            shared.lift_shared(&spec)
+        } else {
+            let r = shared.bans.lift(&spec);
+            if r.is_ok() {
+                shared.log_lift(&spec.key, spec.actor);
+            }
+            r
+        };
         if let Ok(l) = &result {
             meter!(shared.meters, bans_lifted, l.removed);
             Emit {
@@ -1308,7 +1317,12 @@ impl Bouncer {
             + shared.budgets.bytes()
             + shared.identity.bytes()
             + shared.sources.bytes()
-            + shared.counters.bytes();
+            + shared.counters.bytes()
+            + shared.ledger.as_ref().map_or(0, |m| {
+                m.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .bytes()
+            });
         c
     }
 }
@@ -1342,7 +1356,8 @@ pub struct Capacity {
     pub budget_keys: u32,
     /// Bytes of the dynamic ban table.
     pub table_bytes: u64,
-    /// Bytes of every table together.
+    /// Bytes of every table together (on a node that shares, its ledger of
+    /// each node's bans too, which grows with the bans it holds).
     pub total_bytes: u64,
 }
 
@@ -1807,6 +1822,9 @@ impl BouncerBuilder {
                 .take()
                 .map(|s| crate::persist::Persist::new(s, self.mac_key)),
             share: crate::share::Share::new(self.channel_import_rate),
+            ledger: self
+                .node
+                .map(|_| std::sync::Mutex::new(crate::ledger::Ledger::new(self.ban_capacity))),
             max_clock_skew: self.max_clock_skew,
             clock,
             bans: BanMemory::new(

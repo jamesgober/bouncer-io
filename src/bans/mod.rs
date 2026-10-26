@@ -458,9 +458,21 @@ thread_local! {
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// What a ban did: its id, an escalation now due, and a ban the insert
-/// took out (`true` when evicted, `false` when expired).
-pub(crate) type Planned = (BanId, Option<Plan>, Option<(BanKey, bool)>);
+/// What a ban did: its id, an escalation now due, a ban the insert took out
+/// (`true` when evicted, `false` when expired), and the ban the call itself
+/// produced (`None` when a wider ban already covered it).
+pub(crate) type Planned = (BanId, Option<Plan>, Option<(BanKey, bool)>, Option<Own>);
+
+/// The ban one call produced, before any merge with a ban already stored
+/// under the key: what a sharing node records as its own (D-096).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Own {
+    pub(crate) until: u32,
+    pub(crate) issued: u32,
+    pub(crate) actor: ActorKind,
+    pub(crate) reason: Reason,
+    pub(crate) offences: u16,
+}
 
 /// The ban memory of one bouncer.
 pub(crate) struct BanMemory {
@@ -797,8 +809,7 @@ impl BanMemory {
         now: Now,
         policy: Option<DurationPolicy>,
     ) -> Result<BanId, BouncerError> {
-        self.ban_plan(spec, guards, now, policy)
-            .map(|(id, _, _)| id)
+        self.ban_plan(spec, guards, now, policy).map(|(id, ..)| id)
     }
 
     /// Adds a ban and reports an escalation it makes due: the parent prefix
@@ -857,12 +868,19 @@ impl BanMemory {
         // explicit ban is stored anyway, so lifting the prefix keeps it.
         if let (Placement::Dynamic(tkey), true) = (&placement, spec.actor.is_automated()) {
             if let Some(covering) = self.covering_wider(tkey, until, now_secs) {
-                return Ok((BanId(covering), None, None));
+                return Ok((BanId(covering), None, None, None));
             }
         }
         let id = w.next_id;
         w.next_id += 1;
         let actor = spec.actor.kind();
+        let own = Own {
+            until,
+            issued,
+            actor,
+            reason: spec.reason,
+            offences: previous.unwrap_or(0),
+        };
         match placement {
             Placement::Dynamic(tkey) => {
                 let flags = if actor == ActorKind::Local && until != 0 {
@@ -914,7 +932,7 @@ impl BanMemory {
                 };
                 writer.offenders.record(tkey, now_secs);
                 let plan = self.plan(writer, &tkey, now_secs);
-                Ok((id, plan, gone))
+                Ok((id, plan, gone, Some(own)))
             }
             Placement::Admin(cidr) => {
                 let entry = AdminEntry {
@@ -944,7 +962,7 @@ impl BanMemory {
                     }
                 };
                 self.publish_admin(&writer.admin);
-                Ok((BanId(id), None, None))
+                Ok((BanId(id), None, None, Some(own)))
             }
         }
     }
@@ -1122,6 +1140,19 @@ impl BanMemory {
         let tombstone = BanId(writer.next_id);
         writer.next_id += 1;
         Ok(Lifted { removed, tombstone })
+    }
+
+    /// A new id from this bouncer's sequence (a lift's tombstone id).
+    pub(crate) fn new_id(&self) -> BanId {
+        let mut w = self.lock();
+        let id = BanId(w.next_id);
+        w.next_id += 1;
+        id
+    }
+
+    /// Refuses keys an allow-list entry or a trusted proxy covers.
+    pub(crate) fn check(&self, key: &BanKey, guards: &Guards<'_>) -> Result<(), BouncerError> {
+        self.guard(&key.normalized(), guards)
     }
 
     fn publish_admin(&self, list: &[(Cidr, AdminEntry)]) {
