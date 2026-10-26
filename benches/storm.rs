@@ -71,7 +71,7 @@ fn main() {
     let revoker = {
         let (b, stop, done) = (Arc::clone(&b), Arc::clone(&stop), Arc::clone(&done));
         std::thread::spawn(move || {
-            // 100,000 per second: one every 10 Âµs, paced by the clock.
+            // 100,000 per second: one every 10 µs, paced by the clock.
             let start = Instant::now();
             let mut n: u64 = 0;
             while !stop.load(Ordering::Relaxed) {
