@@ -1301,7 +1301,11 @@ impl BanMemory {
         let mut home = None;
         for (i, &len) in lengths.iter().enumerate() {
             keys[i] = Self::key_at(host, len);
-            spots[i] = table.locate(&keys[i]);
+            spots[i] = match anchor {
+                // Past the anchor: the tag is all a key needs of its own.
+                Some(a) if len > a => (usize::MAX, Table::anchored_tag(&keys[i])),
+                _ => table.locate(&keys[i]),
+            };
             if Some(len) == anchor {
                 home = Some(spots[i].0);
             }
@@ -1331,7 +1335,8 @@ impl BanMemory {
                     if len <= a {
                         continue;
                     }
-                    let (own, tag) = spots[i];
+                    let own = table.locate(&keys[i]).0;
+                    let tag = spots[i].1;
                     match table.find_at(&keys[i], own, tag, table.first_tags(own), now_secs) {
                         Probe::Hit(e) => return Some(Lookup::Banned(e.id)),
                         Probe::Busy => busy = true,
@@ -1346,7 +1351,7 @@ impl BanMemory {
     /// The table key of `host`'s prefix of length `len` (IPv4 in 32-bit
     /// arithmetic).
     #[inline]
-    fn key_at(host: &Cidr, len: u8) -> TableKey {
+    pub(crate) fn key_at(host: &Cidr, len: u8) -> TableKey {
         match host.family() {
             Family::V4 => {
                 let a = host.bits() as u32;

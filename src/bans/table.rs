@@ -438,7 +438,7 @@ impl Table {
             Some(a) => Spot {
                 home: self.locate(&a).0,
                 own,
-                tag,
+                tag: Self::anchored_tag(k),
                 anchored: true,
             },
             None => Spot {
@@ -448,6 +448,17 @@ impl Table {
                 anchored: false,
             },
         }
+    }
+
+    /// The tag of an anchored key: seven bits of an unkeyed multiply of the
+    /// key. The anchor's keyed hash chooses the group; the tag only filters
+    /// the slots compared within it, so a chosen tag costs an attacker's key
+    /// at most a few more slot reads, and the lookup saves a keyed hash per
+    /// length past the anchor.
+    #[inline]
+    pub(crate) fn anchored_tag(k: &TableKey) -> u8 {
+        let x = k.k1 ^ k.k0.rotate_left(29) ^ (u64::from(k.len) << 56) ^ u64::from(k.kind);
+        (x.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 57) as u8
     }
 
     /// Whether some key anchored at `group` lives in its own sequence.

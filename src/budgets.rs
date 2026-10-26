@@ -480,10 +480,9 @@ impl DoorBudgets {
             Family::V6 => (64, 48),
         };
         let hash = |len: u8| {
-            let p = host.parent(len).unwrap_or(host);
             Claims::key(crate::bans::table::hash_key(
                 &self.key,
-                &crate::bans::BanMemory::prefix_key(&p),
+                &crate::bans::BanMemory::key_at(&host, len),
             ))
         };
         [hash(client), hash(prefix)]
