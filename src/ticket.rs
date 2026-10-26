@@ -1534,6 +1534,11 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
     let present_child = cell.present_child.load(Ordering::Acquire);
     match TicketKind::from_state(st) {
         TicketKind::Connection => {
+            // A swap, not a load and a store: the swap orders this release
+            // against a request counting itself (both read-modify-write the
+            // same word), which a load could only match with a sequentially
+            // consistent fence that costs more than the swap (D-103; loom
+            // model L-7 fails without it).
             let old = cell.link.swap(u64::from(next_gen) << 32, Ordering::AcqRel);
             if generation(old) == gen_ && old as u32 > 0 {
                 // Live requests remain: they must see their connection is gone

@@ -1284,25 +1284,7 @@ impl BanMemory {
                     if hashes.key != table.hasher() {
                         *hashes = AddrHashes::new(table.hasher(), addr);
                     }
-                    let mut starts = [(0usize, 0u8); PROBE_BATCH];
-                    for i in 0..count {
-                        starts[i] = table.locate_hash(hashes.get(lengths[i]));
-                    }
-                    let mut tags = [0u64; PROBE_BATCH];
-                    for i in 0..count {
-                        tags[i] = table.first_tags(starts[i].0);
-                    }
-                    let mut busy = false;
-                    for i in 0..count {
-                        // The full key is only compared on a tag match.
-                        let key = Self::prefix_key(&host.parent(lengths[i]).unwrap_or(host));
-                        match table.find_at(&key, starts[i].0, starts[i].1, tags[i], now_secs) {
-                            Probe::Hit(e) => return Some(Lookup::Banned(e.id)),
-                            Probe::Busy => busy = true,
-                            Probe::Miss => {}
-                        }
-                    }
-                    busy.then_some(Lookup::Busy)
+                    Self::probe_lengths(table, &host, hashes, &lengths[..count], now_secs)
                 })
             })
             .flatten();
@@ -1330,6 +1312,59 @@ impl BanMemory {
             }
         }
         if busy { Lookup::Busy } else { Lookup::Clear }
+    }
+
+    /// Probes the address's prefix at each of `lengths`. Every length at or
+    /// past the family's anchor lives in the anchor's probe sequence, so one
+    /// group's tag word serves them all; a crowded anchor (its overflow bit
+    /// set) sends the longer ones to their own sequences too.
+    #[inline]
+    fn probe_lengths(
+        table: &Table,
+        host: &Cidr,
+        hashes: &mut AddrHashes,
+        lengths: &[u8],
+        now_secs: u64,
+    ) -> Option<Lookup> {
+        let anchor = match host.family() {
+            Family::V4 => table.anchors().0,
+            Family::V6 => table.anchors().1,
+        };
+        let home = anchor.map(|a| table.locate_hash(hashes.get(a)).0);
+        let home_tags = home.map(|g| table.first_tags(g));
+        let mut spots = [(0usize, 0u8, 0u64); PROBE_BATCH];
+        for (i, &len) in lengths.iter().enumerate() {
+            let (own, tag) = table.locate_hash(hashes.get(len));
+            spots[i] = match (home, home_tags) {
+                (Some(g), Some(t)) if anchor.is_some_and(|a| len >= a) => (g, tag, t),
+                _ => (own, tag, table.first_tags(own)),
+            };
+        }
+        let mut busy = false;
+        for (i, &len) in lengths.iter().enumerate() {
+            // The full key is only compared on a tag match.
+            let key = Self::prefix_key(&host.parent(len).unwrap_or(*host));
+            let (g, tag, tags) = spots[i];
+            match table.find_at(&key, g, tag, tags, now_secs) {
+                Probe::Hit(e) => return Some(Lookup::Banned(e.id)),
+                Probe::Busy => busy = true,
+                Probe::Miss => {}
+            }
+        }
+        if let (Some(a), Some(g)) = (anchor, home) {
+            if table.overflowed(g) {
+                for &len in lengths.iter().filter(|&&len| len > a) {
+                    let key = Self::prefix_key(&host.parent(len).unwrap_or(*host));
+                    let (own, tag) = table.locate_hash(hashes.get(len));
+                    match table.find_at(&key, own, tag, table.first_tags(own), now_secs) {
+                        Probe::Hit(e) => return Some(Lookup::Banned(e.id)),
+                        Probe::Busy => busy = true,
+                        Probe::Miss => {}
+                    }
+                }
+            }
+        }
+        busy.then_some(Lookup::Busy)
     }
 
     /// Probes every length in use that is not in `done`.

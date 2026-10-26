@@ -268,6 +268,23 @@ pub(crate) struct Table {
     tags: Box<[AtomicU64]>,
     key: HashKey,
     capacity: u32,
+    /// The anchor lengths (IPv4, IPv6): an address key at this length or
+    /// longer lives in the probe sequence of its prefix at this length, so
+    /// one group holds every automatic length of an address (D-104).
+    anchors: (Option<u8>, Option<u8>),
+    /// One bit per group: some key anchored here did not fit its anchor's
+    /// probe sequence and lives in its own (a crowded prefix).
+    overflow: Box<[AtomicU64]>,
+}
+
+/// Where a key lives: its home group (its anchor's, or its own), its own
+/// group, its tag, and whether it is anchored elsewhere.
+#[derive(Clone, Copy, Debug)]
+struct Spot {
+    home: usize,
+    own: usize,
+    tag: u8,
+    anchored: bool,
 }
 
 /// Writer-side bookkeeping, kept inside the owner's writer lock.
@@ -335,6 +352,24 @@ fn has_empty(word: u64) -> bool {
 }
 
 impl Table {
+    /// A table for `capacity` entries at a load of at most 7/8, address keys
+    /// anchored at the given lengths.
+    pub(crate) fn with_anchors(
+        capacity: u32,
+        key: HashKey,
+        anchors: (Option<u8>, Option<u8>),
+    ) -> Table {
+        Table {
+            anchors,
+            ..Table::new(capacity, key)
+        }
+    }
+
+    /// The anchor lengths.
+    pub(crate) fn anchors(&self) -> (Option<u8>, Option<u8>) {
+        self.anchors
+    }
+
     /// A table for `capacity` entries at a load of at most 7/8.
     pub(crate) fn new(capacity: u32, key: HashKey) -> Table {
         let wanted = (u64::from(capacity) * 8)
@@ -351,12 +386,78 @@ impl Table {
             .map(|_| AtomicU64::new(TAGS_EMPTY))
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let overflow = (0..groups.div_ceil(64))
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Table {
             slots,
             tags,
             key,
             capacity,
+            anchors: (None, None),
+            overflow,
         }
+    }
+
+    /// The prefix an address key is anchored at, when it is longer than its
+    /// family's anchor length.
+    fn anchor_of(&self, k: &TableKey) -> Option<TableKey> {
+        let (a, width) = match k.kind {
+            KIND_V4 => (self.anchors.0?, 32u32),
+            KIND_V6 => (self.anchors.1?, 128u32),
+            _ => return None,
+        };
+        if k.len <= a {
+            return None;
+        }
+        let bits = (u128::from(k.k0) << 64) | u128::from(k.k1);
+        let keep = if a == 0 {
+            0
+        } else {
+            let all = if width == 32 {
+                u128::from(u32::MAX)
+            } else {
+                u128::MAX
+            };
+            (u128::MAX << (width - u32::from(a))) & all
+        };
+        let m = bits & keep;
+        Some(TableKey {
+            kind: k.kind,
+            len: a,
+            k0: (m >> 64) as u64,
+            k1: m as u64,
+        })
+    }
+
+    #[inline]
+    fn spot(&self, k: &TableKey) -> Spot {
+        let (own, tag) = self.locate(k);
+        match self.anchor_of(k) {
+            Some(a) => Spot {
+                home: self.locate(&a).0,
+                own,
+                tag,
+                anchored: true,
+            },
+            None => Spot {
+                home: own,
+                own,
+                tag,
+                anchored: false,
+            },
+        }
+    }
+
+    /// Whether some key anchored at `group` lives in its own sequence.
+    #[inline]
+    pub(crate) fn overflowed(&self, group: usize) -> bool {
+        self.overflow[group / 64].load(Ordering::Acquire) & (1u64 << (group % 64)) != 0
+    }
+
+    fn mark_overflow(&self, group: usize) {
+        self.overflow[group / 64].fetch_or(1u64 << (group % 64), Ordering::Release);
     }
 
     pub(crate) fn capacity(&self) -> u32 {
@@ -408,9 +509,14 @@ impl Table {
     /// Lock-free lookup of a live (not expired) entry.
     #[inline]
     pub(crate) fn find(&self, key: &TableKey, now_secs: u64) -> Probe {
-        let (g, h2) = self.locate(key);
-        let tags = self.first_tags(g);
-        self.find_at(key, g, h2, tags, now_secs)
+        let s = self.spot(key);
+        let tags = self.first_tags(s.home);
+        match self.find_at(key, s.home, s.tag, tags, now_secs) {
+            Probe::Miss if s.anchored && self.overflowed(s.home) => {
+                self.find_at(key, s.own, s.tag, self.first_tags(s.own), now_secs)
+            }
+            found => found,
+        }
     }
 
     /// The tag word of a key's first group: callers that probe several keys
@@ -462,7 +568,16 @@ impl Table {
 
     /// The slot holding `key` (expired or not), for the writer.
     fn position(&self, key: &TableKey) -> Option<(usize, Raw)> {
-        let (mut g, h2) = self.locate(key);
+        let s = self.spot(key);
+        self.position_from(key, s.home, s.tag).or_else(|| {
+            (s.anchored && self.overflowed(s.home))
+                .then(|| self.position_from(key, s.own, s.tag))
+                .flatten()
+        })
+    }
+
+    fn position_from(&self, key: &TableKey, start: usize, h2: u8) -> Option<(usize, Raw)> {
+        let mut g = start;
         for step in 1..=MAX_PROBE {
             let tags = self.tags[g].load(Ordering::Relaxed);
             for i in 0..GROUP {
@@ -504,40 +619,24 @@ impl Table {
         now_secs: u64,
         merge: impl FnOnce(&Entry) -> Entry,
     ) -> Result<Inserted, NoRoom> {
-        let (start, h2) = self.locate(&entry.key);
+        let s = self.spot(&entry.key);
+        let h2 = s.tag;
         if let Some((slot, raw)) = self.position(&entry.key) {
             let previous = raw.entry();
             self.store(slot, &merge(&previous), h2);
             return Ok(Inserted::Merged { previous });
         }
-        // The first reusable slot on the probe path: empty, deleted, or expired.
-        let mut free: Option<(usize, Option<Entry>)> = None;
-        let mut window_victim: Option<(usize, Entry)> = None;
-        let mut g = start;
-        'groups: for step in 1..=MAX_PROBE {
-            let tags = self.tags[g].load(Ordering::Relaxed);
-            for i in 0..GROUP {
-                let slot = g * GROUP + i;
-                let tag = tag_at(tags, i);
-                if tag == TAG_EMPTY || tag == TAG_DELETED {
-                    free = Some((slot, None));
-                    break 'groups;
-                }
-                let raw = self.slots[slot].read_owned();
-                if raw.kind() < KIND_V4 {
-                    free = Some((slot, None));
-                    break 'groups;
-                }
-                let e = raw.entry();
-                if e.expired(now_secs) {
-                    free = Some((slot, Some(e)));
-                    break 'groups;
-                }
-                if e.evictable() && window_victim.is_none_or(|(_, v)| earlier(&e, &v)) {
-                    window_victim = Some((slot, e));
-                }
+        // The first reusable slot on the home probe path: empty, deleted, or
+        // expired; for an anchored key whose anchor's path is full, one on
+        // its own path (and the anchor's group is marked).
+        let (mut free, mut window_victim) = self.scan(s.home, now_secs);
+        if free.is_none() && s.anchored {
+            let (own_free, _) = self.scan(s.own, now_secs);
+            if own_free.is_some() {
+                self.mark_overflow(s.home);
+                free = own_free;
+                window_victim = None;
             }
-            g = self.next_group(g, step);
         }
 
         let (slot, removed, evicted) = match free {
@@ -562,6 +661,41 @@ impl Table {
         };
         self.store(slot, &entry, h2);
         Ok(Inserted::New { removed, evicted })
+    }
+
+    /// The first reusable slot on the probe path from `start`, and the
+    /// evictable entry with the earliest end seen on the way.
+    #[allow(clippy::type_complexity)]
+    fn scan(
+        &self,
+        start: usize,
+        now_secs: u64,
+    ) -> (Option<(usize, Option<Entry>)>, Option<(usize, Entry)>) {
+        let mut window_victim: Option<(usize, Entry)> = None;
+        let mut g = start;
+        for step in 1..=MAX_PROBE {
+            let tags = self.tags[g].load(Ordering::Relaxed);
+            for i in 0..GROUP {
+                let slot = g * GROUP + i;
+                let tag = tag_at(tags, i);
+                if tag == TAG_EMPTY || tag == TAG_DELETED {
+                    return (Some((slot, None)), window_victim);
+                }
+                let raw = self.slots[slot].read_owned();
+                if raw.kind() < KIND_V4 {
+                    return (Some((slot, None)), window_victim);
+                }
+                let e = raw.entry();
+                if e.expired(now_secs) {
+                    return (Some((slot, Some(e))), window_victim);
+                }
+                if e.evictable() && window_victim.is_none_or(|(_, v)| earlier(&e, &v)) {
+                    window_victim = Some((slot, e));
+                }
+            }
+            g = self.next_group(g, step);
+        }
+        (None, window_victim)
     }
 
     /// Frees one entry somewhere in the table (bounded scan from the clock
@@ -767,7 +901,7 @@ impl Tables {
             Err(NoRoom::ProbeBound) => {
                 let old = self.load();
                 let key = HashKey::new(w.rng.next_u64(), w.rng.next_u64());
-                let fresh = Table::new(old.capacity, key);
+                let fresh = Table::with_anchors(old.capacity, key, old.anchors);
                 let mut moved = TableWriter {
                     live: 0,
                     hand: 0,
