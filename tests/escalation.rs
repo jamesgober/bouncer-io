@@ -365,7 +365,10 @@ fn test_datagram_unverified_never_banned() {
     assert!(seen.bans.is_empty(), "{seen:?}");
     assert!(seen.admitted);
     assert!(b.explain(c("192.0.2.0/24")).bans.is_empty());
-    assert!(b.door(victim).is_ok(), "the victim's own connections still pass");
+    assert!(
+        b.door(victim).is_ok(),
+        "the victim's own connections still pass"
+    );
     assert_eq!(sink.count(signals::BAN_ADDED.id, Mode::Enforce), 0);
     assert_eq!(sink.count(signals::BAN_ADDED.id, Mode::Observe), 0);
 }

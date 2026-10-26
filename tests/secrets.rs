@@ -9,8 +9,8 @@ use std::{
 };
 
 use bouncer_io::{
-    Actor, BanKey, BanSpec, Bouncer, Budgets, Cidr, Event, EventSink, FingerprintKey, Filter,
-    Page, Reason, RequestId, SessionKey,
+    Actor, BanKey, BanSpec, Bouncer, Budgets, Cidr, Event, EventSink, Filter, FingerprintKey, Page,
+    Reason, RequestId, SessionKey,
 };
 
 const SESSION: [u8; 16] = [
@@ -74,7 +74,11 @@ fn test_debug_never_prints_key_bytes() {
     let mut shown = vec![
         format!("{session:?} {session}"),
         format!("{fp:?} {fp}"),
-        format!("{:?} {}", BanKey::Session(session), BanKey::Session(session)),
+        format!(
+            "{:?} {}",
+            BanKey::Session(session),
+            BanKey::Session(session)
+        ),
         format!(
             "{:?} {}",
             BanKey::FingerprintIn(fp, prefix),
@@ -106,7 +110,10 @@ fn test_debug_never_prints_key_bytes() {
 
     // What an operator reads back.
     shown.push(format!("{:?}", b.explain(session)));
-    shown.push(format!("{:?}", b.explain(BanKey::FingerprintIn(fp, prefix))));
+    shown.push(format!(
+        "{:?}",
+        b.explain(BanKey::FingerprintIn(fp, prefix))
+    ));
     shown.push(format!("{:?}", b.list(&Filter::all(), Page::first(100))));
     shown.push(format!("{b:?} {:?}", b.health()));
     let _ = b.maintain(b.now());

@@ -49,11 +49,7 @@ fn ks(a: &mut [f64], b: &mut [f64]) -> (f64, f64) {
 
 /// Times `run` over each class's inputs in interleaved batches; returns
 /// the batch means in nanoseconds per call.
-fn interleaved<T: Copy>(
-    a: &[T],
-    b: &[T],
-    mut run: impl FnMut(T, usize),
-) -> (Vec<f64>, Vec<f64>) {
+fn interleaved<T: Copy>(a: &[T], b: &[T], mut run: impl FnMut(T, usize)) -> (Vec<f64>, Vec<f64>) {
     let (mut ta, mut tb) = (Vec::with_capacity(BATCHES), Vec::with_capacity(BATCHES));
     let mut n = 0usize;
     let mut time = |inputs: &[T], k: usize, n: &mut usize| {
@@ -144,7 +140,9 @@ fn test_timing_admitted_does_not_reveal_neighbour_bans() {
         .count();
     // Control: admitted against banned differs, and the harness sees it.
     let (cd, ccritical, mb, ma) = door_case(&b, &banned, &clean);
-    println!("control, banned against admitted: D {cd:.4} (critical {ccritical:.4}); medians {mb:.1} / {ma:.1} ns");
+    println!(
+        "control, banned against admitted: D {cd:.4} (critical {ccritical:.4}); medians {mb:.1} / {ma:.1} ns"
+    );
     assert!(cd > ccritical, "the control must separate");
     assert!(
         separated < FAIL_AT,
@@ -181,7 +179,7 @@ fn test_timing_bind_does_not_reveal_near_banned_digests() {
         }
     }
     let conn = b.door("192.0.2.1".parse().unwrap()).unwrap();
-    let mut run = |a: &[SessionKey], c: &[SessionKey]| {
+    let run = |a: &[SessionKey], c: &[SessionKey]| {
         let (mut ta, mut tc) = interleaved(a, c, |key, n| {
             let mut req = conn.request(RequestId(n as u128 + 1)).unwrap();
             black_box(req.bind_session(key).is_pass());
