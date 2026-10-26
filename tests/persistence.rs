@@ -1,5 +1,5 @@
 //! Persistence (0.5): bans, lifts, and offender memory survive a restart.
-//! Threats T-15, T-16, T-19; edge cases 56 to 61.
+//! Threats T-15, T-16, T-19; edge cases 58, 59, 62, and 63.
 
 use std::{
     io::{BufRead, BufReader},
@@ -138,9 +138,20 @@ fn test_offences_survive_so_the_next_ban_is_longer() {
     );
 }
 
+/// Counts `persist.wall_jump` events.
+#[derive(Default)]
+struct Jumps(std::sync::atomic::AtomicU32);
+impl bouncer_io::EventSink for Jumps {
+    fn event(&self, e: &bouncer_io::Event<'_>) {
+        if e.signal == bouncer_io::signals::PERSIST_WALL_JUMP {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 #[test]
 fn test_wall_clock_steps_never_lengthen_and_strict_keeps() {
-    // T-19; edge cases 56 and 57.
+    // T-19; edge cases 58 and 59 (the jump is reported).
     for (step_back, strict, banned_after) in [
         (true, false, true),
         (false, false, false),
@@ -163,16 +174,23 @@ fn test_wall_clock_steps_never_lengthen_and_strict_keeps() {
         } else {
             clock.step_wall_forward(Duration::from_secs(86_400));
         }
+        let jumps = Arc::new(Jumps::default());
         let b = Bouncer::builder()
             .persistence(Box::new(store.clone()))
             .clock(clock.clone())
             .strict_wall_jump(strict)
+            .event_sink(jumps.clone())
             .try_build()
             .unwrap();
         assert_eq!(
             b.door(addr).is_err(),
             banned_after,
             "back {step_back} strict {strict}"
+        );
+        assert_eq!(
+            jumps.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a day's step is reported (back {step_back})"
         );
         if banned_after {
             let r = &b.explain(addr).bans[0];
@@ -187,7 +205,7 @@ fn test_wall_clock_steps_never_lengthen_and_strict_keeps() {
 
 #[test]
 fn test_snapshot_tampered_byte_refused() {
-    // T-15, edge case 61.
+    // T-15, edge case 63.
     let store = Shared::default();
     let clock = Arc::new(ManualClock::new());
     let key = [42u8; 32];
@@ -249,7 +267,7 @@ fn test_snapshot_tampered_byte_refused() {
 
 #[test]
 fn test_torn_journal_tail_and_damaged_middle() {
-    // Edge case 60 and the torn tail rule.
+    // The torn tail rule (edge case 62, a damaged middle, is in src/persist.rs).
     let store = Shared::default();
     let clock = Arc::new(ManualClock::new());
     {

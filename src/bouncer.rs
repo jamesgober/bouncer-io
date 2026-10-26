@@ -90,6 +90,8 @@ pub(crate) struct Shared {
     /// Counters of cold paths (bans, revocations, maintenance).
     #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
     pub(crate) meters: Meters,
+    /// Budgets of the sampled event signals.
+    pub(crate) samplers: crate::events::Samplers,
 }
 
 impl Shared {
@@ -1867,6 +1869,7 @@ impl BouncerBuilder {
                 .clone()
                 .unwrap_or_else(|| Arc::new(crate::format::NoFormat)),
             meters: Meters::new(),
+            samplers: crate::events::Samplers::default(),
         });
         let shards: Box<[Arc<Shard>]> = (0..shard_count)
             .map(|_| {
@@ -1930,6 +1933,48 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Bouncer>();
         assert_send_sync::<Ticket>();
+    }
+
+    #[test]
+    fn test_epoch_near_its_end_every_ticket_sees_each_change() {
+        // Edge case 34: the epoch starts at `u64::MAX - 2`; three
+        // revocations move it past the end. The epoch never takes the value
+        // that marks always-checking tickets, so a self-revoked ticket stays
+        // denied, and a normal ticket sees each change.
+        let epoch = Arc::new(RevocationEpoch::starting_at(u64::MAX - 2));
+        let b = Bouncer::builder()
+            .epoch(Arc::clone(&epoch))
+            .budgets(crate::Budgets::off())
+            .try_build()
+            .unwrap();
+        let conn = b.door("192.0.2.1".parse().unwrap()).unwrap();
+        let mut watched = conn.request(crate::RequestId(1)).unwrap();
+        let session = crate::SessionKey::from_digest([3; 16]);
+        assert!(watched.bind_session(session).is_pass());
+        let other = b.door("192.0.2.2".parse().unwrap()).unwrap();
+        let mut gone = other.request(crate::RequestId(2)).unwrap();
+        let _ = gone.deny_and_eject(&mut crate::Collected::new());
+        assert_eq!(
+            epoch.current(),
+            u64::MAX - 1,
+            "the self-revocation moved it"
+        );
+        let mut seen = Vec::new();
+        for i in 0..2u128 {
+            let _ = b.revoke(crate::AccountKey(100 + i), crate::Reason::ADMIN);
+            seen.push(epoch.current());
+            assert!(watched.checkpoint().is_pass(), "unrelated change {i}");
+            assert!(gone.checkpoint().is_deny(), "self-revoked stays denied");
+        }
+        let _ = b.revoke(session, crate::Reason::LOGOUT);
+        seen.push(epoch.current());
+        assert!(
+            watched.checkpoint().is_deny(),
+            "the third change is its own"
+        );
+        assert!(gone.checkpoint().is_deny());
+        assert!(!seen.contains(&u64::MAX), "{seen:?}");
+        assert_eq!(seen, [0, 1, 2], "u64::MAX is stepped over");
     }
 
     #[test]

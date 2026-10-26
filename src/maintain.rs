@@ -6,7 +6,7 @@
 
 use core::time::Duration;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, Weak},
 };
 
@@ -15,7 +15,7 @@ use crate::{
     directive::{Actor, Reason},
     events::{self, Emit},
     keys::ConnId,
-    registry::{F_LIVE, F_PENDING_CLIENT, F_REVOKED, KIND_CONNECTION, generation},
+    registry::{F_LIVE, F_PENDING_CLIENT, F_REVOKED, KIND_CONNECTION, KIND_REQUEST, generation},
     revoke::Target,
     sync::{AtomicU64, Ordering},
     ticket::{check_cell, mark_revoked, source_of, subject_of},
@@ -100,6 +100,10 @@ pub(crate) struct Maintenance {
     /// Epoch values sampled at maintenance runs, oldest first, to tell how
     /// long a ticket has gone without a checkpoint.
     samples: Mutex<VecDeque<(u64, Now)>>,
+    /// Proxied requests still waiting for their client, by (cell,
+    /// generation): when a run first saw them, and whether they were
+    /// reported (edge case 22, D-097).
+    pending: Mutex<HashMap<(u32, u32), (Now, bool)>>,
     sweep_requested: AtomicU64,
     thread: Mutex<Option<std::thread::Thread>>,
     stop: AtomicU64,
@@ -113,6 +117,7 @@ impl Maintenance {
     pub(crate) fn new(max_unchecked: Duration) -> Maintenance {
         Maintenance {
             samples: Mutex::new(VecDeque::new()),
+            pending: Mutex::new(HashMap::new()),
             sweep_requested: AtomicU64::new(0),
             thread: Mutex::new(None),
             stop: AtomicU64::new(0),
@@ -151,6 +156,15 @@ impl Maintenance {
         self.state.store(s, Ordering::Release);
     }
 
+    /// Whether a maintenance run already reported this pending request
+    /// (then its release reports nothing more).
+    pub(crate) fn reported_pending(&self, index: u32, gen_: u32) -> bool {
+        self.pending
+            .lock()
+            .map(|p| p.get(&(index, gen_)).is_some_and(|&(_, r)| r))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn request_sweep(&self) {
         self.sweep_requested.fetch_add(1, Ordering::AcqRel);
         self.wake();
@@ -176,6 +190,7 @@ pub(crate) fn run(shared: &Shared, now: Now) -> MaintenanceReport {
     if let Ok(n) = shared.persist_flush(now, false) {
         report.journal_written = n;
     }
+    report_unresolved(shared, now);
     let persist_due = shared.persist_due();
     if shared.revocations.is_empty() {
         if let Ok(mut s) = shared.maintenance.samples.lock() {
@@ -244,6 +259,40 @@ pub(crate) fn run(shared: &Shared, now: Now) -> MaintenanceReport {
         (a, b) => a.or(b),
     };
     report
+}
+
+/// Reports proxied requests whose adapter has not bound the real client
+/// `max_unchecked` after a run first saw them (the handshake deadline; such
+/// a request is denied at every checkpoint meanwhile). One scan of the
+/// registry per run; nothing on the hot path. A request released before a
+/// run reports it is reported at its release instead.
+fn report_unresolved(shared: &Shared, now: Now) {
+    let Ok(mut pending) = shared.maintenance.pending.lock() else {
+        return;
+    };
+    let max = u64::try_from(shared.maintenance.max_unchecked.as_nanos()).unwrap_or(u64::MAX);
+    let mut live = Vec::new();
+    for (index, cell) in shared.registry.cells.iter().enumerate() {
+        let st = cell.state.load(Ordering::Acquire);
+        if st & F_LIVE == 0 || st & 0xff != KIND_REQUEST || st & F_PENDING_CLIENT == 0 {
+            continue;
+        }
+        let key = (index as u32, generation(st));
+        live.push(key);
+        let entry = pending.entry(key).or_insert((now, false));
+        if !entry.1 && now.as_nanos().saturating_sub(entry.0.as_nanos()) >= max {
+            entry.1 = true;
+            Emit {
+                subject: subject_of(cell),
+                ..Emit::new(events::signals::DOOR_PROXY_HOP_UNRESOLVED)
+            }
+            .send(shared);
+        }
+    }
+    if pending.len() > live.len() {
+        live.sort_unstable();
+        pending.retain(|k, _| live.binary_search(k).is_ok());
+    }
 }
 
 /// Checks every live ticket now and ejects the denied connections. Returns

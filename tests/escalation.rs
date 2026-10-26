@@ -1,5 +1,5 @@
 //! Escalation, offender memory, shared addresses, datagrams (0.5).
-//! Threats T-2, T-3, T-4, T-5, T-25; edge cases 47 to 49, 51, 52, 54.
+//! Threats T-2, T-3, T-4, T-5, T-20, T-25; edge cases 49 to 51, 53, 54, 56.
 
 use std::{
     net::IpAddr,
@@ -82,7 +82,7 @@ fn test_escalation_ipv4_eight_hosts_bans_24() {
 
 #[test]
 fn test_escalation_four_64s_bans_56_then_48() {
-    // T-2 and edge case 49 (stops at the widest prefix).
+    // T-2 and edge case 51 (stops at the widest prefix).
     let b = Bouncer::new();
     for s in 0..4u16 {
         for h in 0..4u16 {
@@ -114,7 +114,7 @@ fn test_escalation_four_64s_bans_56_then_48() {
 
 #[test]
 fn test_escalation_blocked_by_allow_list_and_proxy_and_shared() {
-    // Edge case 48, T-25.
+    // Edge case 50, T-25.
     let sink = Arc::new(Sink::default());
     let b = Bouncer::builder()
         .allow(AllowList::new().immune(c("198.51.100.250/32"), "partner"))
@@ -141,7 +141,7 @@ fn test_escalation_blocked_by_allow_list_and_proxy_and_shared() {
 
 #[test]
 fn test_escalation_per_parent_quota_forces_escalation() {
-    // Edge case 47.
+    // Edge case 49.
     let b = Bouncer::builder()
         .escalation(
             EscalationPolicy::default()
@@ -160,7 +160,7 @@ fn test_escalation_per_parent_quota_forces_escalation() {
 
 #[test]
 fn test_lift_of_parent_does_not_resurrect_children() {
-    // Edge case 51.
+    // Edge case 53.
     let b = Bouncer::new();
     for i in 1..=8u8 {
         b.ban(local(IpAddr::from([198, 51, 100, i]))).unwrap();
@@ -218,7 +218,7 @@ fn test_escalation_flood_keeps_table_bounded() {
 
 #[test]
 fn test_offender_memory_lengthens_and_decays() {
-    // Edge case 52: durations follow the decayed offences.
+    // Edge case 54: durations follow the decayed offences.
     let clock = Arc::new(ManualClock::new());
     let b = Bouncer::builder()
         .clock(clock.clone())

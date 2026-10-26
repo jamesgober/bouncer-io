@@ -1,5 +1,5 @@
 //! Sharing across nodes (0.5): deltas converge under every order and
-//! repetition. Threats T-17, T-27; edge cases 62 to 64.
+//! repetition. Threats T-17, T-27; edge cases 64 to 68.
 
 use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
 
@@ -120,6 +120,7 @@ fn heap(a: &mut Vec<usize>, k: usize, out: &mut Vec<Vec<usize>>) {
 
 #[test]
 fn test_revocation_on_one_node_stops_a_request_on_another() {
+    // Edge case 68.
     let clock = Arc::new(ManualClock::new());
     let a = node(1, &clock);
     let b = node(2, &clock);
@@ -137,7 +138,7 @@ fn test_revocation_on_one_node_stops_a_request_on_another() {
 
 #[test]
 fn test_duplicate_and_future_format_deltas() {
-    // Edge cases 62 and 63.
+    // Edge cases 64 and 65.
     let clock = Arc::new(ManualClock::new());
     let a = node(1, &clock);
     let b = node(2, &clock);
@@ -169,7 +170,7 @@ fn test_duplicate_and_future_format_deltas() {
 
 #[test]
 fn test_lift_older_than_a_local_ban_leaves_it() {
-    // Edge case 64.
+    // Edge case 66.
     let clock = Arc::new(ManualClock::new());
     let a = node(1, &clock);
     let b = node(2, &clock);
@@ -218,6 +219,55 @@ fn test_import_cannot_touch_allowlist_and_foreign_lifts_refused() {
         c.door(ip("192.0.2.99")).is_err(),
         "node 1 cannot lift node 2's ban"
     );
+}
+
+#[derive(Default)]
+struct Rejected(std::sync::atomic::AtomicU32);
+impl bouncer_io::EventSink for Rejected {
+    fn event(&self, e: &bouncer_io::Event<'_>) {
+        if e.signal == bouncer_io::signals::IMPORT_REJECTED {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[test]
+fn test_delta_past_the_skew_bound_refused_with_an_event() {
+    // Edge case 67: each record stamped past `max_clock_skew` is refused
+    // (`ClockSkew`) and reported; the rest of the delta applies.
+    let clock = Arc::new(ManualClock::new());
+    let ahead = Arc::new(ManualClock::new());
+    ahead.step_wall_forward(Duration::from_secs(600));
+    let rejected = Arc::new(Rejected::default());
+    let b = Bouncer::builder()
+        .node(NodeId(2))
+        .clock(clock.clone())
+        .event_sink(rejected.clone())
+        .budgets(Budgets::off())
+        .try_build()
+        .unwrap();
+    let c = node(3, &ahead);
+    c.ban(ip("198.51.100.67")).unwrap();
+    let report = b
+        .import(&c.export_delta(Sequence::START).unwrap(), Actor::Channel(3))
+        .unwrap();
+    assert!(report.rejected >= 1, "{report:?}");
+    assert_eq!(
+        u64::from(rejected.0.load(std::sync::atomic::Ordering::SeqCst)),
+        u64::from(report.rejected),
+        "one event per refused record"
+    );
+    assert!(b.door(ip("198.51.100.67")).is_ok());
+    // Five minutes ahead is the bound: four are accepted.
+    let near = Arc::new(ManualClock::new());
+    near.step_wall_forward(Duration::from_secs(240));
+    let d = node(4, &near);
+    d.ban(ip("198.51.100.68")).unwrap();
+    let report = b
+        .import(&d.export_delta(Sequence::START).unwrap(), Actor::Channel(4))
+        .unwrap();
+    assert_eq!(report.rejected, 0, "{report:?}");
+    assert!(b.door(ip("198.51.100.68")).is_err());
 }
 
 #[test]

@@ -96,15 +96,46 @@ impl RevocationEpoch {
     /// Moves the epoch so every live ticket re-checks at its next checkpoint,
     /// and returns the new value. The fence pairs with the sequentially
     /// consistent load of the before-commit checkpoint and with binds.
+    ///
+    /// The epoch never takes the value `u64::MAX`, which marks tickets that
+    /// take the slow path at every checkpoint: after `u64::MAX - 1` it moves
+    /// to 0 (edge case 34; a real wrap needs 2^64 moves).
     pub(crate) fn bump(&self) -> u64 {
-        let v = self.value.fetch_add(1, Ordering::Release).wrapping_add(1);
+        let mut cur = self.value.load(Ordering::Relaxed);
+        let v = loop {
+            let next = after(cur);
+            match self
+                .value
+                .compare_exchange_weak(cur, next, Ordering::Release, Ordering::Relaxed)
+            {
+                Ok(_) => break next,
+                Err(actual) => cur = actual,
+            }
+        };
         fence(Ordering::SeqCst);
         v
     }
 
     /// The next value a bump will produce (the birth of a new revocation).
     pub(crate) fn next(&self) -> u64 {
-        self.value.load(Ordering::Acquire).wrapping_add(1)
+        after(self.value.load(Ordering::Acquire))
+    }
+
+    /// An epoch starting at `value` (tests of the wrap).
+    #[cfg(all(test, not(bouncer_loom)))]
+    pub(crate) fn starting_at(value: u64) -> RevocationEpoch {
+        RevocationEpoch {
+            value: AtomicU64::new(value),
+        }
+    }
+}
+
+/// The epoch after `v`, stepping over `u64::MAX`.
+#[inline]
+const fn after(v: u64) -> u64 {
+    match v.wrapping_add(1) {
+        u64::MAX => 0,
+        n => n,
     }
 }
 

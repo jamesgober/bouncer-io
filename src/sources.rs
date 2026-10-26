@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_many_identities_flag_an_address_then_expire() {
-        // Edge case 54: set and expired.
+        // Edge case 56: set and expired.
         let s = Sources::new(64, HashKey::new(7, 8));
         let a: IpAddr = "198.51.100.1".parse().unwrap();
         let mut flagged = false;

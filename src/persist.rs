@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_truncated_anywhere_is_refused() {
-        // Edge case 59.
+        // Edge case 61.
         let key = Key([7; 32]);
         let recs: Vec<Envelope> = (0..3).map(rec).collect();
         for k in [None, Some(&key)] {
@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_mac_rules() {
-        // Edge case 61, and the downgrade the other way.
+        // Edge case 63, and the downgrade the other way.
         let key = Key([7; 32]);
         let other = Key([8; 32]);
         let (mac_d, _) = encode_snapshot(&header(), &[rec(1)], Some(&key));
@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn test_journal_replay_stops_at_damage_and_skips_old_epochs() {
-        // Edge case 60, and the torn tail.
+        // Edge case 62, and the torn tail.
         let key = Key([7; 32]);
         for k in [None, Some(&key)] {
             let chain0 = [1u8; 32];

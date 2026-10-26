@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_offences_decay_by_half_life() {
-        // Edge case 52: after 1, 2, and 10 half-lives.
+        // Edge case 54: after 1, 2, and 10 half-lives.
         let mut o = Offenders::new(16, 100);
         for _ in 0..4 {
             o.record(k(1), 0);

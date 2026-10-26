@@ -343,6 +343,16 @@ impl Emit<'_> {
         let Some(sink) = shared.sink.as_ref() else {
             return;
         };
+        // Signals that can fire once per packet under a flood are sampled:
+        // the sink sees at most `SAMPLED_PER_SECOND` of each a second, and
+        // each carries how many occurrences it stands for.
+        let mut count = self.count;
+        if let Some(sampler) = shared.samplers.get(self.signal) {
+            match sampler.admit(shared.now().secs()) {
+                Some(skipped) => count = count.max(1).saturating_add(skipped),
+                None => return,
+            }
+        }
         let (evidence, truncated) = bounded(self.evidence);
         let event = Event {
             signal: self.signal,
@@ -356,12 +366,66 @@ impl Emit<'_> {
             reason: self.reason,
             subject: self.subject,
             reference: self.reference,
-            count: self.count,
+            count,
             mode: self.mode,
             evidence,
             truncated,
         };
         sink.event(&event);
+    }
+}
+
+/// Sampled events a sink sees per signal per second, at most.
+pub(crate) const SAMPLED_PER_SECOND: u32 = 100;
+
+/// One sampled signal's budget for the current second.
+#[derive(Default)]
+pub(crate) struct Sampler {
+    window: core::sync::atomic::AtomicU64,
+    used: core::sync::atomic::AtomicU32,
+    skipped: core::sync::atomic::AtomicU32,
+}
+
+impl Sampler {
+    /// `Some(skipped since the last one)` when this occurrence is delivered;
+    /// `None` when it is counted into a later one. Approximate under races
+    /// (a few over the budget at a second's turn), never blocking.
+    fn admit(&self, secs: u64) -> Option<u32> {
+        use core::sync::atomic::Ordering::Relaxed;
+        let w = self.window.load(Relaxed);
+        if w != secs
+            && self
+                .window
+                .compare_exchange(w, secs, Relaxed, Relaxed)
+                .is_ok()
+        {
+            self.used.store(0, Relaxed);
+        }
+        if self.used.fetch_add(1, Relaxed) < SAMPLED_PER_SECOND {
+            Some(self.skipped.swap(0, Relaxed))
+        } else {
+            self.skipped.fetch_add(1, Relaxed);
+            None
+        }
+    }
+}
+
+/// The samplers of the sampled signals: door refusals (ban, budget,
+/// registry full), identity budget refusals, and expiries.
+#[derive(Default)]
+pub(crate) struct Samplers([Sampler; 5]);
+
+impl Samplers {
+    fn get(&self, signal: SignalId) -> Option<&Sampler> {
+        let i = match signal.id {
+            1 => 0,
+            2 => 1,
+            3 => 2,
+            5 => 3,
+            23 => 4,
+            _ => return None,
+        };
+        Some(&self.0[i])
     }
 }
 

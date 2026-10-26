@@ -143,8 +143,13 @@ fn test_revoke_deny_with_not_found() {
 
 #[test]
 fn test_revoke_twice_one_entry_strongest_code() {
-    // Edge case 33.
-    let b = plain();
+    // Edge case 33: idempotent, two events, one entry.
+    let events = Arc::new(Events::default());
+    let b = Bouncer::builder()
+        .budgets(Budgets::off())
+        .event_sink(events.clone())
+        .try_build()
+        .unwrap();
     let conn = b.door(ip("192.0.2.1")).unwrap();
     let mut r = conn.request(RequestId(1)).unwrap();
     b.apply(Directive::revoke(RequestId(1)).deny_with(DenialCode::NotFound))
@@ -152,6 +157,7 @@ fn test_revoke_twice_one_entry_strongest_code() {
     b.apply(Directive::revoke(RequestId(1)).deny_with(DenialCode::Forbidden))
         .unwrap();
     assert_eq!(denied(r.checkpoint()), Some(DenialCode::Forbidden));
+    assert_eq!(events.count(signals::REVOKE_APPLIED.id), 2, "two events");
     drop(r);
     drop(conn);
     assert_eq!(
@@ -163,11 +169,22 @@ fn test_revoke_twice_one_entry_strongest_code() {
 
 #[test]
 fn test_revoke_never_issued_connection_reclaimed() {
-    // Edge case 32.
+    // Edge case 32: a connection id never issued, and one already
+    // released: a receipt, nothing matched, the entries cleaned up.
     let b = plain();
     let receipt = b.revoke(ConnId(123_456), Reason::ADMIN).unwrap();
     assert!(receipt.epoch > 0);
     let mut live = b.door(ip("192.0.2.1")).unwrap();
+    assert!(live.checkpoint().is_pass());
+    assert_eq!(b.maintain(b.now()).reclaimed, 1);
+    let gone = b.door(ip("192.0.2.2")).unwrap();
+    let gone_id = gone.conn();
+    drop(gone);
+    let receipt = b.revoke(gone_id, Reason::ADMIN).unwrap();
+    assert!(receipt.epoch > 0);
+    let mut next = b.door(ip("192.0.2.2")).unwrap();
+    assert_ne!(next.conn(), gone_id);
+    assert!(next.checkpoint().is_pass(), "a new connection is not hit");
     assert!(live.checkpoint().is_pass());
     assert_eq!(b.maintain(b.now()).reclaimed, 1);
 }
@@ -577,7 +594,7 @@ fn test_maintainer_thread_parks_and_cleans_up() {
 
 #[test]
 fn test_connection_dropped_with_live_request_after_revocation() {
-    // Edge case 39-style: counts and state stay consistent.
+    // Counts and state stay consistent (edge case 39 is in tests/posture.rs).
     let b = plain();
     let conn = b.door(ip("192.0.2.1")).unwrap();
     let mut req = conn.request(RequestId(1)).unwrap();
@@ -882,4 +899,48 @@ fn test_shared_epoch_word() {
     let before = epoch.current();
     b.revoke(AccountKey(1), Reason::ADMIN).unwrap();
     assert_eq!(epoch.current(), before + 1);
+}
+
+#[test]
+fn test_strike_ban_into_a_full_table_still_denies_and_ejects() {
+    // Edge case 48: the table holds only permanent bans; a strike's ban
+    // fails with `BanTableFull` and an event, and the striking connection is
+    // still denied and ejected.
+    let events = Arc::new(Events::default());
+    let kills = Arc::new(Kills::default());
+    let b = Bouncer::builder()
+        .budgets(Budgets::off())
+        .ban_capacity(64)
+        .enforcement(Enforcement::enforce_all())
+        .event_sink(events.clone())
+        .ejector(kills.clone())
+        .try_build()
+        .unwrap();
+    let mut full = false;
+    for i in 0..10_000u32 {
+        let a = IpAddr::from((0x0a00_0000 + (i << 8)).to_be_bytes());
+        if matches!(
+            b.ban(BanSpec::address(a).permanent()),
+            Err(BouncerError::BanTableFull { .. })
+        ) {
+            full = true;
+            break;
+        }
+    }
+    assert!(full, "the table filled with permanent bans");
+    let before = events.count(signals::BAN_TABLE_FULL.id);
+    let mut conn = b.door(ip("203.0.113.48")).unwrap();
+    let outcomes: Vec<_> = (0..10)
+        .map(|_| conn.strike(StrikeKind::Malformed))
+        .collect();
+    assert!(
+        outcomes.contains(&StrikeOutcome::RevokedNotBanned),
+        "{outcomes:?}"
+    );
+    assert!(events.count(signals::BAN_TABLE_FULL.id) > before);
+    assert!(conn.checkpoint().is_deny(), "denied without the ban");
+    let id = conn.conn();
+    let out = conn.deny_and_eject(&mut bouncer_io::Collected::new());
+    assert!(out.ejected && !out.remembered);
+    assert!(kills.0.lock().unwrap().contains(&id), "and ejected");
 }

@@ -1,4 +1,4 @@
-//! Administration: explain, list, replace_allow, health (0.5). Edge case 50.
+//! Administration: explain, list, replace_allow, health (0.5). Edge case 52.
 
 use std::{
     net::IpAddr,
@@ -69,7 +69,7 @@ fn test_explain_address_shows_every_covering_ban_and_state() {
     assert!(client.retry_after.is_some());
     assert!(why.to_string().contains("door.rate.client spent"), "{why}");
     drop((conn, second));
-    // Edge case 50: a child ban and its parent; lift the child, the parent stands.
+    // Edge case 52: a child ban and its parent; lift the child, the parent stands.
     b.ban(addr).unwrap();
     b.ban(
         BanSpec::prefix(c("203.0.113.0/24"))
