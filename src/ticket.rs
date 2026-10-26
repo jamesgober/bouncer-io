@@ -25,9 +25,10 @@ use crate::{
     registry::{
         CHILD_MASK, CODE_SHIFT, Cell, F_CANCELLED, F_CHARGED, F_CLIENT_BOUND, F_DETACHED, F_IMMUNE,
         F_KEEP_CONNECTION, F_LIVE, F_PENDING_CLIENT, F_PROXY_HOP, F_REVOKED, F_TENANT_CHARGED,
-        K_ACCOUNT, K_FINGERPRINT, K_REQUEST, K_SESSION, K_SOURCE, K_TENANT, KIND_CONNECTION,
-        KIND_REQUEST, NIL, P_ACCOUNT, P_FINGERPRINT, P_REQUEST, P_SESSION, P_SOURCE, P_SOURCE_V6,
-        P_TENANT, PRESENT_SHIFT, PROVENANCE_MASK, PROVENANCE_SHIFT, Shard, generation,
+        K_ACCOUNT, K_FINGERPRINT, K_LATEST, K_REQUEST, K_SESSION, K_SOURCE, K_TENANT,
+        KIND_CONNECTION, KIND_REQUEST, NIL, P_ACCOUNT, P_FINGERPRINT, P_REQUEST, P_SESSION,
+        P_SOURCE, P_SOURCE_V6, P_TENANT, PRESENT_SHIFT, PROVENANCE_MASK, PROVENANCE_SHIFT, Shard,
+        generation,
     },
     sync::{Ordering, fence, update},
     verdict::{Denial, DenialCode, Reference, Verdict},
@@ -229,7 +230,9 @@ pub struct Ticket {
 pub(crate) struct Issue {
     pub(crate) kind: TicketKind,
     pub(crate) flags: u64,
-    pub(crate) conn: u64,
+    /// The connection id; `None` lets the cell's index and generation make
+    /// one (unique without a shared counter).
+    pub(crate) conn: Option<u64>,
     pub(crate) source: Option<IpAddr>,
     pub(crate) request: Option<RequestId>,
     pub(crate) parent: Option<(u32, u32)>,
@@ -243,15 +246,21 @@ impl Ticket {
         let index = shared.registry.pop_from(first_shard)?;
         let cell = shared.registry.cell(index);
         let gen_ = generation(cell.state.load(Ordering::Relaxed));
-        cell.conn.store(issue.conn, Ordering::Relaxed);
+        let conn = issue
+            .conn
+            .unwrap_or((1u64 << 63) | (u64::from(gen_) << 24) | u64::from(index));
+        cell.conn.store(conn, Ordering::Relaxed);
         let mut present = 0u64;
         if let Some(src) = issue.source {
             present |= write_source(cell, src);
         }
-        if let Some(r) = issue.request {
-            cell.keys[K_REQUEST].store((r.0 >> 64) as u64, Ordering::Relaxed);
-            cell.keys[K_REQUEST + 1].store(r.0 as u64, Ordering::Relaxed);
-            present |= P_REQUEST;
+        match issue.request {
+            Some(r) => {
+                cell.keys[K_REQUEST].store((r.0 >> 64) as u64, Ordering::Relaxed);
+                cell.keys[K_REQUEST + 1].store(r.0 as u64, Ordering::Relaxed);
+                present |= P_REQUEST;
+            }
+            None => cell.keys[K_LATEST].store(u64::from(NIL), Ordering::Relaxed),
         }
         let (kind_bits, link) = match (issue.kind, issue.parent) {
             (TicketKind::Request, Some((pi, pg))) => {
@@ -1236,7 +1245,7 @@ pub(crate) fn issue_request(
         Issue {
             kind: TicketKind::Request,
             flags,
-            conn: pcell.conn.load(Ordering::Relaxed),
+            conn: Some(pcell.conn.load(Ordering::Relaxed)),
             source,
             request: Some(id),
             parent: Some((parent, parent_gen)),
@@ -1244,14 +1253,9 @@ pub(crate) fn issue_request(
     );
     match issued {
         Some(t) => {
-            // The connection's latest request, followed by the egress check.
-            let child = u64::from(t.index);
-            let _ = update(
-                &pcell.present_child,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |w| Some((w & !CHILD_MASK) | child),
-            );
+            // The connection's latest request, followed by the egress check:
+            // a plain store, published after the child's state.
+            pcell.keys[K_LATEST].store(u64::from(t.index), Ordering::Release);
             Ok(t)
         }
         None => {
@@ -1419,7 +1423,9 @@ fn latest_child(
     if st & 0xff != KIND_CONNECTION {
         return None;
     }
-    let ci = (cell.present_child.load(Ordering::Acquire) & CHILD_MASK) as u32;
+    // A stale index is harmless: the child must be a live request of this
+    // connection's generation.
+    let ci = cell.keys[K_LATEST].load(Ordering::Acquire) as u32;
     if ci == NIL || ci as usize >= shared.registry.cells.len() {
         return None;
     }
@@ -1446,7 +1452,8 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
     let Ok(st) = taken else {
         return false;
     };
-    let present_child = cell.present_child.swap(CHILD_MASK, Ordering::AcqRel);
+    // The cell is ours now; the next issue overwrites this word.
+    let present_child = cell.present_child.load(Ordering::Acquire);
     match TicketKind::from_state(st) {
         TicketKind::Connection => {
             let old = cell.link.swap(u64::from(next_gen) << 32, Ordering::AcqRel);
@@ -1475,15 +1482,9 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
                 }
                 .send(shared);
             }
+            // The connection may still name it as its latest request; the
+            // egress check sees it is no longer live.
             uncount_child(shared, pi, pg);
-            // Forget it as the connection's latest request.
-            let me = u64::from(index);
-            let _ = update(
-                &shared.registry.cell(pi).present_child,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |w| (w & CHILD_MASK == me).then_some(w | CHILD_MASK),
-            );
         }
     }
     if st & F_TENANT_CHARGED != 0 {

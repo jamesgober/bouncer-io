@@ -49,12 +49,15 @@ pub(crate) const P_ACCOUNT: u64 = 1 << 4;
 pub(crate) const P_TENANT: u64 = 1 << 5;
 pub(crate) const P_FINGERPRINT: u64 = 1 << 6;
 pub(crate) const PRESENT_SHIFT: u32 = 56;
-/// Low bits of `present_child`: a connection's latest live request, or [`NIL`].
+/// Low bits of `present_child` (unused; the latest request is in `K_LATEST`).
 pub(crate) const CHILD_MASK: u64 = 0xffff_ffff;
 
 /// Key word positions.
 pub(crate) const K_SOURCE: usize = 0;
 pub(crate) const K_REQUEST: usize = 2;
+/// A connection cell's latest request index, or [`NIL`]: the request key
+/// words, which a connection never uses. Written with a plain store.
+pub(crate) const K_LATEST: usize = K_REQUEST;
 pub(crate) const K_SESSION: usize = 4;
 pub(crate) const K_ACCOUNT: usize = 6;
 pub(crate) const K_TENANT: usize = 8;
@@ -173,7 +176,6 @@ impl FreeList {
 pub(crate) struct Registry {
     pub(crate) cells: Box<[Cell]>,
     pub(crate) free: Box<[FreeList]>,
-    pub(crate) next_conn: Box<[AtomicU64]>,
     per_shard: u32,
 }
 
@@ -188,7 +190,6 @@ impl Registry {
             free: (0..shards)
                 .map(|s| FreeList::range(s * per_shard, per_shard))
                 .collect(),
-            next_conn: (0..shards).map(|_| AtomicU64::new(0)).collect(),
             per_shard,
         }
     }
@@ -223,7 +224,6 @@ impl Registry {
 /// A shard handle. Tickets hold one through an `Arc`, so reference-count
 /// traffic is spread over shards instead of one shared line.
 pub(crate) struct Shard {
-    pub(crate) id: u8,
     pub(crate) epoch: Arc<Epoch>,
     pub(crate) shared: Arc<crate::bouncer::Shared>,
     #[cfg_attr(not(feature = "metrics"), allow(dead_code))]

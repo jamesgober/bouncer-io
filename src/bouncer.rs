@@ -37,7 +37,7 @@ use crate::{
 
 /// Most tickets a bouncer holds: the cell index has 24 bits per shard.
 const MAX_TICKETS: u32 = 1 << 24;
-/// Most shards: the shard id has 8 bits.
+/// Most shards.
 const MAX_SHARDS: u16 = 256;
 /// Most ban entries.
 const MAX_BAN_CAPACITY: u32 = 1 << 26;
@@ -522,37 +522,38 @@ impl Bouncer {
     ) -> Result<Ticket, Refusal> {
         let shared = &self.inner.shared;
         let peer = normalize(peer);
-        let (mut flags, source, charge) = match shared.judge(peer, provenance, now) {
-            Judgement::Admit { immune, exempt } => {
-                (if immune { F_IMMUNE } else { 0 }, Some(peer), !exempt)
-            }
-            Judgement::ProxyHop => (F_PROXY_HOP, None, false),
-            Judgement::Refuse(r) => {
-                self.report_refusal(r, peer);
-                return Err(r);
-            }
-        };
+        let mut hashes = crate::bans::AddrHashes::new(shared.bans.hasher(), peer);
+        let (mut flags, source, charge) =
+            match shared.judge_hashed(peer, provenance, now, &mut hashes) {
+                Judgement::Admit { immune, exempt } => {
+                    (if immune { F_IMMUNE } else { 0 }, Some(peer), !exempt)
+                }
+                Judgement::ProxyHop => (F_PROXY_HOP, None, false),
+                Judgement::Refuse(r) => {
+                    self.report_refusal(r, peer);
+                    return Err(r);
+                }
+            };
         if charge {
-            if let Err(over) = shared.budgets.admit(peer, now, shared.door_divisor()) {
+            if let Err(over) = shared
+                .budgets
+                .admit_hashed(&mut hashes, now, shared.door_divisor())
+            {
                 let r = Refusal::OverBudget {
                     retry_after: over.0,
                 };
                 self.report_refusal(r, peer);
                 return Err(r);
             }
-            flags |= F_CHARGED;
+            if shared.budgets.has_concurrency() {
+                flags |= F_CHARGED;
+            }
         }
         flags |= provenance.code() << crate::registry::PROVENANCE_SHIFT;
         let shards = &self.inner.shards;
         let first = shard_hint() as usize & (shards.len() - 1);
         let shard = &shards[first];
-        let id = match conn {
-            Some(c) => c.0,
-            None => {
-                let k = shared.registry.next_conn[first].fetch_add(1, Ordering::Relaxed);
-                (1u64 << 63) | ((k & ((1u64 << 55) - 1)) << 8) | u64::from(shard.id)
-            }
-        };
+        let id = conn.map(|c| c.0);
         let issued = Ticket::issue(
             shard,
             first,
@@ -1763,7 +1764,9 @@ impl BouncerBuilder {
             .unwrap_or_else(|| Arc::new(RevocationEpoch::new()));
         let mut rng = crate::hash::Rng::from_seed(seeds.rng ^ 0x0b0b);
         let derived = |rng: &mut crate::hash::Rng| HashKey::new(rng.next_u64(), rng.next_u64());
-        let budgets = DoorBudgets::new(&self.budgets, derived(&mut rng));
+        // The table's key: one keyed hash of a prefix serves the ban lookup
+        // and the door budgets.
+        let budgets = DoorBudgets::new(&self.budgets, seeds.tables);
         let identity = IdentityBudgets::new(&self.budgets, derived(&mut rng), Now::default());
         let revocation_rate =
             rate_net::Quota::rate(self.revocation_rate_limit, Duration::from_secs(1))
@@ -1821,9 +1824,8 @@ impl BouncerBuilder {
             meters: Meters::new(),
         });
         let shards: Box<[Arc<Shard>]> = (0..shard_count)
-            .map(|i| {
+            .map(|_| {
                 Arc::new(Shard {
-                    id: i as u8,
                     epoch: Arc::clone(&epoch),
                     shared: Arc::clone(&shared),
                     meters: Meters::new(),

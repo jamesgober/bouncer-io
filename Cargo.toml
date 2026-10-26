@@ -92,6 +92,10 @@ harness = false
 name    = "comparison"
 harness = false
 
+[[bench]]
+name    = "perf"
+harness = false
+
 
 # LINTS
 # #################################

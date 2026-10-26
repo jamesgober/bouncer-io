@@ -7,7 +7,16 @@
 
 use std::net::IpAddr;
 
-use bouncer_io::{BanSpec, Bouncer, Budgets, Cidr};
+use bouncer_io::{AllowList, BanSpec, Bouncer, Budgets, Cidr};
+
+/// The allow list both sides of a comparison hold (immune entries).
+pub const ALLOW: [&str; 2] = ["198.18.0.0/15", "fd00::/8"];
+/// The trusted proxies both sides hold.
+pub const PROXIES: [&str; 2] = ["10.0.0.0/8", "fd12::/16"];
+
+pub fn cidrs(list: &[&str]) -> Vec<Cidr> {
+    list.iter().map(|s| s.parse().unwrap()).collect()
+}
 
 pub fn v6(bits: u128) -> IpAddr {
     IpAddr::V6(std::net::Ipv6Addr::from(bits))
@@ -41,10 +50,21 @@ pub fn fixture() -> Fixture {
 
 /// The fixture with the given budgets.
 pub fn fixture_with(budgets: Budgets) -> Fixture {
+    build(budgets, 10_000)
+}
+
+/// The fixture with the given budgets and number of administrator prefixes.
+pub fn build(budgets: Budgets, admin_prefixes: usize) -> Fixture {
     let bouncer = Bouncer::builder()
         .ban_capacity(1_100_000)
         .tickets(4096)
         .budgets(budgets)
+        .allow(
+            cidrs(&ALLOW)
+                .into_iter()
+                .fold(AllowList::new(), |l, c| l.immune(c, "bench")),
+        )
+        .trusted_proxies(&cidrs(&PROXIES))
         .escalation(bouncer_io::EscalationPolicy::default().off())
         .seed([9; 32])
         .try_build()
@@ -76,7 +96,7 @@ pub fn fixture_with(budgets: Budgets) -> Fixture {
         }
     }
     let mut admin = 0;
-    while admin < 10_000 {
+    while admin < admin_prefixes {
         let r = m.next();
         let cidr = if r % 2 == 0 {
             let len = 8 + (r >> 8) as u8 % 23; // 8..=30, skipping /24

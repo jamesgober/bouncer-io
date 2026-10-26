@@ -454,20 +454,26 @@ impl DoorBudgets {
     /// The two keys of an address: the client (IPv4 /32, IPv6 /64) and its
     /// prefix (IPv4 /24, IPv6 /48).
     fn keys(&self, addr: IpAddr) -> [u64; 2] {
-        let host = Cidr::host(addr);
-        let (client, prefix) = match host.family() {
+        self.keys_hashed(&mut crate::bans::AddrHashes::new(self.key, addr))
+    }
+
+    /// The two keys through the door's hash cache: the same keyed hash as
+    /// the ban table's (`key` is the table's), so each is computed once.
+    #[inline]
+    fn keys_hashed(&self, hashes: &mut crate::bans::AddrHashes) -> [u64; 2] {
+        let (client, prefix) = match hashes.host().family() {
             Family::V4 => (32, 24),
             Family::V6 => (64, 48),
         };
-        let k = |len: u8| {
-            let p = host.parent(len).unwrap_or(host);
-            let meta = u64::from(len) | (u64::from(host.family() == Family::V6) << 8);
-            Claims::key(
-                self.key
-                    .hash3(meta, (p.bits() >> 64) as u64, p.bits() as u64),
-            )
-        };
-        [k(client), k(prefix)]
+        [
+            Claims::key(hashes.get(client)),
+            Claims::key(hashes.get(prefix)),
+        ]
+    }
+
+    /// Whether admissions hold concurrency slots (returned on release).
+    pub(crate) fn has_concurrency(&self) -> bool {
+        self.concurrency.is_some()
     }
 
     /// The throttle factor in force for a key now (1 when none).
@@ -485,11 +491,10 @@ impl DoorBudgets {
 
     /// Sets a throttle on the client or prefix key of `cidr`.
     pub(crate) fn throttle(&self, cidr: &Cidr, factor: u8, until_secs: u64, now_secs: u64) -> bool {
-        let meta = u64::from(cidr.len()) | (u64::from(cidr.family() == Family::V6) << 8);
-        let key = Claims::key(
-            self.key
-                .hash3(meta, (cidr.bits() >> 64) as u64, cidr.bits() as u64),
-        );
+        let key = Claims::key(crate::bans::table::hash_key(
+            &self.key,
+            &crate::bans::BanMemory::prefix_key(cidr),
+        ));
         self.throttles.set(key, factor, until_secs, now_secs)
     }
 
@@ -500,7 +505,26 @@ impl DoorBudgets {
     /// that many tokens and the concurrency limits shrink by it.
     #[inline]
     pub(crate) fn admit(&self, addr: IpAddr, now: Now, divisor: u32) -> Result<(), OverBudget> {
-        let keys = self.keys(addr);
+        self.admit_hashed(
+            &mut crate::bans::AddrHashes::new(self.key, addr),
+            now,
+            divisor,
+        )
+    }
+
+    /// As [`admit`](Self::admit), through the door's hash cache. Nothing is
+    /// hashed when no door budget is configured.
+    #[inline]
+    pub(crate) fn admit_hashed(
+        &self,
+        hashes: &mut crate::bans::AddrHashes,
+        now: Now,
+        divisor: u32,
+    ) -> Result<(), OverBudget> {
+        if self.rate.is_none() && self.concurrency.is_none() {
+            return Ok(());
+        }
+        let keys = self.keys_hashed(hashes);
         let now_d = Duration::from_nanos(now.as_nanos());
         let now_secs = now.secs();
         if let Some(tiers) = &self.rate {
