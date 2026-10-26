@@ -18,6 +18,7 @@
 ### Added
 
 - Tests for threats T-1 (a peer that is not a trusted proxy cannot name a client), T-7 (a stream cut by revocation leaks at most the chunk in flight), T-18 (no printable value or event carries digest bytes), and T-20 (unverified datagram sources are never banned). Every test named in the threat table now exists under that name.
+- The full T-6 stress run uses 32 threads, as the threat table states (10^8 checkpoints with concurrent revocations; no missed revocation).
 - Timing tests for threat T-8 (`tests/timing.rs`, run with `--ignored` in release): admitted latency does not depend on neighbours' bans, and bind latency does not reveal digests near a banned one (Kolmogorov-Smirnov at p < 0.01, with a control that must separate).
 
 ---
