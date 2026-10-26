@@ -1,0 +1,12 @@
+# cargo-audit reads every package in the lockfile, optional ones included.
+# Each ignore below names a package that bouncer-io never compiles; CI checks
+# that with `cargo tree` (the "Advisory ignores still hold" step), so an
+# ignore cannot outlive its reason.
+[advisories]
+ignore = [
+    # ctutils 0.4.2: non-constant-time masks and u128 comparisons. Reached only
+    # through crypt-io's optional `hmac` and `sha2` features, which bouncer-io
+    # does not enable; the fixed 0.4.4 needs Rust 1.87, above our MSRV, so the
+    # resolver keeps 0.4.2 in the lockfile.
+    "RUSTSEC-2026-0385",
+]

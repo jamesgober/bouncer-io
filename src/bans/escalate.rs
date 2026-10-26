@@ -6,7 +6,7 @@
 //! shared-address flags are checked by the caller before the parent is banned.
 
 use core::time::Duration;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use super::table::TableKey;
 use crate::{
@@ -179,6 +179,9 @@ pub(crate) struct Plan {
 pub(crate) struct Tracker {
     /// parent -> (child, noted at secs)
     parents: HashMap<Cidr, Vec<(Cidr, u64)>>,
+    /// Parents in the order they were first noted, for evicting the oldest
+    /// in constant time. May hold parents already gone; they are skipped.
+    order: VecDeque<Cidr>,
 }
 
 impl Tracker {
@@ -210,12 +213,22 @@ impl Tracker {
         now_secs: u64,
     ) -> Option<Vec<Cidr>> {
         let window = policy.window.as_secs().max(1);
-        if self.parents.len() >= MAX_PARENTS && !self.parents.contains_key(&parent) {
-            self.parents
-                .retain(|_, v| v.iter().any(|&(_, t)| t + window > now_secs));
-            if self.parents.len() >= MAX_PARENTS {
-                return None;
+        if !self.parents.contains_key(&parent) {
+            // Full: forget the parent noted longest ago. One pop per new
+            // parent, so a flood of new prefixes costs constant time each.
+            while self.parents.len() >= MAX_PARENTS {
+                match self.order.pop_front() {
+                    Some(old) => {
+                        self.parents.remove(&old);
+                    }
+                    None => break,
+                }
             }
+            if self.order.len() >= 2 * MAX_PARENTS {
+                let parents = &self.parents;
+                self.order.retain(|p| parents.contains_key(p));
+            }
+            self.order.push_back(parent);
         }
         let children = self.parents.entry(parent).or_default();
         children.retain(|&(_, t)| t + window > now_secs);
@@ -260,5 +273,43 @@ impl Tracker {
             .map(|&c| (c, now_secs))
             .collect();
         self.parents.insert(parent, v);
+    }
+}
+
+#[cfg(all(test, not(bouncer_loom)))]
+mod tests {
+    use super::*;
+
+    fn v4(n: u32) -> Cidr {
+        Cidr::host(std::net::IpAddr::from(n.to_be_bytes()))
+    }
+
+    #[test]
+    fn test_full_tracker_forgets_oldest_in_constant_time() {
+        let policy = EscalationPolicy::default();
+        let mut t = Tracker::default();
+        let started = std::time::Instant::now();
+        // Three times the bound, one child per /24: every note is a new parent.
+        for i in 0..(3 * MAX_PARENTS as u32) {
+            let child = v4(0x0a00_0001 | (i << 8));
+            let parent = child.parent(24).unwrap();
+            assert!(t.note(&policy, parent, child, 0).is_none());
+        }
+        assert!(t.parents.len() <= MAX_PARENTS);
+        assert!(t.order.len() <= 2 * MAX_PARENTS);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // The newest parents are kept, so an attack in progress still escalates.
+        let last = 3 * MAX_PARENTS as u32 - 1;
+        let parent = v4(0x0a00_0001 | (last << 8)).parent(24).unwrap();
+        let mut due = None;
+        for h in 2..=8u32 {
+            let child = v4((0x0a00_0000 | (last << 8)) + h);
+            due = t.note(&policy, parent, child, 0);
+        }
+        assert_eq!(due.map(|c| c.len()), Some(8));
     }
 }

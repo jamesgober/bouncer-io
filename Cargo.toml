@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Files kept out of the published package
-exclude = ["fuzz/", ".github/"]
+exclude = [".cargo/", "fuzz/", ".github/"]
 
 # Description
 description = "Connection gate for Rust services: admission by address, prefix, fingerprint, session, and account; in-flight revocation through cheap checkpoints; wipe, replace, and eject of revoked requests; ban memory with prefix escalation. Protocol-free."
