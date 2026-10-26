@@ -2570,21 +2570,21 @@ A pipeline that skips steps 6 to 8 still cannot send a byte for a revoked connec
 
 ## Cost summary
 
-| Path | Target [est. until measured at 0.6] |
-|---|---|
-| `checkpoint`, nothing revoked | median under 2 ns, p99 under 5 ns |
-| `checkpoint` slow path, not revoked | under 150 ns with 7 bound keys |
-| `before_commit` | under 5 ns |
-| `egress`, nothing revoked | under 3 ns |
-| `door` with 1,000,000 bans and 10,000 administrator prefixes | under 100 ns p99, budgets included |
-| ticket issue and release | under 40 ns median with 32 threads |
-| `bind_session` / `bind_account` / `bind_tenant` | under 30 ns each |
-| `revoke` | under 1 µs |
-| `ban` | under 500 ns |
-| eject-now sweep over 65,536 tickets | under 1 ms |
-| wipe | 30-60 ns per KiB of capacity |
-| memory per ban | 45-48 bytes, hard limit 64 |
-| idle CPU | zero wake-ups with nothing pending |
+| Path | Target | Measured at 0.6 (pinned, [`PERFORMANCE.md`](./PERFORMANCE.md)) |
+|---|---|---|
+| `checkpoint`, nothing revoked | median under 2 ns, p99 under 5 ns | 0.2 ns |
+| `checkpoint` slow path, not revoked | under 150 ns with 7 bound keys | p50 64 ns, p99 96 ns |
+| `before_commit` | under 5 ns | 0.2 ns |
+| `egress`, nothing revoked | under 3 ns | 1.3 ns |
+| `door` with 1,000,000 bans and 10,000 administrator prefixes | under 100 ns p99, budgets included | 113 ns per call (`door_at`, admitted); not met |
+| ticket issue and release | under 40 ns median with 32 threads | 40 ns, one thread |
+| `bind_session` / `bind_account` / `bind_tenant` | under 30 ns each | about 24 ns |
+| `revoke` | under 1 µs | 119 ns |
+| `ban` | under 500 ns | median 457 ns while the table fills |
+| eject-now sweep over 65,536 tickets | under 1 ms | 317 µs |
+| wipe | 30-60 ns per KiB of capacity | not measured at 0.6 |
+| memory per ban | 45-48 bytes, hard limit 64 | 56 bytes |
+| idle CPU | zero wake-ups with nothing pending | none |
 
 No allocation on the door, checkpoint, before-commit, egress, bind, or strike paths, proven with a counting allocator. Readers (door, checkpoints, egress) never wait on writers (ban, revoke, lift, import).
 

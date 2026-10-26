@@ -61,9 +61,23 @@ Exit:
 ## v0.6.0 - Optimisation
 Items: the door under 100 ns p99 with 1,000,000 bans (moved from 0.3); T-12, p99 checkpoint under 100,000 revocations per second (moved from 0.4); table rebuild with a fresh seed at the probe bound (moved from 0.3); 8-byte keys and 32-byte slots; the benchmarks of PLAN 11 against the named competitors; prefix structure confirmed or changed (O-4); keyed hash chosen (O-8); shard `Arc` confirmed (O-5); `#[track_caller]` cost on `checkpoint` measured (0.2 defence idea); `docs/PERFORMANCE.md`.
 Exit:
-- [ ] Every target of PLAN 11 met, or the gap recorded here with a plan.
-- [ ] NFR-10 met on `door_1m` and `budget_check`; `checkpoint_fast` within 10% of an `AtomicBool` load.
-- [ ] Baselines committed; the 5% regression gate active.
+- [x] Every target of PLAN 11 met, or the gap recorded here with a plan: see `docs/PERFORMANCE.md`. Gaps: the door's 100 ns p99 (113.4 ns per call admitted; plan below); ticket issue and release at 32 threads (not measured; measured at one thread, 40.1 ns); memory per ban 56 B against 45 to 48 B (within the 64 B limit; plan below).
+- [ ] NFR-10 met on `door_1m` (PLAN D-081: 20% faster than the same-job composition). Not met: admitted 113.4 against 109.3 ns, random peers 151.2 against 118.1 ns. `checkpoint_fast` within 10% of an `AtomicBool` load: met (0.2 against 0.3 ns). `budget_check`: bouncer checks two rates (client and prefix) in about the time governor checks one.
+- [ ] Baselines committed; the 5% regression gate active (Callgrind instruction counts; the first CI run writes the baseline).
+- [x] T-12: checkpoints under 100,009 revocations a second, p99 0.8 ns (mean of 10,000); the slow path with seven keys bound, p99 96.2 ns.
+- [x] O-4, O-5, O-8 decided by measurement (PLAN D-082, D-085); `#[track_caller]` measured (D-089); `docs/PERFORMANCE.md` written.
+
+The plan to reach NFR-10 (each estimate marked as such until built and measured):
+
+| Step | Expected | Cost and risk |
+|---|---|---|
+| one probe for a family's automatic lengths: a prefix's children stored in its group, with an overflow path | random peers -15 to -30 ns, admitted about -10 ns [est.] | a table redesign: probe-overflow rules must keep the per-parent quota (T-4) and the probe bound; loom and fuzz again |
+| 8-byte keys and 32-byte slots | random peers -5 to -15 ns [est.]; memory per ban 56 -> about 32 B | the same redesign; identity keys keep their digests beside the slot or in a second table |
+| keyed multiply-mix hash with the table reseed at the probe bound (T-9) | about -5 to -8 ns [est.] | the reseed needs a whole-table swap that readers never wait on |
+| connection release without the link swap (a store-load pairing proved by a loom model) | about -4 ns [est.] | a new loom model |
+| a fast monotonic clock in clock-lib, for `door` | `door` -15 to -20 ns [est.] | clock-lib's own release; `door_at` does not need it |
+
+Moves recorded at 0.6: the table rebuild with a fresh seed (T-9) and 8-byte keys with 32-byte slots move with the plan above (reason: both are parts of the ban-table redesign; with SipHash under a random key an attacker cannot choose colliding keys without the key, and an insert past the probe bound still fails cleanly as `BanTableFull` with an event).
 
 ## v0.7.0 - Hardening
 Items: every fuzz target run 24 h without findings; every attack test of PLAN 8; the timing test (T-8); 24 h soak (NFR-13); three-node simulation with partitions, skew, and reordering; adversarial review with every finding fixed test-first; `docs/SECURITY.md`, `docs/PLATFORM-NOTES.md`.
