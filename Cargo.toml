@@ -73,6 +73,9 @@ crypt-io = { version = "1.2", default-features = false, features = ["zeroize", "
 [dev-dependencies]
 criterion = { version = "0.7", default-features = false }
 proptest = { version = "1", default-features = false, features = ["std"] }
+# Comparison benchmarks only (benches/comparison.rs): never in the library.
+governor = "0.10"
+prefix-trie = { version = "0.10", default-features = false }
 
 [target.'cfg(bouncer_loom)'.dev-dependencies]
 loom = "0.7"
@@ -82,6 +85,10 @@ loom = "0.7"
 # #################################
 [[bench]]
 name    = "door"
+harness = false
+
+[[bench]]
+name    = "comparison"
 harness = false
 
 
