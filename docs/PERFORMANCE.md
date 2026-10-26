@@ -122,7 +122,7 @@ Tried and reverted, because pinned measurement showed them slower: a two-pass pr
 
 ## The NFR-10 target
 
-NFR-10 (PLAN D-081, decided by James): the door at least 20% faster than the same-job composition, which means about 90 ns admitted and about 95 ns for random peers on this host. At the end of 0.6 the door is at 113.4 and 151.2: within 4% of the composition admitted, 1.28 times slower for random peers. The target is not met. What is left, and what each step is expected to give, is in `dev/ROADMAP.md`.
+NFR-10 (PLAN D-081, decided by James): the door at least 20% faster than the same-job composition, which means about 87 ns admitted and about 94 ns for random peers on this host. At the end of 0.6 the door is at 113.4 and 151.2: within 4% of the composition admitted, 1.28 times slower for random peers. The target is not met. What is left, and what each step is expected to give, is in `dev/ROADMAP.md`.
 
 ## The regression gate
 
