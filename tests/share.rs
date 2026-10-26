@@ -132,7 +132,7 @@ fn test_revocation_on_one_node_stops_a_request_on_another() {
     let report = b
         .import(&a.export_delta(Sequence::START).unwrap(), Actor::Channel(1))
         .unwrap();
-    assert_eq!(report.revocations, 1);
+    assert_eq!(report.revocations, 1, "{report:?}");
     assert!(req.checkpoint().is_deny(), "logged out everywhere");
 }
 
@@ -316,4 +316,57 @@ fn test_old_since_exports_everything() {
             .len()
             < 64
     );
+}
+
+#[test]
+fn test_a_channel_carries_only_its_own_nodes_records() {
+    // T-17: a hostile node cannot replay or forge another node's records to
+    // shorten or erase its bans, and a refused record is not remembered as
+    // seen (it cannot shadow the genuine one).
+    let clock = Arc::new(ManualClock::new());
+    let a = node(1, &clock);
+    let c = node(3, &clock);
+    let k = ip("198.51.100.77");
+    a.ban(BanSpec::address(k).permanent()).unwrap();
+    let _ = c
+        .import(&a.export_delta(Sequence::START).unwrap(), Actor::Channel(1))
+        .unwrap();
+    assert!(c.door(k).is_err());
+    // A node posing as node 1, a second later, with a one-second ban.
+    clock.advance(Duration::from_secs(1));
+    clock.step_wall_forward(Duration::from_secs(1));
+    let forger = node(1, &clock);
+    forger
+        .ban(BanSpec::address(k).for_duration(Duration::from_secs(1)))
+        .unwrap();
+    let forged = forger.export_delta(Sequence::START).unwrap();
+    let report = c.import(&forged, Actor::Channel(2)).unwrap();
+    assert_eq!(report.applied, 0, "{report:?}");
+    assert!(report.rejected >= 1);
+    assert_eq!(c.explain(k).bans[0].until, None, "still permanent");
+    // Node 1's next delta, first relayed by node 2 (refused), then from node 1.
+    let since = a.export_delta(Sequence::START).unwrap().last();
+    a.ban(ip("198.51.100.78")).unwrap();
+    let d = a.export_delta(since).unwrap();
+    let relayed = c.import(&d, Actor::Channel(2)).unwrap();
+    assert_eq!(relayed.applied, 0);
+    let direct = c.import(&d, Actor::Channel(1)).unwrap();
+    assert!(direct.applied >= 1, "{direct:?}");
+    assert!(c.door(ip("198.51.100.78")).is_err());
+}
+
+#[test]
+fn test_no_channel_bans_a_whole_address_family() {
+    // A ban of 0.0.0.0/0 travels only through the administration channel.
+    let clock = Arc::new(ManualClock::new());
+    let a = node(1, &clock);
+    let b = node(2, &clock);
+    a.ban("0.0.0.0/0".parse::<Cidr>().unwrap()).unwrap();
+    let d = a.export_delta(Sequence::START).unwrap();
+    let report = b.import(&d, Actor::Channel(1)).unwrap();
+    assert!(report.rejected >= 1, "{report:?}");
+    assert!(b.door(ip("192.0.2.1")).is_ok());
+    let report = b.import(&d, Actor::Admin(1)).unwrap();
+    assert!(report.applied >= 1, "{report:?}");
+    assert!(b.door(ip("192.0.2.1")).is_err());
 }

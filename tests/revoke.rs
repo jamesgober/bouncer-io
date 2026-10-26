@@ -944,3 +944,26 @@ fn test_strike_ban_into_a_full_table_still_denies_and_ejects() {
     assert!(out.ejected && !out.remembered);
     assert!(kills.0.lock().unwrap().contains(&id), "and ejected");
 }
+
+#[test]
+fn test_revoked_session_bound_on_one_stream_stops_its_siblings() {
+    // A request binding a revoked session revokes its connection (unless the
+    // revocation keeps it); the connection's other requests, already past
+    // their checks, and the connection itself must notice at once.
+    let b = plain();
+    let session = SessionKey::from_digest([0x5e; 16]);
+    b.revoke(session, Reason::LOGOUT).unwrap();
+    let conn = b.door(ip("192.0.2.80")).unwrap();
+    let tag = conn.into_tag();
+    let mut sibling = b.request(tag, RequestId(1)).unwrap();
+    assert!(sibling.checkpoint().is_pass(), "on its fast path");
+    let sibling_tag = sibling.tag();
+    assert!(b.egress(sibling_tag).is_pass());
+    let mut stream = b.request(tag, RequestId(2)).unwrap();
+    assert!(stream.bind_session(session).is_deny());
+    assert!(sibling.checkpoint().is_deny(), "the sibling is stopped");
+    assert!(b.egress(sibling_tag).is_deny(), "nothing more leaves");
+    assert!(b.egress(tag).is_deny());
+    drop((sibling, stream));
+    b.release(tag);
+}

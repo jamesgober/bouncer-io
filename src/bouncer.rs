@@ -1765,6 +1765,8 @@ impl BouncerBuilder {
         );
         let bouncer = self.build_with(allow);
         bouncer.inner.shared.load_persisted(policy, jump, strict)?;
+        // After the persisted clock is restored: past every earlier run.
+        bouncer.inner.shared.seed_sequences();
         if maintainer {
             maintain::spawn(&bouncer.inner.shared).map_err(BouncerError::Spawn)?;
         }
@@ -1891,6 +1893,7 @@ impl BouncerBuilder {
         if let Some(node) = shared.node {
             shared.bans.set_node(node.0);
         }
+        shared.seed_sequences();
         Bouncer {
             inner: Arc::new(Inner {
                 shared,
@@ -1951,8 +1954,7 @@ mod tests {
         let mut watched = conn.request(crate::RequestId(1)).unwrap();
         let session = crate::SessionKey::from_digest([3; 16]);
         assert!(watched.bind_session(session).is_pass());
-        let other = b.door("192.0.2.2".parse().unwrap()).unwrap();
-        let mut gone = other.request(crate::RequestId(2)).unwrap();
+        let mut gone = b.door("192.0.2.2".parse().unwrap()).unwrap();
         let _ = gone.deny_and_eject(&mut crate::Collected::new());
         assert_eq!(
             epoch.current(),

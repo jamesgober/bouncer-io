@@ -203,6 +203,13 @@ pub enum ImportError {
     ClockSkew,
     /// A channel tried to lift a ban that another node issued.
     ForeignLift,
+    /// A channel carried a record of another node (or of no node): a node
+    /// channel carries only its own node's records.
+    ForeignOrigin,
+    /// A record a channel may not deliver: a ban an automated actor could
+    /// not set here, a ban of a whole address family, or a key already
+    /// banned by as many nodes as one key may hold.
+    NotAllowed,
 }
 
 impl fmt::Display for ImportError {
@@ -230,6 +237,11 @@ impl fmt::Display for ImportError {
                 "a record is stamped too far in the future: check the sender's clock"
             ),
             Self::ForeignLift => write!(f, "a channel may lift only bans its own node issued"),
+            Self::ForeignOrigin => write!(
+                f,
+                "a channel carried another node's record: each node sends its own"
+            ),
+            Self::NotAllowed => write!(f, "a channel may not deliver this ban"),
         }
     }
 }

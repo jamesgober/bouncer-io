@@ -84,7 +84,8 @@ Denials never say why: every refusal is the same abortive close, every denial ca
 bouncer-io provides the records; the transport authenticates them (mutual TLS on node links, or the back-channel). Inside that boundary:
 
 - Each node's ban on a key is kept apart, with its stamp, so the outcome of any order and any repetition of delivery is the same on every node.
-- A node channel (`Actor::Channel(n)`) carries only lifts node `n` made, and they reach only node `n`'s bans: a node cannot lift another node's bans. An administrator's lift reaches every node's bans only when an administrator delivers it (`Actor::Admin` or `Actor::App`, the administration channel).
+- A node channel (`Actor::Channel(n)`) carries only node `n`'s own records; a record of another node on it is refused before it is remembered as seen. A node cannot shorten, erase, lift, or shadow another node's bans. An administrator's lift reaches every node's bans only when an administrator delivers it (`Actor::Admin` or `Actor::App`, the administration channel).
+- A channel's bans are held to what their actor could set locally, never cover a whole address family, and one key holds the bans of at most 64 nodes.
 - Records stamped more than `max_clock_skew` (5 minutes) ahead are refused, so a node with a broken clock cannot pin a ban or a lift in the future.
 - Channels are rate limited (100,000 records a second) and can never touch the allow list.
 - A node that is cut off keeps enforcing what it has.
@@ -95,7 +96,8 @@ bouncer-io provides the records; the transport authenticates them (mutual TLS on
 - A flood larger than the network link needs help upstream (the provider, a CDN). bouncer-io protects the server's resources, not the pipe.
 - Detection is as good as the signals fed into it; long-term correlation belongs to a detection system.
 - A compromised process can turn off its own bouncer; containment belongs to the host.
-- A node that is itself compromised can ban arbitrary keys and lift its own bans across the cluster; it cannot lift other nodes' bans or touch their allow lists.
+- A node that is itself compromised can ban keys within the limits above and lift its own bans across the cluster; it cannot lift or change other nodes' bans or touch their allow lists. Allow-list the addresses the deployment cannot lose (its own infrastructure, monitoring).
+- Someone who can write the state files, even without the MAC key, can cut the journal after a whole batch or put back an older snapshot and journal: the bans recorded since are lost, without a report. The MAC detects any change, reordering, or removal from the middle. Protect the state directory like the server's own configuration, or keep a counter of the last epoch outside it.
 - A formatter (`DenialFormat`) that panics leaves the ticket revoked and the buffer wiped (both happen before it runs); build with `panic = "abort"` in release so a panic cannot leave a connection half-handled.
 
 ## How it is checked

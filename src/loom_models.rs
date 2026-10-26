@@ -1,6 +1,7 @@
 //! Loom models of the revocation protocol (dev/PLAN.md section 12.4):
 //! L-1 epoch ordering, L-4 bind against revoke, L-5 release against revoke,
-//! L-6 concurrency counters. Built only under `--cfg bouncer_loom`.
+//! L-6 concurrency counters, L-7 a request issued while its connection is
+//! released. Built only under `--cfg bouncer_loom`.
 
 use loom::{
     sync::{
@@ -178,5 +179,64 @@ fn loom_l6_concurrency_counter_never_underflows() {
             0,
             "the count leaked or underflowed"
         );
+    });
+}
+
+/// L-7: a request issued while its connection is released is never left
+/// passing on its fast path: either the issue fails (the connection is
+/// stale), or the request is revoked, or the epoch it recorded is behind the
+/// final one (its next checkpoint takes the slow path and finds the
+/// connection gone). The steps are those of `issue_request` and
+/// `release_cell`.
+#[test]
+fn loom_l7_request_issued_during_release_never_passes() {
+    loom::model(|| {
+        let parent = Arc::new(Cell::new());
+        let gen0 = generation(parent.state.load(Ordering::Relaxed));
+        parent.state.store(
+            u64::from(gen0) << 32 | F_LIVE | KIND_CONNECTION,
+            Ordering::Release,
+        );
+        parent.link.store(u64::from(gen0) << 32, Ordering::Release);
+        let epoch = Arc::new(RevocationEpoch::new());
+        let (p, e) = (Arc::clone(&parent), Arc::clone(&epoch));
+        let releaser = thread::spawn(move || {
+            let next = gen0.wrapping_add(1);
+            let taken = update(&p.state, Ordering::AcqRel, Ordering::Acquire, |st| {
+                (generation(st) == gen0 && st & F_LIVE != 0).then_some(u64::from(next) << 32)
+            });
+            assert!(taken.is_ok());
+            let old = p.link.swap(u64::from(next) << 32, Ordering::AcqRel);
+            if generation(old) == gen0 && old as u32 > 0 {
+                e.bump();
+            }
+        });
+        // The issuer: check the connection, count the child, record the
+        // epoch, then look at the connection again.
+        let st = parent.state.load(Ordering::Acquire);
+        let outcome = if generation(st) != gen0 || st & F_LIVE == 0 {
+            None
+        } else {
+            let counted = update(&parent.link, Ordering::AcqRel, Ordering::Acquire, |l| {
+                (generation(l) == gen0).then(|| l.wrapping_add(1))
+            })
+            .is_ok();
+            if counted {
+                let seen = epoch.load();
+                fence(Ordering::SeqCst);
+                let pst = parent.state.load(Ordering::Acquire);
+                let revoked = generation(pst) != gen0 || pst & F_LIVE == 0;
+                Some((seen, revoked))
+            } else {
+                None
+            }
+        };
+        releaser.join().unwrap();
+        if let Some((seen, revoked)) = outcome {
+            assert!(
+                revoked || seen != epoch.load(),
+                "a request outlived its connection on the fast path"
+            );
+        }
     });
 }

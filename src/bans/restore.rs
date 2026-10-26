@@ -35,17 +35,18 @@ impl BanMemory {
         guards: &Guards<'_>,
         now_secs: u64,
     ) -> Result<(), BouncerError> {
-        self.put(r, guards, now_secs, false)
+        self.put(r, guards, now_secs, false).map(|_| ())
     }
 
     /// Sets the ban under the key to exactly `r` (a sharing node's merge of
-    /// every origin's ban, computed by the ledger).
+    /// every origin's ban, computed by the ledger). Returns a ban the insert
+    /// took out to make room (`true` when evicted, `false` when expired).
     pub(crate) fn replace(
         &self,
         r: &Restore,
         guards: &Guards<'_>,
         now_secs: u64,
-    ) -> Result<(), BouncerError> {
+    ) -> Result<Option<(BanKey, bool)>, BouncerError> {
         self.put(r, guards, now_secs, true)
     }
 
@@ -55,7 +56,7 @@ impl BanMemory {
         guards: &Guards<'_>,
         now_secs: u64,
         exact: bool,
-    ) -> Result<(), BouncerError> {
+    ) -> Result<Option<(BanKey, bool)>, BouncerError> {
         let key = r.key.normalized();
         self.guard(&key, guards)?;
         // Placement as the application: stored bans of every kind go back.
@@ -93,17 +94,18 @@ impl BanMemory {
                             super::merge(old, &entry, now_secs)
                         }
                     }) {
-                    Ok(Inserted::New { removed, .. }) => {
-                        if let Some(old) = removed {
+                    Ok(Inserted::New { removed, evicted }) => {
+                        let gone = removed.and_then(|old| {
                             self.count(writer, &old.key, false);
-                        }
+                            self.key_of(writer, &old.key).map(|k| (k, evicted))
+                        });
                         self.count(writer, &tkey, true);
                         if let BanKey::FingerprintIn(fp, c) = key {
                             self.remember_compound(writer, &tkey, fp, c);
                         }
-                        Ok(())
+                        Ok(gone)
                     }
-                    Ok(Inserted::Merged { .. }) => Ok(()),
+                    Ok(Inserted::Merged { .. }) => Ok(None),
                     Err(()) => Err(BouncerError::BanTableFull {
                         capacity: self.table.capacity(),
                     }),
@@ -140,7 +142,7 @@ impl BanMemory {
                     }
                 }
                 self.publish_admin(&writer.admin);
-                Ok(())
+                Ok(None)
             }
         }
     }

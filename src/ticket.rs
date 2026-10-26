@@ -1295,10 +1295,26 @@ pub(crate) fn issue_request(
         },
     );
     match issued {
-        Some(t) => {
+        Some(mut t) => {
             // The connection's latest request, followed by the egress check:
             // a plain store, published after the child's state.
             pcell.keys[K_LATEST].store(u64::from(t.index), Ordering::Release);
+            // The connection may have been released or revoked since it was
+            // checked above, and the epoch moved for that before this ticket
+            // read it: look again, and deny the request at every checkpoint
+            // if the connection is gone. The fence pairs with the epoch's.
+            fence(Ordering::SeqCst);
+            let pst = pcell.state.load(Ordering::Acquire);
+            let gone = generation(pst) != parent_gen || pst & F_LIVE == 0;
+            if gone || pst & F_REVOKED != 0 {
+                let code = if gone {
+                    DenialCode::Unavailable
+                } else {
+                    code_of(pst)
+                };
+                mark_revoked(shared.registry.cell(t.index), t.generation, code);
+                t.seen = SEEN_ALWAYS_CHECK;
+            }
             Ok(t)
         }
         None => {
@@ -1375,7 +1391,10 @@ pub(crate) fn check_cell(
             }
             if request && !hit.keep_connection {
                 if let Some((p, pg)) = parent_cell {
-                    mark_revoked(p, pg, hit.code);
+                    // Its siblings and the connection must notice.
+                    if mark_revoked(p, pg, hit.code) {
+                        shared.epoch.bump();
+                    }
                 }
             }
             return Err(hit.code);
@@ -1386,10 +1405,15 @@ pub(crate) fn check_cell(
 }
 
 /// Revokes the connection a request cell belongs to.
+///
+/// The epoch moves when this revokes it: the connection's other requests
+/// and the connection itself may sit on their fast paths.
 fn revoke_parent(shared: &Shared, cell: &Cell, code: DenialCode) {
     let link = cell.link.load(Ordering::Relaxed);
     let (pi, pg) = ((link >> 32) as u32, link as u32);
-    mark_revoked(shared.registry.cell(pi), pg, code);
+    if mark_revoked(shared.registry.cell(pi), pg, code) {
+        shared.epoch.bump();
+    }
 }
 
 /// Sets the revoked flag and denial code on a cell of generation `gen_`. The

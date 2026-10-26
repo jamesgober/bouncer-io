@@ -16,6 +16,10 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::{directive::ActorKind, keys::BanKey};
 
+/// Nodes whose bans one key may hold at once; a further node's ban is
+/// refused (a backstop: a channel carries only its own node's records).
+pub(crate) const MAX_ORIGINS: usize = 64;
+
 /// Keys whose lifts are remembered at most; past it the oldest are
 /// forgotten (a ban older than a forgotten lift could come back if it is
 /// delivered that late).
@@ -91,6 +95,8 @@ pub(crate) enum Applied {
     /// A lift or a later ban of the same origin already covers it, or it has
     /// expired.
     Superseded,
+    /// The key already holds bans of `MAX_ORIGINS` nodes.
+    Full,
 }
 
 /// The replicated ban state.
@@ -124,12 +130,14 @@ impl Ledger {
         if st.covered(&c) {
             return Applied::Superseded;
         }
+        let full = st.bans.len() >= MAX_ORIGINS;
         match st.bans.iter_mut().find(|b| b.origin == c.origin) {
             Some(b) if b.stamp >= c.stamp => Applied::Superseded,
             Some(b) => {
                 *b = c;
                 Applied::Changed
             }
+            None if full => Applied::Full,
             None => {
                 // Most keys hold one node's ban: no room for more until needed.
                 st.bans.reserve_exact(1);
@@ -255,6 +263,12 @@ impl Ledger {
             lifts.extend(st.lifts.iter().map(|&(s, t)| (*key, s, t)));
         }
         (bans, lifts)
+    }
+
+    /// Keys held (tests).
+    #[cfg(all(test, not(bouncer_loom)))]
+    pub(crate) fn len(&self) -> usize {
+        self.keys.len()
     }
 
     /// Bytes held, estimated (for `capacity`).

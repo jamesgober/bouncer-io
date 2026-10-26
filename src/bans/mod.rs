@@ -1155,6 +1155,21 @@ impl BanMemory {
         self.guard(&key.normalized(), guards)
     }
 
+    /// Whether an actor of `kind` could set this ban here: automation may
+    /// not ban a bare fingerprint, a prefix at a length that is not
+    /// automatic, or permanently (Sentinel may ban permanently).
+    pub(crate) fn allowed_for(&self, key: &BanKey, kind: ActorKind, permanent: bool) -> bool {
+        let actor = match kind {
+            ActorKind::App | ActorKind::Admin => Actor::App,
+            ActorKind::Sentinel => Actor::Sentinel,
+            _ => Actor::Local,
+        };
+        if permanent && !actor.may_ban_permanently() {
+            return false;
+        }
+        self.place(&key.normalized(), actor).is_ok()
+    }
+
     fn publish_admin(&self, list: &[(Cidr, AdminEntry)]) {
         let set = PrefixSet::build(list, |a, _| *a);
         let count = set.len() as u64;

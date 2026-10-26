@@ -156,6 +156,13 @@ impl Shared {
         );
     }
 
+    /// Seeds the sharing sequence numbers past every earlier run.
+    pub(crate) fn seed_sequences(&self) {
+        if self.node.is_some() {
+            self.share.seed(self.share.stamp(self.wall_ms()));
+        }
+    }
+
     /// How times are counted now.
     fn ctx_now(&self) -> LoadCtx {
         let now_wall = unix(self.wall());
@@ -218,7 +225,12 @@ impl Shared {
 
     /// Makes the ban table entry under `key` the ledger's merge of every
     /// origin's ban (or removes it). `Ok(true)` when the key is banned after.
-    fn sync_key(&self, ledger: &Ledger, key: &BanKey, ctx: &LoadCtx) -> Result<bool, BouncerError> {
+    fn sync_key(
+        &self,
+        ledger: &mut Ledger,
+        key: &BanKey,
+        ctx: &LoadCtx,
+    ) -> Result<bool, BouncerError> {
         let Some(c) = ledger.effective(key, ctx.now_wall) else {
             let _ = self.bans.remove_exact(key);
             return Ok(false);
@@ -232,7 +244,23 @@ impl Shared {
             immune: &allow,
             proxies: &self.proxies,
         };
-        self.bans.replace(&r, &guards, ctx.now_secs)?;
+        // A ban the insert took out leaves the ledger too, so it cannot come
+        // back with a later merge or a snapshot.
+        if let Some((gone, evicted)) = self.bans.replace(&r, &guards, ctx.now_secs)? {
+            ledger.forget(&gone);
+            if evicted {
+                self.log(Rec::Remove { key: gone }, true, false);
+            }
+            Emit {
+                subject: crate::bouncer::subject_of_key(&gone),
+                ..Emit::new(if evicted {
+                    signals::BAN_EVICTED
+                } else {
+                    signals::BAN_EXPIRED
+                })
+            }
+            .send(self);
+        }
         Ok(true)
     }
 
@@ -288,7 +316,7 @@ impl Shared {
             c.id = p.id;
         }
         let _ = l.ban(key, c, ctx.now_wall);
-        let _ = self.sync_key(&l, &key, &ctx);
+        let _ = self.sync_key(&mut l, &key, &ctx);
         drop(l);
         self.log(Self::contribution_rec(&key, &c), true, true);
         let secs = ctx.now_secs;
@@ -320,7 +348,7 @@ impl Shared {
             let stamp = self.share.stamp(self.wall_ms());
             let mut l = lock(m);
             let removed = l.lift(key, Scope::Origin(node), stamp, ctx.now_wall);
-            let _ = self.sync_key(&l, &key, &ctx);
+            let _ = self.sync_key(&mut l, &key, &ctx);
             drop(l);
             if removed > 0 {
                 self.log(
@@ -375,7 +403,7 @@ impl Shared {
         }
         let removed = l.lift(key, scope, stamp, ctx.now_wall);
         let lifted = if l.effective(&key, ctx.now_wall).is_some() {
-            let _ = self.sync_key(&l, &key, &ctx);
+            let _ = self.sync_key(&mut l, &key, &ctx);
             Lifted {
                 removed,
                 tombstone: self.bans.new_id(),
@@ -440,8 +468,8 @@ impl Shared {
     }
 
     /// The full state as records: bans, offender records, and (sharing
-    /// nodes) lifts. `export`: for another node, which takes lifts only from
-    /// their own origin, so other origins' lifts are left out.
+    /// nodes) lifts. `export`: for another node, which takes from a channel
+    /// only that node's own records, so other origins' are left out.
     fn state_records(&self, export: bool) -> Vec<Envelope> {
         let secs = self.now().secs();
         let origin = self.origin();
@@ -449,6 +477,9 @@ impl Shared {
         if let Some(m) = &self.ledger {
             let (bans, lifts) = lock(m).dump(unix(self.wall()));
             for (key, c) in bans {
+                if export && c.origin != origin {
+                    continue;
+                }
                 out.push(Envelope {
                     origin: c.origin,
                     seq: 0,
@@ -621,7 +652,8 @@ impl Shared {
                 };
                 let mut l = lock(m);
                 if l.ban(key, c, ctx.now_wall) == Applied::Changed {
-                    if let Err(BouncerError::BanTableFull { .. }) = self.sync_key(&l, &key, ctx) {
+                    if let Err(BouncerError::BanTableFull { .. }) = self.sync_key(&mut l, &key, ctx)
+                    {
                         l.forget(&key);
                         ctx.full += 1;
                     }
@@ -644,7 +676,7 @@ impl Shared {
                 let key = key.normalized();
                 let mut l = lock(m);
                 let _ = l.lift(key, scope, stamp, ctx.now_wall);
-                let _ = self.sync_key(&l, &key, ctx);
+                let _ = self.sync_key(&mut l, &key, ctx);
             }
             Rec::Remove { key } => {
                 let key = key.normalized();
@@ -694,6 +726,7 @@ impl Shared {
         let now_wall = unix(self.wall());
         match loaded {
             Ok(Some((h, records, rep, journal_len))) => {
+                self.share.mark_partial();
                 let last_wall = rep.last_wall.unwrap_or(h.created).max(h.created);
                 let forward = now_wall.saturating_sub(last_wall);
                 let jumped = now_wall < last_wall || forward > max_wall_jump.as_secs();
@@ -967,163 +1000,204 @@ impl Bouncer {
         let own = shared.node.map(|n| n.0);
         let trusted = matches!(from, Actor::Admin(_) | Actor::App);
         for env in records {
+            // A node channel carries only its own node's records (T-17): a
+            // relayed or forged record of another origin is refused before
+            // it is remembered as seen, so it cannot shadow the real one.
+            let foreign = match from {
+                Actor::Channel(n) => u64::from(env.origin) != n,
+                _ => false,
+            };
+            if foreign || env.origin == 0 {
+                report.rejected += 1;
+                self.reject(if matches!(env.rec, Rec::Lift { .. }) {
+                    ImportError::ForeignLift
+                } else {
+                    ImportError::ForeignOrigin
+                });
+                continue;
+            }
             // An administrator's lift seen before over a node channel
             // (where it reached only its own node's bans) still applies in
             // full when an administrator delivers it; applying a lift again
             // changes nothing else.
             let full_lift = trusted && matches!(env.rec, Rec::Lift { all: true, .. });
             if Some(env.origin) == own
-                || (!delta.is_full() && !shared.share.first_time(env.origin, env.seq) && !full_lift)
+                || (!delta.is_full() && !full_lift && shared.share.seen(env.origin, env.seq))
             {
                 report.duplicates += 1;
                 continue;
             }
-            let stamp = match env.rec {
-                Rec::Ban { stamp, .. } | Rec::Lift { stamp, .. } | Rec::Revoke { stamp, .. } => {
-                    Some(stamp)
+            // Remembered as seen only once it was not refused: a refused
+            // record must not shadow a later delivery that is allowed (from
+            // the administration channel, or after a fix at the sender).
+            let rejected_before = report.rejected;
+            'rec: {
+                let stamp = match env.rec {
+                    Rec::Ban { stamp, .. }
+                    | Rec::Lift { stamp, .. }
+                    | Rec::Revoke { stamp, .. } => Some(stamp),
+                    _ => None,
+                };
+                if stamp.is_some_and(|s| s >> 16 > limit) {
+                    report.rejected += 1;
+                    self.reject(ImportError::ClockSkew);
+                    break 'rec;
                 }
-                _ => None,
-            };
-            if stamp.is_some_and(|s| s >> 16 > limit) {
-                report.rejected += 1;
-                self.reject(ImportError::ClockSkew);
-                continue;
-            }
-            if let Some(s) = stamp {
-                shared.share.observe(s);
-            }
-            match env.rec {
-                Rec::Ban { key, .. } => {
-                    let allow = shared.allow.load();
-                    let guards = Guards {
-                        immune: &allow,
-                        proxies: &shared.proxies,
-                    };
-                    if shared.bans.check(&key, &guards).is_err() {
-                        report.rejected += 1;
-                        self.reject(ImportError::AllowListTouched);
-                        continue;
-                    }
-                    let Some((key, c)) = shared.contribution(env.origin, &env.rec) else {
-                        continue;
-                    };
-                    let mut l = lock(ledger);
-                    if l.ban(key, c, ctx.now_wall) == Applied::Superseded {
-                        report.superseded += 1;
-                        continue;
-                    }
-                    match shared.sync_key(&l, &key, &ctx) {
-                        Ok(_) => {
-                            drop(l);
-                            report.applied += 1;
-                            shared.log_env(env, true, true);
-                        }
-                        Err(_) => {
-                            l.forget(&key);
-                            report.rejected += 1;
-                        }
-                    }
+                if let Some(s) = stamp {
+                    shared.share.observe(s);
                 }
-                Rec::Lift {
-                    key,
-                    stamp,
-                    actor,
-                    all,
-                } => {
-                    // A node channel carries only lifts its own node made.
-                    if let Actor::Channel(n) = from {
-                        if u64::from(env.origin) != n {
-                            report.rejected += 1;
-                            self.reject(ImportError::ForeignLift);
-                            continue;
-                        }
-                    }
-                    let scope = if all && trusted {
-                        Scope::All
-                    } else {
-                        Scope::Origin(env.origin)
-                    };
-                    let key = key.normalized();
-                    let mut l = lock(ledger);
-                    if all && !trusted && l.held_by_other(&key, env.origin, ctx.now_wall) {
-                        // The lift covered other nodes' bans where it was
-                        // made; here it reaches only its own node's.
-                        report.rejected += 1;
-                        self.reject(ImportError::ForeignLift);
-                    }
-                    let had = shared.bans.held_exact(&key, 0).is_some();
-                    let _ = l.lift(key, scope, stamp, ctx.now_wall);
-                    let banned = shared.sync_key(&l, &key, &ctx).unwrap_or(true);
-                    drop(l);
-                    if had && !banned {
-                        Emit {
-                            actor: from,
-                            reason: Reason::IMPORTED,
-                            subject: crate::bouncer::subject_of_key(&key),
-                            ..Emit::new(signals::BAN_LIFTED)
-                        }
-                        .send(shared);
-                    }
-                    report.applied += 1;
-                    // Journaled with the scope it had here; not passed on
-                    // (other nodes take lifts only from the node that made
-                    // them).
-                    shared.log_env(
-                        Envelope {
-                            rec: Rec::Lift {
-                                key,
-                                stamp,
-                                actor,
-                                all: scope == Scope::All,
-                            },
-                            ..env
-                        },
-                        true,
-                        false,
-                    );
-                }
-                Rec::Offence { key, score, last } => {
-                    shared.put_offence(&key, score, last, &ctx);
-                    report.applied += 1;
-                    shared.log_env(env, true, true);
-                }
-                Rec::Remove { .. } => report.superseded += 1,
-                Rec::Revoke {
-                    target,
-                    code,
-                    keep_connection,
-                    eject_now,
-                    reason,
-                    ..
-                } => {
-                    let mode = if eject_now {
-                        RevokeMode::EjectNow
-                    } else {
-                        RevokeMode::AtCheckpoint
-                    };
-                    let applied = self.revoke_with(
-                        &target,
-                        from,
-                        Reason::from_code(reason),
-                        mode,
-                        keep_connection,
-                        DenialCode::from_number(code),
-                        None,
-                    );
-                    match applied {
-                        Ok(_) | Err(BouncerError::RevocationTableFull { .. }) => {
-                            report.revocations += 1;
-                            shared.log_env(env, false, true);
-                        }
-                        Err(
-                            BouncerError::AllowListed { .. } | BouncerError::TrustedProxyTarget,
-                        ) => {
+                match env.rec {
+                    Rec::Ban { key, .. } => {
+                        let allow = shared.allow.load();
+                        let guards = Guards {
+                            immune: &allow,
+                            proxies: &shared.proxies,
+                        };
+                        if shared.bans.check(&key, &guards).is_err() {
                             report.rejected += 1;
                             self.reject(ImportError::AllowListTouched);
+                            break 'rec;
                         }
-                        Err(_) => report.rejected += 1,
+                        let Some((key, c)) = shared.contribution(env.origin, &env.rec) else {
+                            break 'rec;
+                        };
+                        // A channel's ban is held to what its actor could set
+                        // here, and never covers a whole address family.
+                        let whole_family = matches!(key, BanKey::Prefix(p) if p.len() == 0);
+                        if !trusted
+                            && (whole_family
+                                || !shared.bans.allowed_for(
+                                    &key,
+                                    ActorKind::from_code(c.actor),
+                                    c.until == 0,
+                                ))
+                        {
+                            report.rejected += 1;
+                            self.reject(ImportError::NotAllowed);
+                            break 'rec;
+                        }
+                        let mut l = lock(ledger);
+                        match l.ban(key, c, ctx.now_wall) {
+                            Applied::Superseded => {
+                                report.superseded += 1;
+                                break 'rec;
+                            }
+                            Applied::Full => {
+                                report.rejected += 1;
+                                self.reject(ImportError::NotAllowed);
+                                break 'rec;
+                            }
+                            Applied::Changed => {}
+                        }
+                        match shared.sync_key(&mut l, &key, &ctx) {
+                            Ok(_) => {
+                                drop(l);
+                                report.applied += 1;
+                                // Journaled here; not passed on (each node sends
+                                // its own records).
+                                shared.log_env(env, true, false);
+                            }
+                            Err(_) => {
+                                l.forget(&key);
+                                report.rejected += 1;
+                            }
+                        }
+                    }
+                    Rec::Lift {
+                        key,
+                        stamp,
+                        actor,
+                        all,
+                    } => {
+                        let scope = if all && trusted {
+                            Scope::All
+                        } else {
+                            Scope::Origin(env.origin)
+                        };
+                        let key = key.normalized();
+                        let mut l = lock(ledger);
+                        if all && !trusted && l.held_by_other(&key, env.origin, ctx.now_wall) {
+                            // The lift covered other nodes' bans where it was
+                            // made; here it reaches only its own node's.
+                            report.rejected += 1;
+                            self.reject(ImportError::ForeignLift);
+                        }
+                        let had = shared.bans.held_exact(&key, 0).is_some();
+                        let _ = l.lift(key, scope, stamp, ctx.now_wall);
+                        let banned = shared.sync_key(&mut l, &key, &ctx).unwrap_or(true);
+                        drop(l);
+                        if had && !banned {
+                            Emit {
+                                actor: from,
+                                reason: Reason::IMPORTED,
+                                subject: crate::bouncer::subject_of_key(&key),
+                                ..Emit::new(signals::BAN_LIFTED)
+                            }
+                            .send(shared);
+                        }
+                        report.applied += 1;
+                        // Journaled with the scope it had here; not passed on
+                        // (other nodes take lifts only from the node that made
+                        // them).
+                        shared.log_env(
+                            Envelope {
+                                rec: Rec::Lift {
+                                    key,
+                                    stamp,
+                                    actor,
+                                    all: scope == Scope::All,
+                                },
+                                ..env
+                            },
+                            true,
+                            false,
+                        );
+                    }
+                    Rec::Offence { key, score, last } => {
+                        shared.put_offence(&key, score, last, &ctx);
+                        report.applied += 1;
+                        shared.log_env(env, true, false);
+                    }
+                    Rec::Remove { .. } => report.superseded += 1,
+                    Rec::Revoke {
+                        target,
+                        code,
+                        keep_connection,
+                        eject_now,
+                        reason,
+                        ..
+                    } => {
+                        let mode = if eject_now {
+                            RevokeMode::EjectNow
+                        } else {
+                            RevokeMode::AtCheckpoint
+                        };
+                        let applied = self.revoke_with(
+                            &target,
+                            from,
+                            Reason::from_code(reason),
+                            mode,
+                            keep_connection,
+                            DenialCode::from_number(code),
+                            None,
+                        );
+                        match applied {
+                            Ok(_) | Err(BouncerError::RevocationTableFull { .. }) => {
+                                report.revocations += 1;
+                            }
+                            Err(
+                                BouncerError::AllowListed { .. } | BouncerError::TrustedProxyTarget,
+                            ) => {
+                                report.rejected += 1;
+                                self.reject(ImportError::AllowListTouched);
+                            }
+                            Err(_) => report.rejected += 1,
+                        }
                     }
                 }
+            }
+            if report.rejected == rejected_before && !delta.is_full() {
+                shared.share.remember(env.origin, env.seq);
             }
         }
         Ok(report)
@@ -1354,5 +1428,86 @@ mod tests {
             .import(&three.export_delta(since_three).unwrap(), Actor::Channel(3))
             .unwrap();
         assert!(b.door(a).is_ok(), "both origins lifted");
+    }
+
+    #[test]
+    fn test_records_after_a_restart_reach_peers() {
+        // A node's sequence numbers and log positions continue past its
+        // earlier runs, so a peer neither drops its new records as seen nor
+        // waits for positions it already passed.
+        let store = Mem::default();
+        let one = || {
+            Bouncer::builder()
+                .node(NodeId(1))
+                .persistence(Box::new(store.clone()))
+                .try_build()
+                .unwrap()
+        };
+        let peer = Bouncer::builder().node(NodeId(2)).try_build().unwrap();
+        let a = one();
+        a.ban("198.51.100.1".parse::<std::net::IpAddr>().unwrap())
+            .unwrap();
+        let d = a.export_delta(crate::share::Sequence::START).unwrap();
+        let since = d.last();
+        let _ = peer.import(&d, Actor::Channel(1)).unwrap();
+        a.flush().unwrap();
+        drop(a);
+        let a = one();
+        let second: std::net::IpAddr = "198.51.100.2".parse().unwrap();
+        a.ban(second).unwrap();
+        let report = peer
+            .import(&a.export_delta(since).unwrap(), Actor::Channel(1))
+            .unwrap();
+        assert!(report.applied >= 1, "{report:?}");
+        assert!(peer.door(second).is_err());
+    }
+
+    #[test]
+    fn test_bans_evicted_by_imports_leave_the_ledger() {
+        // A full table evicting imported automatic bans forgets them, so
+        // the ledger stays within the table and evicted bans never come back.
+        let a = Bouncer::builder()
+            .node(NodeId(1))
+            .ban_capacity(1 << 14)
+            .budgets(crate::Budgets::off())
+            .try_build()
+            .unwrap();
+        let b = Bouncer::builder()
+            .node(NodeId(2))
+            .ban_capacity(64)
+            .budgets(crate::Budgets::off())
+            .try_build()
+            .unwrap();
+        let cap = b.capacity().bans as usize;
+        for i in 0..(cap as u32 * 3) {
+            let addr = std::net::IpAddr::from((0x0a00_0000 + (i << 8)).to_be_bytes());
+            let spec = crate::BanSpec::address(addr)
+                .by(Actor::Local)
+                .for_duration(Duration::from_secs(3600));
+            a.ban(spec).unwrap();
+        }
+        let start = crate::share::Sequence::START;
+        let _ = b.import(&a.export_delta(start).unwrap(), Actor::Channel(1));
+        let held = b
+            .list(&crate::Filter::all(), crate::Page::first(u16::MAX))
+            .items
+            .len();
+        assert!(held <= cap, "{held} of {cap}");
+        let ledger = lock(b.shared().ledger.as_ref().unwrap()).len();
+        assert!(
+            ledger <= cap,
+            "the ledger follows the table: {ledger} of {cap}"
+        );
+        let bans = b
+            .export_snapshot()
+            .unwrap()
+            .records()
+            .iter()
+            .filter(|e| matches!(e.rec, Rec::Ban { .. }))
+            .count();
+        assert!(
+            bans <= cap,
+            "evicted bans do not come back: {bans} of {cap}"
+        );
     }
 }

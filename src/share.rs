@@ -264,6 +264,12 @@ pub(crate) struct Share {
     hlc: AtomicU64,
     log: Mutex<VecDeque<(u64, Envelope)>>,
     next: AtomicU64,
+    /// The first log position of this run.
+    base: AtomicU64,
+    /// Whether the log still holds every record this node exported: no
+    /// record has dropped off it, and no state was loaded from before this
+    /// run. A peer behind the log then gets the log, otherwise a snapshot.
+    whole: core::sync::atomic::AtomicBool,
     seen: Mutex<Seen>,
     /// Records accepted per second from channels (a storm defence).
     pub(crate) channel_rate: Option<rate_net::Gcra>,
@@ -275,6 +281,8 @@ impl Share {
             hlc: AtomicU64::new(0),
             log: Mutex::new(VecDeque::new()),
             next: AtomicU64::new(1),
+            base: AtomicU64::new(1),
+            whole: core::sync::atomic::AtomicBool::new(true),
             seen: Mutex::new((HashSet::new(), VecDeque::new())),
             channel_rate: rate_net::Quota::rate(
                 channel_per_second.max(1),
@@ -316,15 +324,34 @@ impl Share {
         self.next.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// The log no longer holds everything this node holds (state was loaded
+    /// from before this run).
+    pub(crate) fn mark_partial(&self) {
+        self.whole.store(false, Ordering::Release);
+    }
+
+    /// Starts sequence numbers and log positions at `start` or later: a
+    /// stamp of this node's clock, which only moves forward across restarts
+    /// (it is persisted), so records after a restart are never taken for
+    /// ones seen before, and a peer's position is never ahead of the log.
+    pub(crate) fn seed(&self, start: u64) {
+        let start = start.max(1);
+        self.next.fetch_max(start, Ordering::AcqRel);
+        self.base.fetch_max(start, Ordering::AcqRel);
+    }
+
     /// Adds a record to the outbound log.
     pub(crate) fn push(&self, env: Envelope) {
         let mut log = self
             .log
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pos = log.back().map_or(1, |(p, _)| p + 1);
+        let pos = log
+            .back()
+            .map_or_else(|| self.base.load(Ordering::Acquire), |(p, _)| p + 1);
         if log.len() >= LOG {
             log.pop_front();
+            self.whole.store(false, Ordering::Release);
         }
         log.push_back((pos, env));
     }
@@ -338,7 +365,7 @@ impl Share {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let last = log.back().map_or(since, |(p, _)| *p);
         if let Some((first, _)) = log.front() {
-            if since + 1 < *first {
+            if since + 1 < *first && !self.whole.load(Ordering::Acquire) {
                 return None;
             }
         }
@@ -357,15 +384,24 @@ impl Share {
             .map_or(0, |(p, _)| *p)
     }
 
-    /// Remembers a record id; `false` when it was already seen.
-    pub(crate) fn first_time(&self, origin: u16, seq: u64) -> bool {
+    /// Whether a record id was seen (and applied) before.
+    pub(crate) fn seen(&self, origin: u16, seq: u64) -> bool {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+            .contains(&(origin, seq))
+    }
+
+    /// Remembers a record id as applied.
+    pub(crate) fn remember(&self, origin: u16, seq: u64) {
         let mut g = self
             .seen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (set, order) = &mut *g;
         if !set.insert((origin, seq)) {
-            return false;
+            return;
         }
         order.push_back((origin, seq));
         if order.len() > SEEN {
@@ -373,6 +409,5 @@ impl Share {
                 set.remove(&old);
             }
         }
-        true
     }
 }
