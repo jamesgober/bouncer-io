@@ -208,9 +208,60 @@ fn checkpoint(c: &mut Criterion) {
     g.finish();
 }
 
+/// Where the door's time goes: the ticket alone (an empty bouncer), the
+/// judgement alone on empty tables, and the judgement against the fixture
+/// (`datagram`, verified, budgets off: allow list, proxies, ban memory).
+fn parts(c: &mut Criterion) {
+    let empty = Bouncer::builder()
+        .budgets(Budgets::off())
+        .tickets(4096)
+        .ban_capacity(1024)
+        .try_build()
+        .unwrap();
+    let f = fixture();
+    let now = f.bouncer.now();
+    let mut g = c.benchmark_group("door_parts");
+    let mut i = 0usize;
+    g.bench_function("ticket_only", |b| {
+        b.iter(|| {
+            i = (i + 1) & 4095;
+            black_box(
+                empty
+                    .door_at(
+                        ConnId(i as u64),
+                        black_box(f.admitted[i]),
+                        Provenance::Socket,
+                        now,
+                    )
+                    .is_ok(),
+            )
+        })
+    });
+    g.bench_function("judge_empty", |b| {
+        b.iter(|| {
+            i = (i + 1) & 4095;
+            black_box(empty.datagram(black_box(f.admitted[i]), true, now))
+        })
+    });
+    g.bench_function("judge_1m_admitted", |b| {
+        b.iter(|| {
+            i = (i + 1) & 4095;
+            black_box(f.bouncer.datagram(black_box(f.admitted[i]), true, now))
+        })
+    });
+    g.bench_function("judge_1m_banned", |b| {
+        b.iter(|| {
+            i = (i + 1) % f.banned.len();
+            black_box(f.bouncer.datagram(black_box(f.banned[i]), true, now))
+        })
+    });
+    g.bench_function("clock_now", |b| b.iter(|| black_box(f.bouncer.now())));
+    g.finish();
+}
+
 criterion_group! {
     name = comparison;
     config = Criterion::default().sample_size(50);
-    targets = door, budget, checkpoint
+    targets = door, budget, checkpoint, parts
 }
 criterion_main!(comparison);

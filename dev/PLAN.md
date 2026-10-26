@@ -631,6 +631,20 @@ Host: AMD Ryzen 9 9950X3D (16 cores, 128 MiB L3), Windows 11, Rust stable, relea
 
 The door target is not met at 0.3. Where the time goes: about 70 ns of ticket issue and release (four atomic read-modify-writes and the reference count), about 30 ns per probe of hashing, and the misses of random access into a 60 MiB table (mostly TLB misses with 4 KiB pages). The plan for 0.6, recorded in ROADMAP: 8-byte keys and 32-byte slots (the table halves), the keyed-hash decision O-8, fewer atomic operations per ticket (O-5 measured), and measurement on a quiet reference machine with percentiles from a nanosecond timer. With realistic traffic the probed tag words of recurring clients stay in cache, which the cache-resident row shows.
 
+### 11.2 Measured at the start of 0.6
+
+Same host, still shared with other build jobs; criterion medians from `benches/comparison.rs`, where bouncer and the composition run on the same data in the same process. Ratios matter more than absolutes here.
+
+| Bench | bouncer | Compared with | Ratio |
+|---|---|---|---|
+| `checkpoint_fast` | 0.40 ns | `Arc<AtomicBool>` load, 0.40 ns | 1.0 (target met) |
+| `door_1m`, admitted, warm | 142 ns | `prefix-trie` per family + `HashSet`, 26 ns | 5.5 |
+| `door_1m`, banned | 65 ns | 12 ns | 5.3 |
+| `door_1m`, random peers | 156 ns | 45 ns | 3.4 |
+| `budget_check` | 79 ns | `governor` keyed, 19 ns | 4.1 |
+
+Where the door's time goes (`door_parts`): ticket issue and release about 78 ns; the judgement on empty tables 12 ns; against 1,000,000 bans 53 to 62 ns (ban memory about 40 to 50 ns); one `Bouncer::now()` 26 ns on Windows. The composition does less (no ticket, no allow list, no trusted proxies, no revocation hookup), but ban lookup alone is still about 5 times slower. NFR-10 is not met; the 0.6 work is fewer atomic operations per ticket, cheaper probes (the keyed hash O-8, smaller slots), and a cheaper clock on the hot path.
+
 NFR-10 is judged on `door_1m` and `budget_check`. Numbers are published in `docs/PERFORMANCE.md` with host, OS, CPU, Rust version, and profile; p99 and p99.9 from a harness over 10^7 operations; baselines committed; a regression over 5% blocks the change.
 
 ---
