@@ -1,4 +1,5 @@
-//! Edge cases 53, 55, 58, 65, 66, and 67 (0.5).
+//! Edge cases 53, 55, 58, 69, 70, and 71 (0.5; numbered as in dev/PLAN.md
+//! 12.5).
 
 use std::{
     net::IpAddr,
@@ -75,7 +76,7 @@ fn test_monotonic_expiry_ignores_the_wall_clock() {
 
 #[test]
 fn test_hammering_one_shard_while_banning_and_lifting() {
-    // Edge case 65: 32 threads on one shard, one thread banning and lifting.
+    // Edge case 69: 32 threads on one shard, one thread banning and lifting.
     let b = Arc::new(
         Bouncer::builder()
             .shards(1)
@@ -132,7 +133,7 @@ impl Ejector for PanicsOnMaintainer {
 
 #[test]
 fn test_maintainer_death_leaves_enforcement_and_maintain() {
-    // Edge case 66.
+    // Edge case 70.
     let b = Bouncer::builder()
         .maintainer(true)
         .ejector(Arc::new(PanicsOnMaintainer))
@@ -172,7 +173,7 @@ impl EventSink for Slow {
 
 #[test]
 fn test_blocking_sink_never_slows_checkpoints() {
-    // Edge case 67.
+    // Edge case 71.
     let b = Bouncer::builder()
         .event_sink(Arc::new(Slow))
         .budgets(Budgets::off())

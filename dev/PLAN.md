@@ -779,7 +779,7 @@ Every public function and every `Ok` and `Err` path, tests at the bottom of each
 
 ### 12.6 Attack tests and CI
 
-Every row of section 8 has its named test. A replay harness drives recorded hostile traffic (scanner, slowloris, credential stuffing from a /48, a CGNAT population) through serve-net at 0.7. CI: Linux, macOS, Windows on stable and 1.85; fmt; clippy in default, all, and no-default modes under `-D warnings`; tests in the same three modes; `cargo doc -D warnings` with default and all features; `cargo audit`; `cargo deny check`; a loom job; a fuzz build job.
+Every row of section 8 has its named test. A replay harness drives recorded hostile traffic (scanner, slowloris, credential stuffing from a /48, a CGNAT population) through serve-net at 0.8, with the net-io feature it needs (ROADMAP 0.8). CI: Linux, macOS, Windows on stable and 1.85; fmt; clippy in default, all, and no-default modes under `-D warnings`; tests in the same three modes; `cargo doc -D warnings` with default and all features; `cargo audit`; `cargo deny check`; a loom job; a fuzz build job.
 
 ---
 
