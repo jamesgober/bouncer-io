@@ -266,7 +266,7 @@ fn main() {
     row(
         "request + bind_session",
         measure(|i| {
-            let mut r = conn.request(RequestId(i as u128 + 1 << 40)).unwrap();
+            let mut r = conn.request(RequestId(i as u128 + (1 << 40))).unwrap();
             let mut d = [0u8; 16];
             d[..8].copy_from_slice(&(i as u64).to_le_bytes());
             black_box(
