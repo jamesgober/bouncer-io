@@ -211,7 +211,7 @@ fn soak_connections_bans_and_revocations() {
                     }
                     std::thread::yield_now();
                 }
-                b.revoke(session(1 << 40 | k), Reason::LOGOUT).unwrap();
+                b.revoke(session((1 << 40) | k), Reason::LOGOUT).unwrap();
                 revoked.store(k, Ordering::SeqCst);
                 counts.revocations.fetch_add(1, Ordering::Relaxed);
                 std::thread::sleep(Duration::from_millis(1));
@@ -236,7 +236,7 @@ fn soak_connections_bans_and_revocations() {
                 let peer = IpAddr::from([0x2001, 0xdb8, (k & 0xffff) as u16, 0, 0, 0, 0, 1]);
                 let conn = b.door(peer).unwrap();
                 let mut req = conn.request(RequestId(u128::from(k))).unwrap();
-                assert!(req.bind_session(session(1 << 40 | k)).is_pass());
+                assert!(req.bind_session(session((1 << 40) | k)).is_pass());
                 ready.store(k, Ordering::SeqCst);
                 loop {
                     let done = revoked.load(Ordering::SeqCst) >= k;
