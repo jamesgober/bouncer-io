@@ -7,7 +7,9 @@
 
 use std::net::IpAddr;
 
-use bouncer_io::{Bouncer, Budgets, Directive, EscalationPolicy, Reason, RequestId, SessionKey, Ticket};
+use bouncer_io::{
+    Bouncer, Budgets, Directive, EscalationPolicy, Reason, RequestId, SessionKey, Ticket,
+};
 use libfuzzer_sys::fuzz_target;
 
 const ADDRS: usize = 8;
@@ -63,16 +65,27 @@ fuzz_target!(|data: &[u8]| {
                     Ok(conn) => {
                         assert!(!banned[a], "banned address {a} admitted");
                         if live.len() < 64 {
-                            let Ok(mut req) = conn.request(RequestId(live.len() as u128)) else { continue };
+                            let Ok(mut req) = conn.request(RequestId(live.len() as u128)) else {
+                                continue;
+                            };
                             // A revocation stops running work; once maintenance has
                             // reclaimed it, a new bind of the session passes (keeping
                             // the session out for good is a ban or the gate's job).
                             let bound = req.bind_session(session(s));
                             if bound.is_deny() {
-                                assert!(revoked_sessions[s], "bind of session {s} denied without a revocation");
+                                assert!(
+                                    revoked_sessions[s],
+                                    "bind of session {s} denied without a revocation"
+                                );
                             }
                             let revoked = bound.is_deny();
-                            live.push(Live { conn, req, addr: a, session: s, revoked });
+                            live.push(Live {
+                                conn,
+                                req,
+                                addr: a,
+                                session: s,
+                                revoked,
+                            });
                         }
                     }
                     Err(_) => assert!(banned[a], "address {a} refused without a ban"),
@@ -80,7 +93,11 @@ fuzz_target!(|data: &[u8]| {
             }
             3 => {
                 let s = arg % SESSIONS;
-                let _ = b.apply(Directive::revoke(session(s)).because(Reason::LOGOUT).keep_connection());
+                let _ = b.apply(
+                    Directive::revoke(session(s))
+                        .because(Reason::LOGOUT)
+                        .keep_connection(),
+                );
                 revoked_sessions[s] = true;
                 for l in live.iter_mut().filter(|l| l.session == s) {
                     l.revoked = true;
@@ -97,7 +114,13 @@ fuzz_target!(|data: &[u8]| {
             5 => {
                 for l in live.iter_mut() {
                     let v = l.req.checkpoint();
-                    assert_eq!(v.is_deny(), l.revoked, "request at {} session {}", l.addr, l.session);
+                    assert_eq!(
+                        v.is_deny(),
+                        l.revoked,
+                        "request at {} session {}",
+                        l.addr,
+                        l.session
+                    );
                 }
             }
             _ => {

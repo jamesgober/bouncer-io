@@ -1,8 +1,12 @@
 //! Arbitrary bytes as a persisted snapshot: loading either refuses with an
 //! error or starts a bouncer that works. Never a panic, never a partial load
-//! that breaks the door.
+//! that breaks the door. With bit 2 of the first byte set, the rest is
+//! framed as a snapshot without a MAC (magic, length, CRC), so mutations
+//! reach the record decoder.
 
 #![no_main]
+
+mod frame;
 
 use bouncer_io::{Bouncer, LoadFailure, PersistError, Persistence};
 use libfuzzer_sys::fuzz_target;
@@ -32,13 +36,19 @@ fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else {
         return;
     };
+    let framed = mode & 4 != 0;
+    let bytes = if framed {
+        frame::snapshot(rest)
+    } else {
+        rest.to_vec()
+    };
     let mut builder = Bouncer::builder()
         .ban_capacity(1024)
         .revocation_capacity(64)
         .tickets(64)
         .budgets(bouncer_io::Budgets::off())
-        .persistence(Box::new(Bytes(Some(rest.to_vec()))));
-    if mode & 1 != 0 {
+        .persistence(Box::new(Bytes(Some(bytes))));
+    if mode & 1 != 0 && !framed {
         builder = builder.mac_key([mode; 32]);
     }
     if mode & 2 != 0 {
