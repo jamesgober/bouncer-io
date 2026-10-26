@@ -63,7 +63,7 @@ Items: the door under 100 ns p99 with 1,000,000 bans (moved from 0.3); T-12, p99
 Exit:
 - [x] Every target of PLAN 11 met, or the gap recorded here with a plan: see `docs/PERFORMANCE.md`. Gaps: the door's 100 ns p99 (113.4 ns per call admitted; plan below); ticket issue and release at 32 threads (not measured; measured at one thread, 40.1 ns); memory per ban 56 B against 45 to 48 B (within the 64 B limit; plan below).
 - [ ] NFR-10 met on `door_1m` (PLAN D-081: 20% faster than the same-job composition). Not met: admitted 113.4 against 109.3 ns, random peers 151.2 against 118.1 ns. `checkpoint_fast` within 10% of an `AtomicBool` load: met (0.2 against 0.3 ns). `budget_check`: bouncer checks two rates (client and prefix) in about the time governor checks one.
-- [ ] Baselines committed; the 5% regression gate active (Callgrind instruction counts; the first CI run writes the baseline).
+- [x] Baselines committed; the 5% regression gate active (Callgrind instruction counts in `benches/gate-baseline.txt`, from the first CI run; the second run matched it exactly).
 - [x] T-12: checkpoints under 100,009 revocations a second, p99 0.8 ns (mean of 10,000); the slow path with seven keys bound, p99 96.2 ns.
 - [x] O-4, O-5, O-8 decided by measurement (PLAN D-082, D-085); `#[track_caller]` measured (D-089); `docs/PERFORMANCE.md` written.
 
