@@ -469,18 +469,24 @@ impl DoorBudgets {
         self.keys_hashed(&mut crate::bans::AddrHashes::new(self.key, addr))
     }
 
-    /// The two keys through the door's hash cache: the same keyed hash as
-    /// the ban table's (`key` is the table's), so each is computed once.
+    /// The two keys of the door's address, under the budgets' own hash key
+    /// (never the ban table's, which a reseed replaces: budgets must not
+    /// reset with it).
     #[inline]
     fn keys_hashed(&self, hashes: &mut crate::bans::AddrHashes) -> [u64; 2] {
-        let (client, prefix) = match hashes.host().family() {
+        let host = *hashes.host();
+        let (client, prefix) = match host.family() {
             Family::V4 => (32, 24),
             Family::V6 => (64, 48),
         };
-        [
-            Claims::key(hashes.get(client)),
-            Claims::key(hashes.get(prefix)),
-        ]
+        let hash = |len: u8| {
+            let p = host.parent(len).unwrap_or(host);
+            Claims::key(crate::bans::table::hash_key(
+                &self.key,
+                &crate::bans::BanMemory::prefix_key(&p),
+            ))
+        };
+        [hash(client), hash(prefix)]
     }
 
     /// Whether admissions hold concurrency slots (returned on release).

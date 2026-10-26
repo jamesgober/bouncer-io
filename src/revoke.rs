@@ -446,7 +446,7 @@ impl Revocations {
                 }
                 self.count(writer, &r.key, true);
             }
-            Err(()) => return Err(()),
+            Err(_) => return Err(()),
         }
         Ok(epoch.bump())
     }

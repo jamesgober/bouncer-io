@@ -106,7 +106,7 @@ impl BanMemory {
                         Ok(gone)
                     }
                     Ok(Inserted::Merged { .. }) => Ok(None),
-                    Err(()) => Err(BouncerError::BanTableFull {
+                    Err(_) => Err(BouncerError::BanTableFull {
                         capacity: self.table.capacity(),
                     }),
                 }

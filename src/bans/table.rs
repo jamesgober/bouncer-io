@@ -24,9 +24,9 @@ pub(crate) fn hash_key(key: &HashKey, k: &TableKey) -> u64 {
     // `k1`; an IPv6 prefix of /64 or shorter in `k0`): two words suffice.
     // The kind and length in `meta` keep the classes apart.
     match k.kind {
-        KIND_V4 => key.hash2(meta, k.k1),
-        KIND_V6 if k.len <= 64 => key.hash2(meta, k.k0),
-        _ => key.hash3(meta, k.k0, k.k1),
+        KIND_V4 => key.mix2(meta, k.k1),
+        KIND_V6 if k.len <= 64 => key.mix2(meta, k.k0),
+        _ => key.mix3(meta, k.k0, k.k1),
     }
 }
 
@@ -271,17 +271,43 @@ pub(crate) struct Table {
 }
 
 /// Writer-side bookkeeping, kept inside the owner's writer lock.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct TableWriter {
     live: u32,
     hand: usize,
+    /// Keys for reseeds.
+    rng: crate::hash::Rng,
+}
+
+impl Default for TableWriter {
+    fn default() -> Self {
+        TableWriter::new(0x5eed)
+    }
 }
 
 impl TableWriter {
+    pub(crate) fn new(seed: u64) -> TableWriter {
+        TableWriter {
+            live: 0,
+            hand: 0,
+            rng: crate::hash::Rng::from_seed(seed),
+        }
+    }
+
     /// Live entries, expired ones not yet reclaimed included.
     pub(crate) fn live(&self) -> u32 {
         self.live
     }
+}
+
+/// Why an insert found no room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoRoom {
+    /// Every entry is one the table may not evict.
+    Full,
+    /// The key's probe sequence is full although the table is not: keys
+    /// that collide under this hash key (T-9). A reseed makes room.
+    ProbeBound,
 }
 
 #[inline]
@@ -477,7 +503,7 @@ impl Table {
         entry: Entry,
         now_secs: u64,
         merge: impl FnOnce(&Entry) -> Entry,
-    ) -> Result<Inserted, ()> {
+    ) -> Result<Inserted, NoRoom> {
         let (start, h2) = self.locate(&entry.key);
         if let Some((slot, raw)) = self.position(&entry.key) {
             let previous = raw.entry();
@@ -521,7 +547,7 @@ impl Table {
                 let mut removed = None;
                 let mut evicted = false;
                 if w.live >= self.capacity {
-                    let (e, was_evicted) = self.make_room(w, now_secs).ok_or(())?;
+                    let (e, was_evicted) = self.make_room(w, now_secs).ok_or(NoRoom::Full)?;
                     removed = Some(e);
                     evicted = was_evicted;
                 }
@@ -530,7 +556,8 @@ impl Table {
             }
             None => match window_victim {
                 Some((slot, victim)) => (slot, Some(victim), true),
-                None => return Err(()),
+                None if w.live < self.capacity => return Err(NoRoom::ProbeBound),
+                None => return Err(NoRoom::Full),
             },
         };
         self.store(slot, &entry, h2);
@@ -612,6 +639,163 @@ impl Table {
     /// The entry under `key` for the writer, expired or not.
     pub(crate) fn get_owned(&self, key: &TableKey) -> Option<Entry> {
         self.position(key).map(|(_, raw)| raw.entry())
+    }
+}
+
+/// The ban table behind a handle that can be replaced whole: readers keep a
+/// per-thread copy of the current table and check one version word, so a
+/// read never waits; the writer (under the owner's writer lock) replaces the
+/// table when an insert reaches the probe bound, rebuilt under a fresh hash
+/// key (T-9). A replaced table is freed once every thread has moved on.
+pub(crate) struct Tables {
+    uid: u64,
+    version: AtomicU64Std,
+    current: std::sync::RwLock<std::sync::Arc<Table>>,
+    reseeds: AtomicU64Std,
+}
+
+type AtomicU64Std = std::sync::atomic::AtomicU64;
+
+type CachedTable = Option<(u64, u64, std::sync::Arc<Table>)>;
+
+std::thread_local! {
+    static CURRENT: core::cell::RefCell<CachedTable> = const { core::cell::RefCell::new(None) };
+}
+
+static NEXT_TABLES: AtomicU64Std = AtomicU64Std::new(1);
+
+impl Tables {
+    pub(crate) fn new(table: Table) -> Tables {
+        Tables {
+            uid: NEXT_TABLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            version: AtomicU64Std::new(0),
+            current: std::sync::RwLock::new(std::sync::Arc::new(table)),
+            reseeds: AtomicU64Std::new(0),
+        }
+    }
+
+    fn load(&self) -> std::sync::Arc<Table> {
+        std::sync::Arc::clone(
+            &self
+                .current
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Runs `f` on the current table.
+    #[inline]
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&Table) -> R) -> R {
+        let version = self.version.load(std::sync::atomic::Ordering::Acquire);
+        let mut f = Some(f);
+        let done = CURRENT
+            .try_with(|cell| {
+                let mut slot = cell.try_borrow_mut().ok()?;
+                if !matches!(&*slot, Some((uid, v, _)) if *uid == self.uid && *v == version) {
+                    *slot = Some((self.uid, version, self.load()));
+                }
+                let table = &slot.as_ref()?.2;
+                f.take().map(|f| f(table))
+            })
+            .ok()
+            .flatten();
+        match done {
+            Some(r) => r,
+            None => {
+                let table = self.load();
+                match f.take() {
+                    Some(f) => f(&table),
+                    None => unreachable!("the closure runs at most once"),
+                }
+            }
+        }
+    }
+
+    /// Reseeds so far.
+    pub(crate) fn reseeds(&self) -> u64 {
+        self.reseeds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn capacity(&self) -> u32 {
+        self.with(Table::capacity)
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.with(Table::bytes)
+    }
+
+    pub(crate) fn hasher(&self) -> HashKey {
+        self.with(Table::hasher)
+    }
+
+    pub(crate) fn find(&self, key: &TableKey, now_secs: u64) -> Probe {
+        self.with(|t| t.find(key, now_secs))
+    }
+
+    pub(crate) fn get_owned(&self, key: &TableKey) -> Option<Entry> {
+        self.with(|t| t.get_owned(key))
+    }
+
+    pub(crate) fn remove(&self, w: &mut TableWriter, key: &TableKey) -> Option<Entry> {
+        self.with(|t| t.remove(w, key))
+    }
+
+    pub(crate) fn remove_where(
+        &self,
+        w: &mut TableWriter,
+        remove: impl FnMut(&Entry) -> bool,
+    ) -> Vec<Entry> {
+        self.with(|t| t.remove_where(w, remove))
+    }
+
+    pub(crate) fn for_each(&self, f: impl FnMut(&Entry)) {
+        self.with(|t| t.for_each(f));
+    }
+
+    /// Inserts or merges, as [`Table::insert`]. When the key's probe
+    /// sequence is full although the table is not, the table is rebuilt
+    /// under a fresh hash key and the insert retried (once). The caller
+    /// holds the owner's writer lock.
+    pub(crate) fn insert(
+        &self,
+        w: &mut TableWriter,
+        entry: Entry,
+        now_secs: u64,
+        merge: impl Fn(&Entry) -> Entry,
+    ) -> Result<Inserted, NoRoom> {
+        match self.with(|t| t.insert(w, entry, now_secs, &merge)) {
+            Err(NoRoom::ProbeBound) => {
+                let old = self.load();
+                let key = HashKey::new(w.rng.next_u64(), w.rng.next_u64());
+                let fresh = Table::new(old.capacity, key);
+                let mut moved = TableWriter {
+                    live: 0,
+                    hand: 0,
+                    rng: w.rng.clone(),
+                };
+                let mut ok = true;
+                old.for_each(|e| {
+                    ok &= fresh.insert(&mut moved, *e, 0, |_| *e).is_ok();
+                });
+                if !ok {
+                    return Err(NoRoom::ProbeBound);
+                }
+                let result = fresh.insert(&mut moved, entry, now_secs, &merge);
+                w.live = moved.live;
+                w.hand = 0;
+                *self
+                    .current
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    std::sync::Arc::new(fresh);
+                self.version
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                self.reseeds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                result
+            }
+            other => other,
+        }
     }
 }
 
@@ -706,7 +890,10 @@ mod tests {
         for n in 0..8 {
             t.insert(&mut w, entry(n, 0, false), 0, |e| *e).unwrap();
         }
-        assert_eq!(t.insert(&mut w, entry(100, 50, true), 0, |e| *e), Err(()));
+        assert_eq!(
+            t.insert(&mut w, entry(100, 50, true), 0, |e| *e),
+            Err(NoRoom::Full)
+        );
         for n in 0..8 {
             assert!(matches!(t.find(&key(n), 0), Probe::Hit(_)));
         }
@@ -817,7 +1004,8 @@ mod flood_tests {
 
     /// Threat T-9: keys chosen to collide under a known hash key exhaust the
     /// probe bound; the same keys under a different (secret, random) key all
-    /// fit. The attacker never learns the key, so it cannot choose collisions.
+    /// fit. The attacker never learns the key, so it cannot choose collisions;
+    /// if keys pile up anyway, the table rebuilds under a fresh key.
     #[test]
     fn test_table_hash_flooding_needs_the_key() {
         let known = HashKey::new(0x1111, 0x2222);
@@ -845,5 +1033,18 @@ mod flood_tests {
         for &n in &colliding {
             assert!(matches!(secret.find(&entry(n).key, 0), Probe::Hit(_)));
         }
+
+        // The known key behind the handle: it reseeds and every key fits.
+        let tables = Tables::new(Table::new(4096, known));
+        let mut w = TableWriter::new(9);
+        for &n in &colliding {
+            tables.insert(&mut w, entry(n), 0, |e| *e).unwrap();
+        }
+        assert!(tables.reseeds() >= 1, "the probe bound forced a reseed");
+        assert_ne!(tables.hasher(), known);
+        for &n in &colliding {
+            assert!(matches!(tables.find(&entry(n).key, 0), Probe::Hit(_)));
+        }
+        assert_eq!(w.live(), colliding.len() as u32);
     }
 }

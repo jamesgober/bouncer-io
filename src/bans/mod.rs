@@ -24,7 +24,7 @@ use self::{
     compiled::PrefixSet,
     escalate::{EscalationPolicy, Plan, Tracker},
     offenders::{Offence, Offenders},
-    table::{Entry, FLAG_EVICTABLE, Inserted, Probe, Table, TableKey, TableWriter},
+    table::{Entry, FLAG_EVICTABLE, Inserted, Probe, Table, TableKey, TableWriter, Tables},
 };
 use crate::{
     directive::{Actor, ActorKind, Evidence, Reason},
@@ -476,7 +476,9 @@ pub(crate) struct Own {
 
 /// The ban memory of one bouncer.
 pub(crate) struct BanMemory {
-    table: Table,
+    table: Tables,
+    /// Reseeds already reported.
+    reseeds_seen: std::sync::atomic::AtomicU64,
     present_v4: AtomicU64,
     present_v6: [AtomicU64; 3],
     present_ident: AtomicU64,
@@ -575,7 +577,8 @@ impl BanMemory {
             HashKey::new(rng.next_u64(), rng.next_u64()),
         );
         BanMemory {
-            table: Table::new(capacity, key),
+            table: Tables::new(Table::new(capacity, key)),
+            reseeds_seen: std::sync::atomic::AtomicU64::new(0),
             present_v4: AtomicU64::new(0),
             present_v6: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             present_ident: AtomicU64::new(0),
@@ -584,7 +587,7 @@ impl BanMemory {
             admin: RwLock::new(Arc::new(PrefixSet::empty())),
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             writer: Mutex::new(Writer {
-                table: TableWriter::default(),
+                table: TableWriter::new(rng_seed ^ 0x7ab1_e5ee_d000_0001),
                 counts_v4: [0; 33],
                 counts_v6: [0; 129],
                 counts_ident: [0; 16],
@@ -924,7 +927,7 @@ impl BanMemory {
                         }
                         BanId(id)
                     }
-                    Err(()) => {
+                    Err(_) => {
                         return Err(BouncerError::BanTableFull {
                             capacity: self.table.capacity(),
                         });
@@ -1224,6 +1227,14 @@ impl BanMemory {
         self.lookup_hashed(&mut hashes, now_secs)
     }
 
+    /// Reseeds since the last call (each is reported once).
+    pub(crate) fn take_reseeds(&self) -> u64 {
+        let now = self.table.reseeds();
+        now - self
+            .reseeds_seen
+            .swap(now, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The table's hash key, for [`AddrHashes`].
     pub(crate) fn hasher(&self) -> HashKey {
         self.table.hasher()
@@ -1265,25 +1276,40 @@ impl BanMemory {
                 }
             }
         }
-        let mut starts = [(0usize, 0u8); PROBE_BATCH];
-        for i in 0..count {
-            starts[i] = self.table.locate_hash(hashes.get(lengths[i]));
-        }
-        let mut tags = [0u64; PROBE_BATCH];
-        for i in 0..count {
-            tags[i] = self.table.first_tags(starts[i].0);
-        }
-        for i in 0..count {
-            // The full key is only compared on a tag match.
-            let key = Self::prefix_key(&host.parent(lengths[i]).unwrap_or(host));
-            match self
-                .table
-                .find_at(&key, starts[i].0, starts[i].1, tags[i], now_secs)
-            {
-                Probe::Hit(e) => return Lookup::Banned(e.id),
-                Probe::Busy => busy = true,
-                Probe::Miss => {}
-            }
+        // Nothing banned at any automatic length: no table to read.
+        let hit = (count > 0)
+            .then(|| {
+                self.table.with(|table| {
+                    // A reseed since the hashes were made: make them again.
+                    if hashes.key != table.hasher() {
+                        *hashes = AddrHashes::new(table.hasher(), addr);
+                    }
+                    let mut starts = [(0usize, 0u8); PROBE_BATCH];
+                    for i in 0..count {
+                        starts[i] = table.locate_hash(hashes.get(lengths[i]));
+                    }
+                    let mut tags = [0u64; PROBE_BATCH];
+                    for i in 0..count {
+                        tags[i] = table.first_tags(starts[i].0);
+                    }
+                    let mut busy = false;
+                    for i in 0..count {
+                        // The full key is only compared on a tag match.
+                        let key = Self::prefix_key(&host.parent(lengths[i]).unwrap_or(host));
+                        match table.find_at(&key, starts[i].0, starts[i].1, tags[i], now_secs) {
+                            Probe::Hit(e) => return Some(Lookup::Banned(e.id)),
+                            Probe::Busy => busy = true,
+                            Probe::Miss => {}
+                        }
+                    }
+                    busy.then_some(Lookup::Busy)
+                })
+            })
+            .flatten();
+        match hit {
+            Some(Lookup::Busy) => busy = true,
+            Some(found) => return found,
+            None => {}
         }
         if overflow {
             // More automatic lengths in use than one batch: probe the rest

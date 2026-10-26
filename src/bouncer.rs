@@ -177,6 +177,18 @@ impl Shared {
         .send(self);
     }
 
+    /// Reports a rebuild of the ban table under a fresh hash key (T-9).
+    pub(crate) fn report_reseeds(&self) {
+        let n = self.bans.take_reseeds();
+        if n > 0 {
+            Emit {
+                count: u32::try_from(n).unwrap_or(u32::MAX),
+                ..Emit::new(events::signals::TABLE_RESEEDED)
+            }
+            .send(self);
+        }
+    }
+
     /// Bookkeeping after bans were lifted outside `lift` (persistence).
     pub(crate) fn after_lift(&self, lifted: &[crate::bans::view::Held]) {
         let keys: Vec<BanKey> = lifted.iter().map(|h| h.key).collect();
@@ -226,6 +238,7 @@ impl Shared {
         let (result, plan) = match planned {
             Ok((id, plan, gone, own)) => {
                 self.report_gone(gone);
+                self.report_reseeds();
                 meter!(self.meters, bans_added);
                 self.record_ban(&spec.key, id, own.as_ref());
                 (Ok(id), plan)
@@ -1808,9 +1821,9 @@ impl BouncerBuilder {
             .unwrap_or_else(|| Arc::new(RevocationEpoch::new()));
         let mut rng = crate::hash::Rng::from_seed(seeds.rng ^ 0x0b0b);
         let derived = |rng: &mut crate::hash::Rng| HashKey::new(rng.next_u64(), rng.next_u64());
-        // The table's key: one keyed hash of a prefix serves the ban lookup
-        // and the door budgets.
-        let budgets = DoorBudgets::new(&self.budgets, seeds.tables, self.tickets);
+        // The budgets' own key: a reseed of the ban table must not reset
+        // anyone's budget.
+        let budgets = DoorBudgets::new(&self.budgets, derived(&mut rng), self.tickets);
         let identity = IdentityBudgets::new(&self.budgets, derived(&mut rng), Now::default());
         let revocation_rate =
             rate_net::Quota::rate(self.revocation_rate_limit, Duration::from_secs(1))
