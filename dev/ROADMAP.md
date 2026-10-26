@@ -109,6 +109,21 @@ Exit:
 - [ ] A browser on localhost banned by an admin call is refused at the door.
 - [ ] A logged-in browser whose session is revoked mid-request gets the generic denial and its connection is closed.
 - [ ] A streamed response cut by revocation leaks at most one chunk (loopback capture).
+- [ ] NFR-10: the door 20% faster than the same-job composition, admitted and random peers (PLAN D-081).
+
+NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core on a loaded machine; final numbers on a quiet one in `docs/PERFORMANCE.md`):
+
+| Step | Result |
+|---|---|
+| keyed multiply mix, reseed at the probe bound (D-102) | judgement with 1,000,000 bans -27%, `door_at` admitted -11% |
+| addresses anchored at their family's shortest automatic length, one group per lookup (D-104) | `door_at` random peers -15% |
+| first table and allow list read without a thread-local access | judgement -10% more |
+| each length's key built once, unkeyed tags past the anchor, direct masks | judgement 55 -> 33 ns in all |
+| connection release without the link swap | dropped: loom L-7 fails without it (D-103) |
+| a per-thread stash of free cells | dropped: no gain measured (the thread-local access costs what the two compare-and-swaps did) |
+| the ticket owner releasing with a load and a store | dropped: loom L-5 rejects it |
+| budgets reusing the lookup's prefix hash | dropped: no gain measured |
+| a fast clock for `door` | not in clock-lib: its directives put timers out of scope and forbid `unsafe` (no timestamp counter); `door_at` with the transport's accept time is the fast path |
 
 ## v0.9.0 - Beta and release candidates
 Items: used end to end by the web stack and one non-HTTP service (a database network layer or the back-channel); API review against the simple-API rule; `cargo-semver-checks` in CI; release candidates `0.9.x`.
