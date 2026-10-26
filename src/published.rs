@@ -1,8 +1,10 @@
 //! A value read on hot paths and replaced whole: the allow list.
 //!
-//! Readers keep a per-thread copy of the `Arc` and check one version word, so
-//! a read is one atomic load and a thread-local access; only the first read
-//! after a replacement takes the lock. Writers swap the value under the lock
+//! Until the first replacement a read is one atomic load of the version word
+//! and the value built with it. After that, readers keep a per-thread copy of
+//! the `Arc` and check the version word, so a read is one atomic load and a
+//! thread-local access; only the first read after a replacement takes the
+//! lock. Writers swap the value under the lock
 //! and then move the version, so a reader that sees the new version reads
 //! the new value.
 
@@ -28,15 +30,20 @@ static NEXT_UID: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct Published<T> {
     uid: u64,
     version: AtomicU64,
+    /// The value it was built with: read directly while it has never been
+    /// replaced (most allow lists never are), with no thread-local access.
+    first: Arc<T>,
     value: RwLock<Arc<T>>,
 }
 
 impl<T: Send + Sync + 'static> Published<T> {
     pub(crate) fn new(value: T) -> Published<T> {
+        let first = Arc::new(value);
         Published {
             uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
             version: AtomicU64::new(0),
-            value: RwLock::new(Arc::new(value)),
+            value: RwLock::new(Arc::clone(&first)),
+            first,
         }
     }
 
@@ -65,6 +72,9 @@ impl<T: Send + Sync + 'static> Published<T> {
     #[inline]
     pub(crate) fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         let version = self.version.load(Ordering::Acquire);
+        if version == 0 {
+            return f(&self.first);
+        }
         let mut f = Some(f);
         let cached = CACHE
             .try_with(|cell| {

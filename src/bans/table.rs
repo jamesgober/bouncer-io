@@ -484,6 +484,7 @@ impl Table {
 
     /// The table's hash key (shared with the door budgets, so one hash of a
     /// prefix serves both).
+    #[cfg(all(test, not(bouncer_loom)))]
     pub(crate) fn hasher(&self) -> HashKey {
         self.key
     }
@@ -784,6 +785,10 @@ impl Table {
 pub(crate) struct Tables {
     uid: u64,
     version: AtomicU64Std,
+    /// The table built with the bouncer, read directly until the first
+    /// reseed (no thread-local access on the door's path); kept until the
+    /// bouncer is dropped, since a reader may still be in it.
+    first: Table,
     current: std::sync::RwLock<std::sync::Arc<Table>>,
     reseeds: AtomicU64Std,
 }
@@ -800,10 +805,12 @@ static NEXT_TABLES: AtomicU64Std = AtomicU64Std::new(1);
 
 impl Tables {
     pub(crate) fn new(table: Table) -> Tables {
+        let placeholder = Table::new(1, table.key);
         Tables {
             uid: NEXT_TABLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             version: AtomicU64Std::new(0),
-            current: std::sync::RwLock::new(std::sync::Arc::new(table)),
+            first: table,
+            current: std::sync::RwLock::new(std::sync::Arc::new(placeholder)),
             reseeds: AtomicU64Std::new(0),
         }
     }
@@ -821,6 +828,9 @@ impl Tables {
     #[inline]
     pub(crate) fn with<R>(&self, f: impl FnOnce(&Table) -> R) -> R {
         let version = self.version.load(std::sync::atomic::Ordering::Acquire);
+        if version == 0 {
+            return f(&self.first);
+        }
         let mut f = Some(f);
         let done = CURRENT
             .try_with(|cell| {
@@ -858,6 +868,7 @@ impl Tables {
         self.with(Table::bytes)
     }
 
+    #[cfg(all(test, not(bouncer_loom)))]
     pub(crate) fn hasher(&self) -> HashKey {
         self.with(Table::hasher)
     }
@@ -899,7 +910,14 @@ impl Tables {
     ) -> Result<Inserted, NoRoom> {
         match self.with(|t| t.insert(w, entry, now_secs, &merge)) {
             Err(NoRoom::ProbeBound) => {
-                let old = self.load();
+                // The writer holds the lock: the current table cannot change.
+                let old_ref: std::sync::Arc<Table>;
+                let old: &Table = if self.version.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                    &self.first
+                } else {
+                    old_ref = self.load();
+                    &old_ref
+                };
                 let key = HashKey::new(w.rng.next_u64(), w.rng.next_u64());
                 let fresh = Table::with_anchors(old.capacity, key, old.anchors);
                 let mut moved = TableWriter {

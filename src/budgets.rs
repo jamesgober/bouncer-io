@@ -466,7 +466,7 @@ impl DoorBudgets {
     /// The two keys of an address: the client (IPv4 /32, IPv6 /64) and its
     /// prefix (IPv4 /24, IPv6 /48).
     fn keys(&self, addr: IpAddr) -> [u64; 2] {
-        self.keys_hashed(&mut crate::bans::AddrHashes::new(self.key, addr))
+        self.keys_hashed(&mut crate::bans::AddrHashes::new(addr))
     }
 
     /// The two keys of the door's address, under the budgets' own hash key
@@ -523,11 +523,7 @@ impl DoorBudgets {
     /// that many tokens and the concurrency limits shrink by it.
     #[inline]
     pub(crate) fn admit(&self, addr: IpAddr, now: Now, divisor: u32) -> Result<(), OverBudget> {
-        self.admit_hashed(
-            &mut crate::bans::AddrHashes::new(self.key, addr),
-            now,
-            divisor,
-        )
+        self.admit_hashed(&mut crate::bans::AddrHashes::new(addr), now, divisor)
     }
 
     /// As [`admit`](Self::admit), through the door's hash cache. Nothing is

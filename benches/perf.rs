@@ -136,6 +136,18 @@ fn main() {
         }),
     );
     row(
+        "door_at, no rate budget, random",
+        measure(|i| {
+            let t = no_rate.bouncer.door_at(
+                ConnId(i as u64),
+                black_box(random[i & 0xffff]),
+                Provenance::Socket,
+                now,
+            );
+            black_box(t.is_ok());
+        }),
+    );
+    row(
         "judge only: 1m bans and admin set",
         measure(|i| {
             let _ = black_box(no_rate.bouncer.datagram(
@@ -153,6 +165,18 @@ fn main() {
             let t = no_admin.bouncer.door_at(
                 ConnId(i as u64),
                 black_box(no_admin.admitted[i & 4095]),
+                Provenance::Socket,
+                now,
+            );
+            black_box(t.is_ok());
+        }),
+    );
+    row(
+        "door_at, no rate, no admin set, random",
+        measure(|i| {
+            let t = no_admin.bouncer.door_at(
+                ConnId(i as u64),
+                black_box(random[i & 0xffff]),
                 Provenance::Socket,
                 now,
             );

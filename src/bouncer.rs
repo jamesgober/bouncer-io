@@ -566,7 +566,7 @@ impl Bouncer {
         let shared = &self.inner.shared;
         let peer = normalize(peer);
         shared.saw(now);
-        let mut hashes = crate::bans::AddrHashes::new(shared.bans.hasher(), peer);
+        let mut hashes = crate::bans::AddrHashes::new(peer);
         let (mut flags, source, charge) =
             match shared.judge_hashed(peer, provenance, now, &mut hashes) {
                 Judgement::Admit { immune, exempt } => {
