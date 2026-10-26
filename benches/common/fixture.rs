@@ -2,6 +2,9 @@
 //! automatic length and 10,000 administrator prefixes at other lengths,
 //! with banned and admitted probe addresses.
 
+// Each bench uses part of it.
+#![allow(dead_code)]
+
 use std::net::IpAddr;
 
 use bouncer_io::{BanSpec, Bouncer, Budgets, Cidr};
