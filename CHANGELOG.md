@@ -11,6 +11,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Forged datagrams no longer spend a real source's budget. Unverified datagrams were charged at their prefix under the same key as the prefix's connections and verified datagrams, so a flood of forged UDP naming a victim's /24 or /48 could get the victim's TCP connections refused. They now have a prefix key of their own.
+
+### Added
+
+- Tests for threats T-1 (a peer that is not a trusted proxy cannot name a client), T-18 (no printable value or event carries digest bytes), and T-20 (unverified datagram sources are never banned).
+
 ---
 
 ## [0.6.0] - 2026-10-26
