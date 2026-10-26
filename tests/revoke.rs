@@ -332,6 +332,55 @@ fn test_tags_request_egress_release() {
 }
 
 #[test]
+fn test_egress_after_revoke_writes_only_denial() {
+    // Threat T-7 (in process): a transport streaming 10 MiB in 16 KiB
+    // chunks checks egress before each write; another thread revokes the
+    // connection mid-stream. After `revoke` returns, at most the chunk whose
+    // check had already passed leaves, then only the denial.
+    const CHUNK: usize = 16 * 1024;
+    const CHUNKS: usize = 640;
+    for round in 0..50u64 {
+        let b = Arc::new(plain());
+        let conn = b.door(ip("192.0.2.1")).unwrap();
+        let id = conn.conn();
+        let tag = conn.into_tag();
+        let written = Arc::new(AtomicU64::new(0));
+        let writer = {
+            let (b, written) = (Arc::clone(&b), Arc::clone(&written));
+            std::thread::spawn(move || {
+                let mut out: Vec<u8> = Vec::with_capacity(CHUNK * CHUNKS);
+                for n in 0..CHUNKS {
+                    if b.egress(tag).is_deny() {
+                        out.extend_from_slice(b"DENIED");
+                        return (out, true);
+                    }
+                    out.extend(std::iter::repeat_n((n % 251) as u8, CHUNK));
+                    written.fetch_add(1, Ordering::SeqCst);
+                }
+                (out, false)
+            })
+        };
+        let at = 20 + (round as usize * 11) % 400;
+        while written.load(Ordering::SeqCst) < at as u64 && !writer.is_finished() {
+            std::hint::spin_loop();
+        }
+        b.revoke(id, Reason::ADMIN).unwrap();
+        let after_revoke = written.load(Ordering::SeqCst);
+        let (out, denied) = writer.join().unwrap();
+        let chunks = (out.len() / CHUNK) as u64;
+        if after_revoke < CHUNKS as u64 {
+            assert!(denied, "round {round}: the stream was cut");
+            assert!(out.ends_with(b"DENIED"));
+            assert!(
+                chunks <= after_revoke + 1,
+                "round {round}: {chunks} chunks left, {after_revoke} when revoke returned"
+            );
+        }
+        b.release(tag);
+    }
+}
+
+#[test]
 fn test_egress_connection_tag_sees_latest_request_session_revocation() {
     // Edge case 41.
     let b = plain();

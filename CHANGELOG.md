@@ -17,7 +17,7 @@
 
 ### Added
 
-- Tests for threats T-1 (a peer that is not a trusted proxy cannot name a client), T-18 (no printable value or event carries digest bytes), and T-20 (unverified datagram sources are never banned).
+- Tests for threats T-1 (a peer that is not a trusted proxy cannot name a client), T-7 (a stream cut by revocation leaks at most the chunk in flight), T-18 (no printable value or event carries digest bytes), and T-20 (unverified datagram sources are never banned). Every test named in the threat table now exists under that name.
 
 ---
 
