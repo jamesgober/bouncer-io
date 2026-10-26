@@ -15,7 +15,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let bytes = if mode & 1 != 0 {
-        frame::delta(rest)
+        frame::delta(if mode & 2 != 0 { 2 } else { 1 }, rest)
     } else {
         data.to_vec()
     };

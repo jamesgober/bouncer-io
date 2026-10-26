@@ -26,11 +26,11 @@ pub(crate) const LIFTED_KEYS: usize = 65_536;
 pub(crate) struct Contribution {
     pub(crate) origin: u16,
     pub(crate) stamp: u64,
-    /// Unix seconds; 0 = permanent.
-    pub(crate) until: u64,
-    pub(crate) issued: u64,
+    /// Unix seconds (to 2106); 0 = permanent.
+    pub(crate) until: u32,
+    pub(crate) issued: u32,
     /// The original length in seconds; 0 = permanent.
-    pub(crate) length: u64,
+    pub(crate) length: u32,
     pub(crate) actor: u8,
     pub(crate) reason: u16,
     pub(crate) offences: u16,
@@ -39,7 +39,7 @@ pub(crate) struct Contribution {
 
 impl Contribution {
     fn expired(&self, now_wall: u64) -> bool {
-        self.until != 0 && self.until <= now_wall
+        self.until != 0 && u64::from(self.until) <= now_wall
     }
 
     /// A local heuristic's timed ban (the table may evict it).
@@ -79,6 +79,9 @@ impl KeyState {
             .any(|&(scope, stamp)| scope.covers(c.origin) && stamp >= c.stamp)
     }
 }
+
+/// Every ban and every lift: `(key, ban)` and `(key, scope, stamp)`.
+pub(crate) type Dump = (Vec<(BanKey, Contribution)>, Vec<(BanKey, Scope, u64)>);
 
 /// What a ban record did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +131,8 @@ impl Ledger {
                 Applied::Changed
             }
             None => {
+                // Most keys hold one node's ban: no room for more until needed.
+                st.bans.reserve_exact(1);
                 st.bans.push(c);
                 Applied::Changed
             }
@@ -142,13 +147,16 @@ impl Ledger {
         }
         match st.lifts.iter_mut().find(|(s, _)| *s == scope) {
             Some((_, t)) => *t = (*t).max(stamp),
-            None => st.lifts.push((scope, stamp)),
+            None => {
+                st.lifts.reserve_exact(1);
+                st.lifts.push((scope, stamp));
+            }
         }
         let before = st.bans.len();
         // A lift covers bans stamped at or before it, as `covered` does for a
         // ban that arrives after the lift: two nodes can make equal stamps.
         st.bans
-            .retain(|b| !b.expired(now_wall) && !(scope.covers(b.origin) && b.stamp <= stamp));
+            .retain(|b| !(b.expired(now_wall) || (scope.covers(b.origin) && b.stamp <= stamp)));
         let removed = (before - st.bans.len()) as u32;
         self.forget_old_lifts();
         removed
@@ -209,7 +217,7 @@ impl Ledger {
         let rank = |c: &Contribution| {
             (
                 !c.evictable(),
-                if c.until == 0 { u64::MAX } else { c.until },
+                if c.until == 0 { u32::MAX } else { c.until },
                 c.stamp,
                 c.origin,
             )
@@ -234,10 +242,7 @@ impl Ledger {
     }
 
     /// Every ban and every lift, for snapshots and full exports.
-    pub(crate) fn dump(
-        &self,
-        now_wall: u64,
-    ) -> (Vec<(BanKey, Contribution)>, Vec<(BanKey, Scope, u64)>) {
+    pub(crate) fn dump(&self, now_wall: u64) -> Dump {
         let mut bans = Vec::new();
         let mut lifts = Vec::new();
         for (key, st) in &self.keys {
@@ -299,7 +304,7 @@ mod tests {
         BanKey::Address(std::net::IpAddr::from([198, 51, 100, i]))
     }
 
-    fn ban(origin: u16, stamp: u64, until: u64) -> Contribution {
+    fn ban(origin: u16, stamp: u64, until: u32) -> Contribution {
         Contribution {
             origin,
             stamp,
@@ -362,7 +367,11 @@ mod tests {
                     1 if next() % 3 == 0 => Op::Lift(k, Scope::All, stamp),
                     _ => Op::Ban(
                         k,
-                        ban(origin, stamp, if next() % 2 == 0 { 0 } else { 1000 + i }),
+                        ban(
+                            origin,
+                            stamp,
+                            if next() % 2 == 0 { 0 } else { 1000 + i as u32 },
+                        ),
                     ),
                 });
             }

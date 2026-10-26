@@ -28,7 +28,7 @@ fn unix(t: SystemTime) -> u64 {
 }
 
 /// The later of two Unix-second ends; 0 (permanent) above all.
-fn later(a: u64, b: u64) -> u64 {
+fn later(a: u32, b: u32) -> u32 {
     if a == 0 || b == 0 { 0 } else { a.max(b) }
 }
 
@@ -185,14 +185,15 @@ impl Shared {
             return None;
         };
         let origin = if origin == 0 { self.origin() } else { origin };
+        let secs = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
         Some((
             key.normalized(),
             Contribution {
                 origin,
                 stamp,
-                until,
-                issued,
-                length,
+                until: secs(until),
+                issued: secs(issued),
+                length: secs(length),
                 actor,
                 reason,
                 offences,
@@ -204,9 +205,9 @@ impl Shared {
     fn contribution_rec(key: &BanKey, c: &Contribution) -> Rec {
         Rec::Ban {
             key: *key,
-            until: c.until,
-            issued: c.issued,
-            length: c.length,
+            until: u64::from(c.until),
+            issued: u64::from(c.issued),
+            length: u64::from(c.length),
             actor: c.actor,
             reason: c.reason,
             offences: c.offences,
@@ -248,20 +249,21 @@ impl Shared {
         let key = key.normalized();
         let ctx = self.ctx_now();
         let mut l = lock(m);
+        let secs = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
         let until = if own.until == 0 {
             0
         } else {
-            unix(self.wall_at(own.until))
+            secs(unix(self.wall_at(own.until))).max(1)
         };
         let mut c = Contribution {
             origin: node,
             stamp: self.share.stamp(self.wall_ms()),
             until,
-            issued: unix(self.wall_at(own.issued)),
+            issued: secs(unix(self.wall_at(own.issued))),
             length: if own.until == 0 {
                 0
             } else {
-                u64::from(own.until.saturating_sub(own.issued)).max(1)
+                own.until.saturating_sub(own.issued).max(1)
             },
             actor: own.actor.code(),
             reason: own.reason.code(),
@@ -519,9 +521,6 @@ impl Shared {
     /// `None` when it has ended.
     fn restore_of(&self, key: BanKey, c: &Contribution, ctx: &LoadCtx) -> Option<Restore> {
         let Contribution {
-            until,
-            issued,
-            length,
             actor,
             reason,
             offences,
@@ -529,6 +528,8 @@ impl Shared {
             origin,
             ..
         } = *c;
+        let (until, issued, length) =
+            (u64::from(c.until), u64::from(c.issued), u64::from(c.length));
         let local_until = if until == 0 {
             0
         } else {
@@ -1135,5 +1136,223 @@ impl Bouncer {
             ..Emit::new(signals::IMPORT_REJECTED)
         }
         .send(self.shared());
+    }
+}
+
+#[cfg(all(test, not(bouncer_loom)))]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::{
+        codec::{self, Writer, crc32c},
+        persist::SNAPSHOT_MAGIC,
+        share::NodeId,
+    };
+
+    /// The snapshot (if any) and the journal.
+    type Files = (Option<Vec<u8>>, Vec<u8>);
+
+    /// Snapshot and journal in memory, shared with the test.
+    #[derive(Clone, Default)]
+    struct Mem(Arc<Mutex<Files>>);
+
+    impl Persistence for Mem {
+        fn load(&mut self) -> Result<Option<Vec<u8>>, PersistError> {
+            Ok(self.0.lock().unwrap().0.clone())
+        }
+        fn journal(&mut self) -> Result<Vec<u8>, PersistError> {
+            Ok(self.0.lock().unwrap().1.clone())
+        }
+        fn append(&mut self, r: &[u8]) -> Result<(), PersistError> {
+            self.0.lock().unwrap().1.extend_from_slice(r);
+            Ok(())
+        }
+        fn sync(&mut self) -> Result<(), PersistError> {
+            Ok(())
+        }
+        fn replace_snapshot(&mut self, s: &[u8]) -> Result<(), PersistError> {
+            let mut g = self.0.lock().unwrap();
+            g.0 = Some(s.to_vec());
+            g.1.clear();
+            Ok(())
+        }
+    }
+
+    fn addr(s: &str) -> BanKey {
+        BanKey::Address(s.parse().unwrap())
+    }
+
+    fn ban(key: BanKey, seq: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        assert!(codec::encode(
+            &mut out,
+            &Envelope {
+                origin: 0,
+                seq,
+                rec: Rec::Ban {
+                    key,
+                    until: 0,
+                    issued: 1_700_000_000,
+                    length: 0,
+                    actor: ActorKind::Admin.code(),
+                    reason: Reason::ADMIN.code(),
+                    offences: 0,
+                    id: seq,
+                    stamp: (1_700_000_000_000 + seq) << 16,
+                },
+            }
+        ));
+        out
+    }
+
+    /// A lift as format 1 wrote it (record type 2: key, stamp, actor).
+    fn legacy_lift(key: BanKey, seq: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        assert!(codec::encode(
+            &mut out,
+            &Envelope {
+                origin: 0,
+                seq,
+                rec: Rec::Lift {
+                    key,
+                    stamp: (1_700_000_100_000 + seq) << 16,
+                    actor: ActorKind::Admin.code(),
+                    all: false,
+                },
+            }
+        ));
+        // Re-frame without the scope byte, as type 2.
+        let body_len = u32::from_le_bytes(out[..4].try_into().unwrap()) as usize;
+        let mut body = out[4..4 + body_len - 1].to_vec();
+        body[0] = 2;
+        let mut framed = (body.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(&body);
+        framed.extend_from_slice(&crc32c(&body).to_le_bytes());
+        framed
+    }
+
+    /// A format-1 snapshot of `records` (epoch 7).
+    fn snapshot_v1(records: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = SNAPSHOT_MAGIC.to_vec();
+        let mut w = Writer(&mut out);
+        w.u16(1);
+        w.u16(0);
+        w.u64(1_700_000_000);
+        w.u64(7);
+        w.u16(0);
+        w.u64(0);
+        w.u64(records.len() as u64);
+        for r in records {
+            out.extend_from_slice(r);
+        }
+        let len = out.len() as u64;
+        Writer(&mut out).u64(len);
+        let crc = crc32c(&out);
+        Writer(&mut out).u32(crc);
+        out
+    }
+
+    /// A format-1 journal batch of epoch 7.
+    fn batch_v1(records: &[Vec<u8>]) -> Vec<u8> {
+        let body: Vec<u8> = records.concat();
+        let mut out = b"BNCJ".to_vec();
+        let mut w = Writer(&mut out);
+        w.u64(7);
+        w.u64(1_700_000_200);
+        w.u32(body.len() as u32);
+        out.extend_from_slice(&body);
+        let crc = crc32c(&out);
+        Writer(&mut out).u32(crc);
+        out
+    }
+
+    fn format_of(snapshot: &[u8]) -> u16 {
+        u16::from_le_bytes([snapshot[4], snapshot[5]])
+    }
+
+    #[test]
+    fn test_format_1_files_load_and_are_rewritten_as_format_2() {
+        // A snapshot and journal in the format 0.6 wrote: three bans, and a
+        // lift of the second in the journal. A node that does not share and
+        // one that does read them the same, and rewrite them at once.
+        for node in [None, Some(NodeId(4))] {
+            let store = Mem::default();
+            *store.0.lock().unwrap() = (
+                Some(snapshot_v1(&[
+                    ban(addr("192.0.2.1"), 1),
+                    ban(addr("192.0.2.2"), 2),
+                    ban(addr("192.0.2.3"), 3),
+                ])),
+                batch_v1(&[legacy_lift(addr("192.0.2.2"), 4)]),
+            );
+            let mut builder = Bouncer::builder().persistence(Box::new(store.clone()));
+            if let Some(n) = node {
+                builder = builder.node(n);
+            }
+            let b = builder.try_build().unwrap();
+            assert!(b.door("192.0.2.1".parse().unwrap()).is_err(), "{node:?}");
+            assert!(
+                b.door("192.0.2.2".parse().unwrap()).is_ok(),
+                "{node:?}: lifted"
+            );
+            assert!(b.door("192.0.2.3".parse().unwrap()).is_err(), "{node:?}");
+            let (snap, journal) = store.0.lock().unwrap().clone();
+            assert_eq!(format_of(&snap.unwrap()), persist::SNAPSHOT_FORMAT);
+            assert!(journal.is_empty(), "a new journal on the new snapshot");
+            drop(b);
+            // And the rewritten files load again.
+            let mut builder = Bouncer::builder().persistence(Box::new(store.clone()));
+            if let Some(n) = node {
+                builder = builder.node(n);
+            }
+            let b = builder.try_build().unwrap();
+            assert!(b.door("192.0.2.1".parse().unwrap()).is_err());
+            assert!(b.door("192.0.2.2".parse().unwrap()).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_sharing_node_keeps_each_origin_across_a_restart() {
+        // Node 1 holds node 2's and node 3's bans on one address. After a
+        // restart it still has both, so node 2's lift leaves node 3's ban,
+        // and node 3's lift ends it.
+        let store = Mem::default();
+        let one = || {
+            Bouncer::builder()
+                .node(NodeId(1))
+                .persistence(Box::new(store.clone()))
+                .try_build()
+                .unwrap()
+        };
+        let two = Bouncer::builder().node(NodeId(2)).try_build().unwrap();
+        let three = Bouncer::builder().node(NodeId(3)).try_build().unwrap();
+        let a: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        two.ban(a).unwrap();
+        three.ban(a).unwrap();
+        let b = one();
+        let start = crate::share::Sequence::START;
+        let _ = b
+            .import(&two.export_delta(start).unwrap(), Actor::Channel(2))
+            .unwrap();
+        let _ = b
+            .import(&three.export_delta(start).unwrap(), Actor::Channel(3))
+            .unwrap();
+        b.flush().unwrap();
+        drop(b);
+        let b = one();
+        assert!(b.door(a).is_err());
+        let since_two = two.export_delta(start).unwrap().last();
+        two.lift(LiftSpec::key(a).by(Actor::Gate)).unwrap();
+        let _ = b
+            .import(&two.export_delta(since_two).unwrap(), Actor::Channel(2))
+            .unwrap();
+        assert!(b.door(a).is_err(), "node 3's ban stands");
+        let since_three = three.export_delta(start).unwrap().last();
+        three.lift(LiftSpec::key(a).by(Actor::Gate)).unwrap();
+        let _ = b
+            .import(&three.export_delta(since_three).unwrap(), Actor::Channel(3))
+            .unwrap();
+        assert!(b.door(a).is_ok(), "both origins lifted");
     }
 }

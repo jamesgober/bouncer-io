@@ -15,8 +15,15 @@
 
 - Forged datagrams no longer spend a real source's budget. Unverified datagrams were charged at their prefix under the same key as the prefix's connections and verified datagrams, so a flood of forged UDP naming a victim's /24 or /48 could get the victim's TCP connections refused. They now have a prefix key of their own.
 - Full budget tables no longer admit uncharged. Once both rate tiers were full of keys still limiting, newcomers passed with no budget at all; they are now charged together to one global cell at the prefix rate, as the design always said. The door's concurrency tables hold at least twice the ticket capacity, so held connections can no longer fill them and lift the per-address limit.
+- Sharing converges. A lift was ordered against the held ban's local issue time in whole seconds (clamped to the node's start), and one merged ban per key could not apply "a node lifts only its own bans" in an order-independent way, so nodes could disagree after every delta was delivered. Each node's ban on a key is now kept apart with its stamp, and lifts are scoped: to their own node's bans, or to every node's for an administrator's lift delivered through the administration channel (`import(.., Actor::Admin(..))`).
 - `Health::budget_load` counts the slots holding a key that has not recovered. It counted claimed slots, which reach 1 in normal use with many clients (recovered keys are reclaimed only when a slot is needed), so `is_ok` reported a healthy bouncer as unhealthy.
 - `docs/API.md` named 0.5.0 as the current version.
+
+### Changed
+
+- Snapshots, journals, and deltas are format 2 (`SNAPSHOT_FORMAT` is 2): a lift records its scope. Format 1 files and deltas are read, and a format-1 snapshot is rewritten as format 2 when it is loaded; 0.5 and 0.6 refuse format 2 with `UnsupportedFormat`.
+- `import` needs a node id (`NodeIdUnset` otherwise), as `export_delta` did.
+- On a node that shares, a lift by an automated actor removes only that node's own ban on the key; another node's ban on it stays.
 
 ### Added
 
@@ -24,6 +31,7 @@
 - The full T-6 stress run uses 32 threads, as the threat table states (10^8 checkpoints with concurrent revocations; no missed revocation).
 - Timing tests for threat T-8 (`tests/timing.rs`, run with `--ignored` in release): admitted latency does not depend on neighbours' bans, and bind latency does not reveal digests near a banned one (Kolmogorov-Smirnov at p < 0.01, with a control that must separate).
 - The soak (`tests/soak.rs`, NFR-13): 100,000 connections a second with bans and revocations running; checks for missed revocations and for heap growth after warming.
+- A three-node simulation (`tests/cluster.rs`): partitions, a clock 30 seconds ahead, reordering, and duplication; every node agrees after healing.
 - The decoder fuzz targets frame part of their inputs (magic, lengths, CRC), so mutations reach the record decoders behind the checksums.
 
 ---

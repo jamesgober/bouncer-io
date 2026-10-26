@@ -29,11 +29,11 @@ fn take<'a>(data: &mut &'a [u8], n: usize) -> Vec<u8> {
     v
 }
 
-/// A delta: `BNCD`, format 1, then flags, origin, last, and count from the
-/// input (16 bytes), the rest of the input as records, and the CRC.
-pub fn delta(mut data: &[u8]) -> Vec<u8> {
+/// A delta: `BNCD`, `format` (1 or 2), then flags, origin, last, and count
+/// from the input (16 bytes), the rest of the input as records, and the CRC.
+pub fn delta(format: u16, mut data: &[u8]) -> Vec<u8> {
     let mut out = b"BNCD".to_vec();
-    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&format.to_le_bytes());
     out.extend(take(&mut data, 16));
     out.extend_from_slice(data);
     let crc = crc32c(&out);
@@ -41,12 +41,12 @@ pub fn delta(mut data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A snapshot without a MAC: `BNCR`, format 1, flags 0, then created,
-/// epoch, node, hlc, and count from the input (34 bytes), the rest as
-/// records, the length, and the CRC.
-pub fn snapshot(mut data: &[u8]) -> Vec<u8> {
+/// A snapshot without a MAC: `BNCR`, `format` (1 or 2), flags 0, then
+/// created, epoch, node, hlc, and count from the input (34 bytes), the rest
+/// as records, the length, and the CRC.
+pub fn snapshot(format: u16, mut data: &[u8]) -> Vec<u8> {
     let mut out = b"BNCR".to_vec();
-    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&format.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend(take(&mut data, 34));
     out.extend_from_slice(data);

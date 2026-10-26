@@ -38,7 +38,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let framed = mode & 4 != 0;
     let bytes = if framed {
-        frame::snapshot(rest)
+        frame::snapshot(if mode & 8 != 0 { 2 } else { 1 }, rest)
     } else {
         rest.to_vec()
     };

@@ -94,7 +94,7 @@ Review findings (each fixed test-first; open until its fix lands):
 | Forged datagrams drained a real prefix's budget, refusing its TCP connections | fixed, D-092 |
 | Full budget tables admitted newcomers uncharged; concurrency tables smaller than the registry lifted the per-address limit; `budget_load` reported a healthy bouncer as unhealthy | fixed, D-094 |
 | Decoder fuzz targets stopped at the checksum (`delta_decode` coverage 53) | fixed, D-095 |
-| Sharing does not converge: a lift is ordered against the held ban's local issue time in whole seconds, clamped to this node's start, instead of the ban's stamp; and one merged entry per key cannot apply "a channel lifts only its own node's bans" in an order-independent way when two nodes ban the same key (`tests/cluster.rs`, seed 1: diverges in 15 steps) | open: per-origin ban contributions and exact lift ordering |
+| Sharing does not converge: a lift is ordered against the held ban's local issue time in whole seconds, clamped to this node's start, instead of the ban's stamp; and one merged entry per key cannot apply "a channel lifts only its own node's bans" in an order-independent way when two nodes ban the same key (`tests/cluster.rs`, seed 1: diverges in 15 steps) | fixed, D-096: per-origin bans with their stamps; the simulation passes over 5,000 seeds |
 | Edge cases 34, 40, 45, 47 have no test; 16, 17, 22, 30, 32, 33, 39, 43, 46, 48, 59, 67, 69, 71 are partly tested; test comments number edge cases by an older list | open |
 
 The 24-hour fuzz and soak runs restart on the final 0.7 code; earlier runs (started 2026-10-26) are early signal only.
