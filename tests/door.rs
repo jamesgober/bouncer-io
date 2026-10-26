@@ -192,6 +192,45 @@ fn test_ban_trusted_proxy_refused() {
 }
 
 #[test]
+fn test_door_forwarded_header_from_untrusted_peer_not_bound() {
+    // Threat T-1: a peer that is not a trusted proxy cannot name another
+    // client, to evade its own ban or to frame someone else.
+    let b = Bouncer::builder()
+        .trusted_proxies(&[c("10.0.0.1/32")])
+        .tickets(64)
+        .ban_capacity(64)
+        .try_build()
+        .unwrap();
+    b.ban(ip("198.51.100.66")).unwrap();
+    let peer = ip("192.0.2.7");
+    let conn = b.door(peer).unwrap();
+    assert_eq!(conn.source(), Some(peer));
+    let mut req = conn.request(RequestId(1)).unwrap();
+    for provenance in [
+        Provenance::ForwardedHeader,
+        Provenance::ProxyProtocol,
+        Provenance::FastCgi,
+    ] {
+        // Naming an innocent address, and naming a banned one.
+        for named in ["203.0.113.5", "198.51.100.66"] {
+            let v = req.bind_client(ip(named), provenance);
+            assert!(
+                matches!(v, Verdict::Deny(d) if d.code == DenialCode::Unavailable),
+                "{named} via {provenance:?}"
+            );
+        }
+    }
+    assert_eq!(req.source(), Some(peer), "the socket peer stays the source");
+    // Not a trusted provenance at all, from a trusted proxy.
+    let hop = b.door(ip("10.0.0.1")).unwrap();
+    let mut via = hop.request(RequestId(2)).unwrap();
+    for provenance in [Provenance::Socket, Provenance::Local] {
+        assert!(via.bind_client(ip("203.0.113.5"), provenance).is_deny());
+    }
+    assert_eq!(via.source(), None, "still waiting for a trusted client");
+}
+
+#[test]
 fn test_ban_ipv6_rotation_within_64_refused() {
     // Threat T-2.
     let b = small();

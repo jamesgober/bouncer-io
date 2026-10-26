@@ -567,8 +567,10 @@ impl DoorBudgets {
     }
 
     /// The datagram budget step: the rate tiers only (no concurrency). An
-    /// unverified source is charged at its prefix only, so a forged address
-    /// cannot spend a real client's budget.
+    /// unverified source is charged at its prefix only, and under a key of
+    /// its own there, so forged datagrams cannot spend the budget of a real
+    /// client or of its prefix (which would refuse that prefix's
+    /// connections and verified datagrams).
     pub(crate) fn datagram(
         &self,
         addr: IpAddr,
@@ -585,6 +587,7 @@ impl DoorBudgets {
         let first = usize::from(!verified);
         for (tier, &key) in tiers.iter().zip(keys.iter()).skip(first) {
             let n = self.factor(key, now_secs).saturating_mul(divisor);
+            let key = if verified { key } else { unverified(key) };
             let cells = &tier.cells;
             let burst = tier.burst;
             let idle = |slot: usize| cells[slot].peek_at(now_d).remaining() >= burst;
@@ -1124,4 +1127,12 @@ mod tests {
         );
         assert!(budgets(Budgets::default()).bytes() > 0);
     }
+}
+
+/// The budget key of unverified datagrams from a prefix: derived from the
+/// prefix's keyed hash, so it is as unpredictable as that hash, and equal to
+/// a key a real source is charged under only by a keyed-hash collision.
+#[inline]
+fn unverified(key: u64) -> u64 {
+    Claims::key(key.rotate_left(29) ^ 0x6a09_e667_f3bc_c908)
 }
