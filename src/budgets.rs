@@ -316,13 +316,20 @@ struct Throttles {
     claims: Claims,
     /// factor (8) | until secs (32)
     cells: Box<[AtomicU64]>,
+    /// The latest end of any throttle ever set: past it, nothing is
+    /// throttled and lookups skip the table (one load instead of a probe).
+    until_max: AtomicU64,
 }
 
 impl Throttles {
     fn new(capacity: u32) -> Throttles {
         let claims = Claims::new(capacity);
         let cells = (0..claims.len()).map(|_| AtomicU64::new(0)).collect();
-        Throttles { claims, cells }
+        Throttles {
+            claims,
+            cells,
+            until_max: AtomicU64::new(0),
+        }
     }
 
     fn bytes(&self) -> u64 {
@@ -330,7 +337,11 @@ impl Throttles {
     }
 
     /// The factor in force for a key now (1 when none).
+    #[inline]
     fn factor(&self, key: u64, now_secs: u64) -> u32 {
+        if self.until_max.load(Ordering::Relaxed) <= now_secs {
+            return 1;
+        }
         match self.claims.find(key) {
             Some(slot) => {
                 let v = self.cells[slot].load(Ordering::Acquire);
@@ -357,6 +368,9 @@ impl Throttles {
             return false;
         };
         let until = until_secs.min(u64::from(u32::MAX));
+        // Raised before the cell is written: a reader that sees the cell's
+        // end also sees a bound at least as late.
+        self.until_max.fetch_max(until, Ordering::Release);
         cells[slot].store((u64::from(factor.max(1)) << 32) | until, Ordering::Release);
         true
     }

@@ -74,6 +74,7 @@ crypt-io = { version = "1.2", default-features = false, features = ["zeroize", "
 criterion = { version = "0.7", default-features = false }
 proptest = { version = "1", default-features = false, features = ["std"] }
 # Comparison benchmarks only (benches/comparison.rs): never in the library.
+dashmap = "6"
 governor = "0.10"
 prefix-trie = { version = "0.10", default-features = false }
 

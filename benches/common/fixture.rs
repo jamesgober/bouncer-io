@@ -33,10 +33,15 @@ pub struct Fixture {
 }
 
 pub fn fixture() -> Fixture {
+    fixture_with(Budgets::off())
+}
+
+/// The fixture with the given budgets.
+pub fn fixture_with(budgets: Budgets) -> Fixture {
     let bouncer = Bouncer::builder()
         .ban_capacity(1_100_000)
         .tickets(4096)
-        .budgets(Budgets::off())
+        .budgets(budgets)
         .escalation(bouncer_io::EscalationPolicy::default().off())
         .seed([9; 32])
         .try_build()
