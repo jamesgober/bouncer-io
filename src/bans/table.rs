@@ -16,6 +16,20 @@ use crate::{
     sync::{AtomicU64, Ordering, fence, spin},
 };
 
+/// The keyed hash of a table key.
+#[inline]
+pub(crate) fn hash_key(key: &HashKey, k: &TableKey) -> u64 {
+    let meta = u64::from(k.kind) | (u64::from(k.len) << 8);
+    // A prefix key has one word that is always zero (IPv4 bits live in
+    // `k1`; an IPv6 prefix of /64 or shorter in `k0`): two words suffice.
+    // The kind and length in `meta` keep the classes apart.
+    match k.kind {
+        KIND_V4 => key.hash2(meta, k.k1),
+        KIND_V6 if k.len <= 64 => key.hash2(meta, k.k0),
+        _ => key.hash3(meta, k.k0, k.k1),
+    }
+}
+
 /// Slot kinds stored in the low byte of the meta word.
 pub(crate) const KIND_TOMBSTONE: u8 = 1;
 pub(crate) const KIND_V4: u8 = 2;
@@ -331,10 +345,20 @@ impl Table {
     /// Starting group and tag byte for a key.
     #[inline]
     pub(crate) fn locate(&self, key: &TableKey) -> (usize, u8) {
-        let meta = u64::from(key.kind) | (u64::from(key.len) << 8);
-        let h = self.key.hash3(meta, key.k0, key.k1);
+        self.locate_hash(hash_key(&self.key, key))
+    }
+
+    /// The group and tag of a key whose hash is already known.
+    #[inline]
+    pub(crate) fn locate_hash(&self, h: u64) -> (usize, u8) {
         let group = ((u128::from(h) * self.tags.len() as u128) >> 64) as usize;
         (group, (h & 0x7f) as u8)
+    }
+
+    /// The table's hash key (shared with the door budgets, so one hash of a
+    /// prefix serves both).
+    pub(crate) fn hasher(&self) -> HashKey {
+        self.key
     }
 
     /// The probe sequence: triangular steps over groups (g, g+1, g+3, g+6, ...),

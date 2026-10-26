@@ -13,6 +13,40 @@
 
 ---
 
+## [0.6.0] - 2026-10-26
+
+Optimisation, measured against compositions of existing crates.
+
+### Changed
+
+- The door: each prefix's keyed hash is computed once per check and shared
+  by the ban lookup and the door budgets; the budget step hashes nothing when
+  no budget is configured; an empty allow list is skipped. 149 -> 113 ns per
+  admission with 1,000,000 bans (pinned).
+- Tickets: a connection's latest request is written with a plain store and
+  not cleared on release; release reads instead of swapping; door-generated
+  connection ids come from the ticket cell; connections hold concurrency
+  slots only when there are any. Issue and release 85 -> 45 ns.
+- Binds read the clock only when a ban of their kind exists; shared-address
+  detection counts with the door's latest second. About 76 -> 24 ns.
+- Prefix keys hash over two words.
+
+### Fixed
+
+- Offender memory scanned itself to evict once full, so ban inserts slowed
+  down without bound (median 3.5 µs at 1.2 million bans); it now evicts in
+  constant time (457 ns). Lift tombstones had the same scan.
+
+### Added
+
+- `docs/PERFORMANCE.md`: the door against the same-job and the lookup-only
+  compositions, every PLAN 11 target, the change from 0.5.0, and the method.
+- Benches `comparison`, `perf` (pinned table), `storm` (T-12, the slow path,
+  `#[track_caller]`), and `gate` with `scripts/gate.py`: a CI job that fails
+  on a hot path more than 5% over its instruction-count baseline.
+
+---
+
 ## [0.5.0] - 2026-10-23
 
 Feature complete: persistence, sharing across nodes, escalation, offender
@@ -228,7 +262,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/bouncer-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/bouncer-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/bouncer-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/bouncer-io/compare/v0.2.0...v0.3.0

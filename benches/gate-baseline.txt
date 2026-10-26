@@ -1,0 +1,6 @@
+gate_ban_insert 49866014
+gate_bind_session 7250999
+gate_checkpoint 90016
+gate_door_admitted 12991535
+gate_door_banned 7172467
+gate_request_cycle 3730018

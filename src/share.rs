@@ -257,6 +257,14 @@ pub struct ImportReport {
     pub rejected: u32,
 }
 
+/// Lift tombstones by key, and keys in the order first noted (for
+/// forgetting the oldest in constant time).
+#[derive(Default)]
+struct Tombstones {
+    map: HashMap<BanKey, (u64, u16)>,
+    order: VecDeque<BanKey>,
+}
+
 /// Record ids seen, and their order for forgetting the oldest.
 type Seen = (HashSet<(u16, u64)>, VecDeque<(u16, u64)>);
 
@@ -266,7 +274,7 @@ pub(crate) struct Share {
     log: Mutex<VecDeque<(u64, Envelope)>>,
     next: AtomicU64,
     seen: Mutex<Seen>,
-    tombstones: Mutex<HashMap<BanKey, (u64, u16)>>,
+    tombstones: Mutex<Tombstones>,
     /// Records accepted per second from channels (a storm defence).
     pub(crate) channel_rate: Option<rate_net::Gcra>,
 }
@@ -278,7 +286,7 @@ impl Share {
             log: Mutex::new(VecDeque::new()),
             next: AtomicU64::new(1),
             seen: Mutex::new((HashSet::new(), VecDeque::new())),
-            tombstones: Mutex::new(HashMap::new()),
+            tombstones: Mutex::new(Tombstones::default()),
             channel_rate: rate_net::Quota::rate(
                 channel_per_second.max(1),
                 core::time::Duration::from_secs(1),
@@ -385,13 +393,20 @@ impl Share {
             .tombstones
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if t.len() >= TOMBSTONES && !t.contains_key(&key) {
-            // Forget the oldest tombstone.
-            if let Some(k) = t.iter().min_by_key(|(_, (s, _))| *s).map(|(k, _)| *k) {
-                t.remove(&k);
+        let t = &mut *t;
+        if !t.map.contains_key(&key) {
+            // Full: forget the tombstone noted longest ago.
+            while t.map.len() >= TOMBSTONES {
+                match t.order.pop_front() {
+                    Some(old) => {
+                        t.map.remove(&old);
+                    }
+                    None => break,
+                }
             }
+            t.order.push_back(key);
         }
-        let e = t.entry(key).or_insert((stamp, origin));
+        let e = t.map.entry(key).or_insert((stamp, origin));
         if stamp > e.0 {
             *e = (stamp, origin);
         }
@@ -402,6 +417,7 @@ impl Share {
         self.tombstones
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map
             .get(key)
             .map(|(s, _)| *s)
     }
@@ -411,6 +427,7 @@ impl Share {
         self.tombstones
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map
             .iter()
             .map(|(k, (s, o))| (*k, *s, *o))
             .collect()

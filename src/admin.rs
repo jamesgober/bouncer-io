@@ -639,7 +639,9 @@ impl Bouncer {
         let shared = self.shared();
         let set = list.compile()?;
         // Swap first: a ban racing this call is checked against the new list.
+        let len = set.len() as u32;
         shared.allow.store(set);
+        shared.allow_len.store(len, crate::sync::Ordering::Release);
         let lifted = shared.bans.lift_covered(|c| shared.immune_covers(c));
         for h in &lifted {
             Emit {

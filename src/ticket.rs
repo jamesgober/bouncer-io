@@ -25,9 +25,10 @@ use crate::{
     registry::{
         CHILD_MASK, CODE_SHIFT, Cell, F_CANCELLED, F_CHARGED, F_CLIENT_BOUND, F_DETACHED, F_IMMUNE,
         F_KEEP_CONNECTION, F_LIVE, F_PENDING_CLIENT, F_PROXY_HOP, F_REVOKED, F_TENANT_CHARGED,
-        K_ACCOUNT, K_FINGERPRINT, K_REQUEST, K_SESSION, K_SOURCE, K_TENANT, KIND_CONNECTION,
-        KIND_REQUEST, NIL, P_ACCOUNT, P_FINGERPRINT, P_REQUEST, P_SESSION, P_SOURCE, P_SOURCE_V6,
-        P_TENANT, PRESENT_SHIFT, PROVENANCE_MASK, PROVENANCE_SHIFT, Shard, generation,
+        K_ACCOUNT, K_FINGERPRINT, K_LATEST, K_REQUEST, K_SESSION, K_SOURCE, K_TENANT,
+        KIND_CONNECTION, KIND_REQUEST, NIL, P_ACCOUNT, P_FINGERPRINT, P_REQUEST, P_SESSION,
+        P_SOURCE, P_SOURCE_V6, P_TENANT, PRESENT_SHIFT, PROVENANCE_MASK, PROVENANCE_SHIFT, Shard,
+        generation,
     },
     sync::{Ordering, fence, update},
     verdict::{Denial, DenialCode, Reference, Verdict},
@@ -225,11 +226,23 @@ pub struct Ticket {
     fast: u32,
 }
 
+/// What the shared half of a bind found.
+enum Bound {
+    /// Stale, or the kind is already bound.
+    Invalid,
+    /// Banned or revoked: the cell is revoked with this code.
+    Refused(DenialCode),
+    /// Bound; the checkpoint decides.
+    Written,
+}
+
 /// What a new cell starts with.
 pub(crate) struct Issue {
     pub(crate) kind: TicketKind,
     pub(crate) flags: u64,
-    pub(crate) conn: u64,
+    /// The connection id; `None` lets the cell's index and generation make
+    /// one (unique without a shared counter).
+    pub(crate) conn: Option<u64>,
     pub(crate) source: Option<IpAddr>,
     pub(crate) request: Option<RequestId>,
     pub(crate) parent: Option<(u32, u32)>,
@@ -243,15 +256,21 @@ impl Ticket {
         let index = shared.registry.pop_from(first_shard)?;
         let cell = shared.registry.cell(index);
         let gen_ = generation(cell.state.load(Ordering::Relaxed));
-        cell.conn.store(issue.conn, Ordering::Relaxed);
+        let conn = issue
+            .conn
+            .unwrap_or((1u64 << 63) | (u64::from(gen_) << 24) | u64::from(index));
+        cell.conn.store(conn, Ordering::Relaxed);
         let mut present = 0u64;
         if let Some(src) = issue.source {
             present |= write_source(cell, src);
         }
-        if let Some(r) = issue.request {
-            cell.keys[K_REQUEST].store((r.0 >> 64) as u64, Ordering::Relaxed);
-            cell.keys[K_REQUEST + 1].store(r.0 as u64, Ordering::Relaxed);
-            present |= P_REQUEST;
+        match issue.request {
+            Some(r) => {
+                cell.keys[K_REQUEST].store((r.0 >> 64) as u64, Ordering::Relaxed);
+                cell.keys[K_REQUEST + 1].store(r.0 as u64, Ordering::Relaxed);
+                present |= P_REQUEST;
+            }
+            None => cell.keys[K_LATEST].store(u64::from(NIL), Ordering::Relaxed),
         }
         let (kind_bits, link) = match (issue.kind, issue.parent) {
             (TicketKind::Request, Some((pi, pg))) => {
@@ -933,15 +952,42 @@ impl Ticket {
         kind: u8,
         banned: impl FnOnce(&Shared, u64) -> Probe,
     ) -> Verdict {
-        let shard = Arc::clone(&self.shard);
-        let shared = &shard.shared;
+        match self.bind_key(bit, at, hi, lo, kind, banned) {
+            Bound::Invalid => self.deny(DenialCode::Unavailable),
+            Bound::Refused(code) => {
+                self.seen = SEEN_ALWAYS_CHECK;
+                self.deny(code)
+            }
+            Bound::Written => {
+                let verdict = self.checkpoint();
+                if verdict.is_pass() && (kind == table::KIND_SESSION || kind == table::KIND_ACCOUNT)
+                {
+                    self.note_identity(hi.unwrap_or(0), lo);
+                }
+                verdict
+            }
+        }
+    }
+
+    /// The shared-state half of [`bind`](Self::bind): it only reads `self`,
+    /// so no reference to the shard is cloned.
+    fn bind_key(
+        &self,
+        bit: u64,
+        at: usize,
+        hi: Option<u64>,
+        lo: u64,
+        kind: u8,
+        banned: impl FnOnce(&Shared, u64) -> Probe,
+    ) -> Bound {
+        let shared = &*self.shard.shared;
         let cell = shared.registry.cell(self.index);
         let st = cell.state.load(Ordering::Acquire);
         if generation(st) != self.generation || st & F_LIVE == 0 {
-            return self.deny(DenialCode::Unavailable);
+            return Bound::Invalid;
         }
         if cell.present() & bit != 0 {
-            return self.deny(DenialCode::Unavailable);
+            return Bound::Invalid;
         }
         match hi {
             Some(hi) => {
@@ -955,31 +1001,24 @@ impl Ticket {
             .fetch_or(bit << PRESENT_SHIFT, Ordering::AcqRel);
         if (before >> PRESENT_SHIFT) & bit != 0 {
             // Another thread bound the same kind first.
-            return self.deny(DenialCode::Unavailable);
+            return Bound::Invalid;
         }
         fence(Ordering::SeqCst);
-        let now_secs = shared.now().secs();
-        match banned(shared, now_secs) {
-            Probe::Hit(_) | Probe::Busy => {
-                mark_revoked(cell, self.generation, DenialCode::Forbidden);
-                self.seen = SEEN_ALWAYS_CHECK;
-                return self.deny(DenialCode::Forbidden);
+        // The clock is read only when a ban of this kind exists to expire.
+        if shared.bans.may_hold(kind) {
+            match banned(shared, shared.now().secs()) {
+                Probe::Hit(_) | Probe::Busy => {
+                    mark_revoked(cell, self.generation, DenialCode::Forbidden);
+                    return Bound::Refused(DenialCode::Forbidden);
+                }
+                Probe::Miss => {}
             }
-            Probe::Miss => {}
         }
-        let key = match hi {
-            Some(hi) => TableKey {
-                kind,
-                len: 0,
-                k0: hi,
-                k1: lo,
-            },
-            None => TableKey {
-                kind,
-                len: 0,
-                k0: 0,
-                k1: lo,
-            },
+        let key = TableKey {
+            kind,
+            len: 0,
+            k0: hi.unwrap_or(0),
+            k1: lo,
         };
         if let Some(hit) = shared.revocations.matches_key(&key) {
             mark_revoked(cell, self.generation, hit.code);
@@ -992,27 +1031,28 @@ impl Ticket {
                     (generation(st) == generation_now).then_some(st | F_KEEP_CONNECTION)
                 });
             }
-            self.seen = SEEN_ALWAYS_CHECK;
-            return self.deny(hit.code);
+            return Bound::Refused(hit.code);
         }
-        let verdict = self.checkpoint();
-        if verdict.is_pass() && (kind == table::KIND_SESSION || kind == table::KIND_ACCOUNT) {
-            if let Some(src) = source_of(cell) {
-                let now = shared.now().secs();
-                if shared.sources.note(src, hi.unwrap_or(0), lo, now) {
-                    let subject = Subject {
-                        source: Some(src),
-                        ..Subject::default()
-                    };
-                    events::Emit {
-                        subject,
-                        ..events::Emit::new(events::signals::SOURCE_SHARED_SUSPECTED)
-                    }
-                    .send(shared);
+        Bound::Written
+    }
+
+    /// Counts a session or account toward shared-address detection.
+    fn note_identity(&self, k0: u64, k1: u64) {
+        let shared = &*self.shard.shared;
+        let cell = shared.registry.cell(self.index);
+        if let Some(src) = source_of(cell) {
+            if shared.sources.note(src, k0, k1, shared.recent_secs()) {
+                let subject = Subject {
+                    source: Some(src),
+                    ..Subject::default()
+                };
+                events::Emit {
+                    subject,
+                    ..events::Emit::new(events::signals::SOURCE_SHARED_SUSPECTED)
                 }
+                .send(shared);
             }
         }
-        verdict
     }
 
     /// Reports misbehaviour seen by any layer (a failed handshake, malformed
@@ -1236,7 +1276,7 @@ pub(crate) fn issue_request(
         Issue {
             kind: TicketKind::Request,
             flags,
-            conn: pcell.conn.load(Ordering::Relaxed),
+            conn: Some(pcell.conn.load(Ordering::Relaxed)),
             source,
             request: Some(id),
             parent: Some((parent, parent_gen)),
@@ -1244,14 +1284,9 @@ pub(crate) fn issue_request(
     );
     match issued {
         Some(t) => {
-            // The connection's latest request, followed by the egress check.
-            let child = u64::from(t.index);
-            let _ = update(
-                &pcell.present_child,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |w| Some((w & !CHILD_MASK) | child),
-            );
+            // The connection's latest request, followed by the egress check:
+            // a plain store, published after the child's state.
+            pcell.keys[K_LATEST].store(u64::from(t.index), Ordering::Release);
             Ok(t)
         }
         None => {
@@ -1419,7 +1454,9 @@ fn latest_child(
     if st & 0xff != KIND_CONNECTION {
         return None;
     }
-    let ci = (cell.present_child.load(Ordering::Acquire) & CHILD_MASK) as u32;
+    // A stale index is harmless: the child must be a live request of this
+    // connection's generation.
+    let ci = cell.keys[K_LATEST].load(Ordering::Acquire) as u32;
     if ci == NIL || ci as usize >= shared.registry.cells.len() {
         return None;
     }
@@ -1446,7 +1483,8 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
     let Ok(st) = taken else {
         return false;
     };
-    let present_child = cell.present_child.swap(CHILD_MASK, Ordering::AcqRel);
+    // The cell is ours now; the next issue overwrites this word.
+    let present_child = cell.present_child.load(Ordering::Acquire);
     match TicketKind::from_state(st) {
         TicketKind::Connection => {
             let old = cell.link.swap(u64::from(next_gen) << 32, Ordering::AcqRel);
@@ -1475,15 +1513,9 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
                 }
                 .send(shared);
             }
+            // The connection may still name it as its latest request; the
+            // egress check sees it is no longer live.
             uncount_child(shared, pi, pg);
-            // Forget it as the connection's latest request.
-            let me = u64::from(index);
-            let _ = update(
-                &shared.registry.cell(pi).present_child,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |w| (w & CHILD_MASK == me).then_some(w | CHILD_MASK),
-            );
         }
     }
     if st & F_TENANT_CHARGED != 0 {

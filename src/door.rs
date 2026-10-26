@@ -7,6 +7,7 @@ use crate::{
     allow::{self, AllowKind},
     bans::Lookup,
     bouncer::Shared,
+    sync::Ordering,
     time::Now,
     verdict::Reference,
 };
@@ -172,6 +173,20 @@ impl Shared {
     /// the socket peer), allow list, ban memory.
     #[inline]
     pub(crate) fn judge(&self, peer: IpAddr, provenance: Provenance, now: Now) -> Judgement {
+        let mut hashes = crate::bans::AddrHashes::new(self.bans.hasher(), peer);
+        self.judge_hashed(peer, provenance, now, &mut hashes)
+    }
+
+    /// As [`judge`](Self::judge), leaving the prefix hashes it computed in
+    /// `hashes` for the budget step.
+    #[inline]
+    pub(crate) fn judge_hashed(
+        &self,
+        peer: IpAddr,
+        provenance: Provenance,
+        now: Now,
+        hashes: &mut crate::bans::AddrHashes,
+    ) -> Judgement {
         if !self.proxies.is_empty() && self.proxies.contains_addr(peer) {
             return if provenance == Provenance::Socket {
                 Judgement::ProxyHop
@@ -183,14 +198,18 @@ impl Shared {
                 })
             };
         }
-        let allowed = self.allow.with(|set| allow::lookup(set, peer));
+        let allowed = if self.allow_len.load(Ordering::Acquire) == 0 {
+            None
+        } else {
+            self.allow.with(|set| allow::lookup(set, peer))
+        };
         if allowed == Some(AllowKind::Immune) {
             return Judgement::Admit {
                 immune: true,
                 exempt: true,
             };
         }
-        match self.bans.lookup_addr(peer, now.secs()) {
+        match self.bans.lookup_hashed(hashes, now.secs()) {
             Lookup::Clear => Judgement::Admit {
                 immune: false,
                 exempt: allowed == Some(AllowKind::ExemptBudgets),

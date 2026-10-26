@@ -88,6 +88,9 @@ impl Sources {
             return false;
         };
         let m = meta[slot].load(Ordering::Acquire);
+        if (m & 0xffff_ffff) > now_secs {
+            return false; // already flagged: nothing more to learn
+        }
         let start = m >> 32;
         if start + WINDOW_SECS <= now_secs {
             // A new window: start it once, keeping the flag.
@@ -99,7 +102,12 @@ impl Sources {
                 bits[slot].store(0, Ordering::Release);
             }
         }
-        let bit = 1u64 << (self.key.hash3(k0, k1, 0x5348) % 64);
+        // The identity words are keyed digests already (or account ids the
+        // caller assigned): a multiply-mix picks the bit.
+        let mixed = (k0.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ k1.wrapping_mul(0xc2b2_ae3d_27d4_eb4f))
+        .wrapping_mul(0x1656_67b1_9e37_79f9);
+        let bit = 1u64 << (mixed >> 58);
         let before = bits[slot].fetch_or(bit, Ordering::AcqRel);
         if before & bit != 0 || (before | bit).count_ones() <= SHARED_THRESHOLD {
             return false;

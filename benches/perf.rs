@@ -1,0 +1,340 @@
+//! A low-noise table of the door against both compositions (NFR-10).
+//!
+//! Each case runs in many short rounds; the table shows the fastest round
+//! (least disturbed by other work on the machine) and the median round, in
+//! nanoseconds per operation. `cargo bench --bench perf`. The numbers in
+//! `docs/PERFORMANCE.md` come from this.
+
+#[path = "common/compose.rs"]
+mod compose;
+#[path = "common/fixture.rs"]
+mod fixture;
+
+use std::{
+    hint::black_box,
+    net::IpAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
+
+use bouncer_io::{Bouncer, Budgets, ConnId, Provenance, Rate, RequestId};
+use compose::{EqualJob, LookupOnly};
+use fixture::Mix;
+
+/// Rounds per case, and operations per round.
+const ROUNDS: usize = 61;
+const OPS: usize = 20_000;
+
+/// Fastest and median nanoseconds per operation.
+fn measure(mut op: impl FnMut(usize)) -> (f64, f64) {
+    for i in 0..OPS {
+        op(i);
+    }
+    let mut rounds: Vec<f64> = (0..ROUNDS)
+        .map(|r| {
+            let start = Instant::now();
+            for i in 0..OPS {
+                op(r * OPS + i);
+            }
+            start.elapsed().as_nanos() as f64 / OPS as f64
+        })
+        .collect();
+    rounds.sort_by(f64::total_cmp);
+    (rounds[0], rounds[ROUNDS / 2])
+}
+
+fn row(name: &str, (best, median): (f64, f64)) {
+    println!("{name:<34} {best:>8.1} {median:>8.1}");
+}
+
+fn main() {
+    // `cargo bench` passes `--bench`; anything else filters nothing.
+    let rate = Rate::per_second(1_000_000_000).burst(1_000_000_000);
+    let f = fixture::fixture_with(Budgets::off().door_rate(rate, rate).capacity(1 << 20));
+    let lookup = LookupOnly::new(&f.prefixes);
+    let equal = EqualJob::new(&f.prefixes);
+    let mut m = Mix(77);
+    let random: Vec<IpAddr> = (0..1 << 16)
+        .map(|_| {
+            if m.next() % 2 == 0 {
+                IpAddr::from((m.next() as u32).to_be_bytes())
+            } else {
+                fixture::v6((u128::from(m.next()) << 64) | (0x2001u128 << 112))
+            }
+        })
+        .collect();
+    let now = f.bouncer.now();
+    println!(
+        "{:<34} {:>8} {:>8}",
+        "case (ns per operation)", "fastest", "median"
+    );
+    for (name, probes) in [
+        ("admitted", &f.admitted),
+        ("random", &random),
+        ("banned", &f.banned),
+    ] {
+        let n = probes.len();
+        row(
+            &format!("door/{name}"),
+            measure(|i| {
+                black_box(f.bouncer.door(black_box(probes[i % n])).is_ok());
+            }),
+        );
+        row(
+            &format!("door_at/{name}"),
+            measure(|i| {
+                let t = f.bouncer.door_at(
+                    ConnId(i as u64),
+                    black_box(probes[i % n]),
+                    Provenance::Socket,
+                    now,
+                );
+                black_box(t.is_ok());
+            }),
+        );
+        row(
+            &format!("same-job composition/{name}"),
+            measure(|i| {
+                let t = equal.door(i as u64, black_box(probes[i % n]));
+                if t.is_some() {
+                    equal.release(i as u64);
+                }
+                black_box(t.is_some());
+            }),
+        );
+        row(
+            &format!("lookup-only composition/{name}"),
+            measure(|i| {
+                black_box(lookup.admit(black_box(probes[i % n])));
+            }),
+        );
+    }
+    // Parts of the door.
+    let empty = Bouncer::builder()
+        .budgets(Budgets::off())
+        .tickets(4096)
+        .ban_capacity(1024)
+        .try_build()
+        .unwrap();
+    let conn = f.bouncer.door(f.admitted[0]).unwrap();
+    let mut req = conn.request(RequestId(1)).unwrap();
+    let flag = Arc::new(AtomicBool::new(false));
+    let no_rate = fixture::build(Budgets::off(), 10_000);
+    row(
+        "door_at, no rate budget, admitted",
+        measure(|i| {
+            let t = no_rate.bouncer.door_at(
+                ConnId(i as u64),
+                black_box(no_rate.admitted[i & 4095]),
+                Provenance::Socket,
+                now,
+            );
+            black_box(t.is_ok());
+        }),
+    );
+    row(
+        "judge only: 1m bans and admin set",
+        measure(|i| {
+            let _ = black_box(no_rate.bouncer.datagram(
+                black_box(no_rate.admitted[i & 4095]),
+                true,
+                now,
+            ));
+        }),
+    );
+    drop(no_rate);
+    let no_admin = fixture::build(Budgets::off(), 0);
+    row(
+        "door_at, no rate, no admin set, admitted",
+        measure(|i| {
+            let t = no_admin.bouncer.door_at(
+                ConnId(i as u64),
+                black_box(no_admin.admitted[i & 4095]),
+                Provenance::Socket,
+                now,
+            );
+            black_box(t.is_ok());
+        }),
+    );
+    row(
+        "judge only: 1m bans",
+        measure(|i| {
+            let _ = black_box(no_admin.bouncer.datagram(
+                black_box(no_admin.admitted[i & 4095]),
+                true,
+                now,
+            ));
+        }),
+    );
+    drop(no_admin);
+    let lists = Bouncer::builder()
+        .budgets(Budgets::off())
+        .tickets(64)
+        .ban_capacity(1024)
+        .allow(
+            fixture::cidrs(&fixture::ALLOW)
+                .into_iter()
+                .fold(bouncer_io::AllowList::new(), |l, c| l.immune(c, "bench")),
+        )
+        .trusted_proxies(&fixture::cidrs(&fixture::PROXIES))
+        .try_build()
+        .unwrap();
+    row(
+        "judge only: allow list and proxies",
+        measure(|i| {
+            let _ = black_box(lists.datagram(black_box(f.admitted[i & 4095]), true, now));
+        }),
+    );
+    row(
+        "judge only: nothing configured",
+        measure(|i| {
+            let _ = black_box(empty.datagram(black_box(f.admitted[i & 4095]), true, now));
+        }),
+    );
+    row(
+        "ticket only (empty bouncer)",
+        measure(|i| {
+            black_box(
+                empty
+                    .door_at(
+                        ConnId(i as u64),
+                        black_box(f.admitted[i & 4095]),
+                        Provenance::Socket,
+                        now,
+                    )
+                    .is_ok(),
+            );
+        }),
+    );
+    row(
+        "judgement, 1m bans, admitted",
+        measure(|i| {
+            let _ = black_box(
+                f.bouncer
+                    .datagram(black_box(f.admitted[i & 4095]), true, now),
+            );
+        }),
+    );
+    row(
+        "request ticket cycle",
+        measure(|i| {
+            black_box(conn.request(RequestId(i as u128 + 2)).is_ok());
+        }),
+    );
+    row(
+        "arc per request",
+        measure(|_| {
+            black_box(Arc::new(AtomicBool::new(false)));
+        }),
+    );
+    row(
+        "checkpoint",
+        measure(|_| {
+            black_box(req.checkpoint().is_pass());
+        }),
+    );
+    row(
+        "atomic bool load",
+        measure(|_| {
+            black_box(!black_box(&flag).load(Ordering::Acquire));
+        }),
+    );
+    row(
+        "Bouncer::now",
+        measure(|_| {
+            black_box(f.bouncer.now());
+        }),
+    );
+    // The other PLAN 11 targets.
+    row(
+        "before_commit",
+        measure(|_| {
+            black_box(req.before_commit().is_pass());
+        }),
+    );
+    let tag = f.bouncer.door(f.admitted[1]).unwrap().into_tag();
+    row(
+        "egress by connection tag",
+        measure(|_| {
+            black_box(f.bouncer.egress(tag).is_pass());
+        }),
+    );
+    f.bouncer.release(tag);
+    row(
+        "request + bind_session",
+        measure(|i| {
+            let mut r = conn.request(RequestId(i as u128 + (1 << 40))).unwrap();
+            let mut d = [0u8; 16];
+            d[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            black_box(
+                r.bind_session(bouncer_io::SessionKey::from_digest(d))
+                    .is_pass(),
+            );
+        }),
+    );
+    let fresh = Bouncer::builder()
+        .budgets(Budgets::off())
+        .ban_capacity(1 << 21)
+        .revocation_capacity(1 << 21)
+        .escalation(bouncer_io::EscalationPolicy::default().off())
+        .try_build()
+        .unwrap();
+    let mut n = 0u32;
+    row(
+        "ban insert (table filling to 1.2m)",
+        measure(|_| {
+            n = n.wrapping_add(1);
+            let a = IpAddr::from((0x4000_0000u32 | n.wrapping_mul(2_654_435_761)).to_be_bytes());
+            black_box(fresh.ban(a).is_ok());
+        }),
+    );
+    let mut k = 0u128;
+    row(
+        "revoke (account)",
+        measure(|_| {
+            k += 1;
+            black_box(
+                fresh
+                    .revoke(bouncer_io::AccountKey(k), bouncer_io::Reason::ADMIN)
+                    .is_ok(),
+            );
+        }),
+    );
+    let cap = fresh.capacity();
+    println!(
+        "memory per ban: {:.1} B (dynamic table {} B for {} entries)",
+        cap.table_bytes as f64 / f64::from(cap.bans),
+        cap.table_bytes,
+        cap.bans
+    );
+    // An eject-now sweep over a full registry.
+    let swept = Bouncer::builder()
+        .budgets(Budgets::off())
+        .tickets(65_536)
+        .try_build()
+        .unwrap();
+    let held: Vec<_> = (0..65_535u32)
+        .map(|i| {
+            swept
+                .door(IpAddr::from((0x0b00_0000 | i).to_be_bytes()))
+                .unwrap()
+        })
+        .collect();
+    let mut sweeps = Vec::new();
+    for s in 0..21u128 {
+        let start = Instant::now();
+        let _ =
+            swept.apply(bouncer_io::Directive::revoke(bouncer_io::AccountKey(s + 1)).eject_now());
+        sweeps.push(start.elapsed().as_nanos() as f64 / 1e3);
+    }
+    sweeps.sort_by(f64::total_cmp);
+    println!(
+        "eject-now sweep, 65,535 live cells: fastest {:.0} us, median {:.0} us",
+        sweeps[0],
+        sweeps[sweeps.len() / 2]
+    );
+    drop(held);
+}

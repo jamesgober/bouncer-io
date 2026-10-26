@@ -484,6 +484,49 @@ pub(crate) struct BanMemory {
     evicted: std::sync::atomic::AtomicU64,
 }
 
+/// The keyed hashes of one address's prefixes, each computed at most once
+/// per door check and shared by the ban lookup and the door budgets.
+pub(crate) struct AddrHashes {
+    host: Cidr,
+    key: HashKey,
+    lens: [u8; 8],
+    vals: [u64; 8],
+    n: usize,
+}
+
+impl AddrHashes {
+    #[inline]
+    pub(crate) fn new(key: HashKey, addr: IpAddr) -> AddrHashes {
+        AddrHashes {
+            host: Cidr::host(addr),
+            key,
+            lens: [0; 8],
+            vals: [0; 8],
+            n: 0,
+        }
+    }
+
+    pub(crate) fn host(&self) -> &Cidr {
+        &self.host
+    }
+
+    /// The table hash of the address's prefix of length `len`.
+    #[inline]
+    pub(crate) fn get(&mut self, len: u8) -> u64 {
+        if let Some(i) = self.lens[..self.n].iter().position(|&l| l == len) {
+            return self.vals[i];
+        }
+        let p = self.host.parent(len).unwrap_or(self.host);
+        let h = table::hash_key(&self.key, &BanMemory::prefix_key(&p));
+        if self.n < 8 {
+            self.lens[self.n] = len;
+            self.vals[self.n] = h;
+            self.n += 1;
+        }
+        h
+    }
+}
+
 /// The allow and trusted-proxy sets a ban is checked against.
 pub(crate) struct Guards<'a> {
     pub(crate) immune: &'a PrefixSet<crate::allow::AllowKind>,
@@ -1131,7 +1174,21 @@ impl BanMemory {
     /// queueing.
     #[inline]
     pub(crate) fn lookup_addr(&self, addr: IpAddr, now_secs: u64) -> Lookup {
-        let host = Cidr::host(addr);
+        let mut hashes = AddrHashes::new(self.table.hasher(), addr);
+        self.lookup_hashed(&mut hashes, now_secs)
+    }
+
+    /// The table's hash key, for [`AddrHashes`].
+    pub(crate) fn hasher(&self) -> HashKey {
+        self.table.hasher()
+    }
+
+    /// As [`lookup_addr`](Self::lookup_addr), through a hash cache the door
+    /// budgets reuse.
+    #[inline]
+    pub(crate) fn lookup_hashed(&self, hashes: &mut AddrHashes, now_secs: u64) -> Lookup {
+        let host = *hashes.host();
+        let addr = host.network();
         let mut busy = false;
         let mut lengths = [0u8; PROBE_BATCH];
         let mut count = 0;
@@ -1162,25 +1219,20 @@ impl BanMemory {
                 }
             }
         }
-        let mut keys = [TableKey {
-            kind: 0,
-            len: 0,
-            k0: 0,
-            k1: 0,
-        }; PROBE_BATCH];
         let mut starts = [(0usize, 0u8); PROBE_BATCH];
         for i in 0..count {
-            keys[i] = Self::prefix_key(&host.parent(lengths[i]).unwrap_or(host));
-            starts[i] = self.table.locate(&keys[i]);
+            starts[i] = self.table.locate_hash(hashes.get(lengths[i]));
         }
         let mut tags = [0u64; PROBE_BATCH];
         for i in 0..count {
             tags[i] = self.table.first_tags(starts[i].0);
         }
         for i in 0..count {
+            // The full key is only compared on a tag match.
+            let key = Self::prefix_key(&host.parent(lengths[i]).unwrap_or(host));
             match self
                 .table
-                .find_at(&keys[i], starts[i].0, starts[i].1, tags[i], now_secs)
+                .find_at(&key, starts[i].0, starts[i].1, tags[i], now_secs)
             {
                 Probe::Hit(e) => return Lookup::Banned(e.id),
                 Probe::Busy => busy = true,
@@ -1240,6 +1292,17 @@ impl BanMemory {
     }
 
     /// Lookup of one table key, for identity checks.
+    /// Whether any ban of an identity kind may be held (a fingerprint bind
+    /// also checks compound keys).
+    #[inline]
+    pub(crate) fn may_hold(&self, kind: u8) -> bool {
+        let mut mask = 1u64 << (kind & 63);
+        if kind == table::KIND_FINGERPRINT {
+            mask |= 1u64 << table::KIND_FINGERPRINT_IN;
+        }
+        self.present_ident.load(Ordering::Acquire) & mask != 0
+    }
+
     pub(crate) fn lookup_key(&self, key: &TableKey, now_secs: u64) -> Probe {
         if self.present_ident.load(Ordering::Acquire) & (1u64 << (key.kind & 63)) == 0 {
             return Probe::Miss;
