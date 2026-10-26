@@ -124,6 +124,7 @@ NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core on a loaded mac
 | a per-thread stash of free cells | dropped: no gain measured (the thread-local access costs what the two compare-and-swaps did) |
 | the ticket owner releasing with a load and a store | dropped: loom L-5 rejects it |
 | budgets reusing the lookup's prefix hash | dropped: no gain measured |
+| the budget cells loaded before the ban lookup, so their misses overlap | dropped: random peers +26%, banned peers +92% (a banned peer now pays for cells it never needed) |
 | a fast clock for `door` | not in clock-lib: its directives put timers out of scope and forbid `unsafe` (no timestamp counter); `door_at` with the transport's accept time is the fast path |
 
 ## v0.9.0 - Beta and release candidates
