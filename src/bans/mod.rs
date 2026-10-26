@@ -1348,8 +1348,8 @@ impl BanMemory {
         busy.then_some(Lookup::Busy)
     }
 
-    /// The table key of `host`'s prefix of length `len` (IPv4 in 32-bit
-    /// arithmetic).
+    /// The table key of `host`'s prefix of length `len` (a host address:
+    /// its bits masked directly, IPv4 in 32-bit arithmetic).
     #[inline]
     pub(crate) fn key_at(host: &Cidr, len: u8) -> TableKey {
         match host.family() {
@@ -1367,7 +1367,20 @@ impl BanMemory {
                     k1: u64::from(m),
                 }
             }
-            Family::V6 => Self::prefix_key(&host.parent(len).unwrap_or(*host)),
+            Family::V6 => {
+                let b = host.bits();
+                let m = if len == 0 {
+                    0
+                } else {
+                    b & (u128::MAX << (128 - u32::from(len.min(128))))
+                };
+                TableKey {
+                    kind: table::KIND_V6,
+                    len,
+                    k0: (m >> 64) as u64,
+                    k1: m as u64,
+                }
+            }
         }
     }
 
