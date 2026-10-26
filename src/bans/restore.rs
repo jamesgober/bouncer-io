@@ -179,7 +179,7 @@ impl BanMemory {
         let w = self.lock();
         let held = match placement {
             Placement::Dynamic(tkey) => {
-                let e = self.table.get_owned(&tkey)?;
+                let e = self.table.get_owned(&w.table, &tkey)?;
                 Held {
                     key,
                     id: e.id,

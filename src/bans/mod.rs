@@ -609,9 +609,10 @@ impl BanMemory {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Bytes reserved by the dynamic table.
+    /// Bytes reserved by the dynamic table and the originals of its
+    /// fingerprinted keys.
     pub(crate) fn table_bytes(&self) -> u64 {
-        self.table.bytes()
+        self.table.bytes() + self.lock().table.bytes()
     }
 
     /// Entries the dynamic table holds at most.
@@ -820,7 +821,7 @@ impl BanMemory {
                 // expired, offender memory (with its decay) decides.
                 let held = self
                     .table
-                    .get_owned(k)
+                    .get_owned(&w.table, k)
                     .filter(|e| !e.expired(now_secs))
                     .map(|e| e.offences.saturating_add(1));
                 let remembered = w.offenders.offences(k, now_secs);
@@ -846,7 +847,7 @@ impl BanMemory {
         // stores nothing new (the table stays compact under a flood). An
         // explicit ban is stored anyway, so lifting the prefix keeps it.
         if let (Placement::Dynamic(tkey), true) = (&placement, spec.actor.is_automated()) {
-            if let Some(covering) = self.covering_wider(tkey, until, now_secs) {
+            if let Some(covering) = self.covering_wider(&w.table, tkey, until, now_secs) {
                 return Ok((BanId(covering), None, None, None));
             }
         }
@@ -948,13 +949,19 @@ impl BanMemory {
 
     /// The id of an unexpired ban at a shorter automatic length that covers
     /// `tkey` and lasts at least until `until` (0 = permanent).
-    fn covering_wider(&self, tkey: &TableKey, until: u32, now_secs: u64) -> Option<u64> {
+    fn covering_wider(
+        &self,
+        tw: &TableWriter,
+        tkey: &TableKey,
+        until: u32,
+        now_secs: u64,
+    ) -> Option<u64> {
         let c = view::cidr_of(tkey)?;
         (0..c.len())
             .rev()
             .filter(|&l| self.is_auto(c.family(), l))
             .filter_map(|l| c.parent(l))
-            .filter_map(|p| self.table.get_owned(&Self::prefix_key(&p)))
+            .filter_map(|p| self.table.get_owned(tw, &Self::prefix_key(&p)))
             .find(|e| !e.expired(now_secs) && (e.until == 0 || (until != 0 && e.until >= until)))
             .map(|e| e.id)
     }
@@ -971,7 +978,7 @@ impl BanMemory {
         let mut keys = Vec::with_capacity(children.len());
         for c in &children {
             let k = Self::prefix_key(c);
-            if let Some(e) = self.table.get_owned(&k) {
+            if let Some(e) = self.table.get_owned(&w.table, &k) {
                 if e.expired(now_secs) {
                     continue;
                 }
@@ -1009,7 +1016,7 @@ impl BanMemory {
         let writer = &mut *w;
         let mut n = Vec::new();
         for k in children {
-            let Some(e) = self.table.get_owned(k) else {
+            let Some(e) = self.table.get_owned(&writer.table, k) else {
                 continue;
             };
             let outlasts = parent_until != 0 && (e.until == 0 || e.until > parent_until);
@@ -1041,7 +1048,7 @@ impl BanMemory {
         let mut held: Vec<Entry> = plan
             .children
             .iter()
-            .filter_map(|k| self.table.get_owned(k))
+            .filter_map(|k| self.table.get_owned(&writer.table, k))
             .collect();
         if held.len() > quota {
             held.sort_by_key(|e| if e.until == 0 { u32::MAX } else { e.until });

@@ -119,6 +119,7 @@ NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core on a loaded mac
 | addresses anchored at their family's shortest automatic length, one group per lookup (D-104) | `door_at` random peers -15% |
 | first table and allow list read without a thread-local access | judgement -10% more |
 | each length's key built once, unkeyed tags past the anchor, direct masks | judgement 55 -> 33 ns in all |
+| 32-byte slots, one-word keys, long keys as keyed fingerprints (D-105) | memory per ban 56.0 -> 37.7 B (NFR-6 met); door within noise; account revocation -20% |
 | connection release without the link swap | dropped: loom L-7 fails without it (D-103) |
 | a per-thread stash of free cells | dropped: no gain measured (the thread-local access costs what the two compare-and-swaps did) |
 | the ticket owner releasing with a load and a store | dropped: loom L-5 rejects it |

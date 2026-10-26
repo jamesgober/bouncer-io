@@ -373,7 +373,7 @@ impl Revocations {
             source_v4: AtomicU64::new(0),
             source_v6: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             writer: Mutex::new(Writer {
-                table: TableWriter::default(),
+                table: TableWriter::digests_only(),
                 counts_kind: [0; 16],
                 counts_v4: [0; 33],
                 counts_v6: [0; 129],
@@ -392,7 +392,7 @@ impl Revocations {
     }
 
     pub(crate) fn bytes(&self) -> u64 {
-        self.table.bytes()
+        self.table.bytes() + self.lock().table.bytes()
     }
 
     /// Live entries.
