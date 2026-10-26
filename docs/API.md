@@ -18,7 +18,7 @@
 
 The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every item lists its tier, its grade, the version that brings it, and what it costs. The rustdoc on [docs.rs](https://docs.rs/bouncer-io) becomes the exhaustive reference as each item lands; until then this file is the contract.
 
-> **Status: `0.5.0` (feature complete).** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. Items marked with a later version (the net-io feature at 0.8) are the agreed shape; their examples become doctests when they land.
+> **Status: `0.6.0` (optimisation; 0.7 hardening in progress).** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. Items marked with a later version (the net-io feature at 0.8) are the agreed shape; their examples become doctests when they land.
 
 **Reading the item headers.** *Tier 1* is the simple surface (one-line constructors, no builder), *Tier 2* is configuration, *Tier 3* is the full surface for integrations and other libraries. *P0* is required for the crate's job, *P1* is what users of the best existing tools expect, *P2* is high value for serious deployments, *P3* comes after 1.0. Costs are targets, marked `[est.]` until they are measured at 0.6.
 
@@ -2371,7 +2371,7 @@ pub struct Capacity { pub tickets: u32, pub bans: u32, pub revocations: u32, pub
 
 Tier 2 · P1 · 0.5 (`Capacity` 0.3)
 
-`is_ok` is `false` when any table is above 90% load, the maintainer stopped, or the last persistence write failed.
+`is_ok` is `false` when any table is above 90% load, the maintainer stopped, or the last persistence write failed. `budget_load` counts the slots holding a key that has not recovered: recovered keys are reclaimed on demand, so a budget table full of them is not full. Near 1, newcomers past a full table are charged together to one global cell at the prefix rate (they are never unlimited).
 
 ---
 

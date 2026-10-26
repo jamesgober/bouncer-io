@@ -14,12 +14,17 @@
 ### Fixed
 
 - Forged datagrams no longer spend a real source's budget. Unverified datagrams were charged at their prefix under the same key as the prefix's connections and verified datagrams, so a flood of forged UDP naming a victim's /24 or /48 could get the victim's TCP connections refused. They now have a prefix key of their own.
+- Full budget tables no longer admit uncharged. Once both rate tiers were full of keys still limiting, newcomers passed with no budget at all; they are now charged together to one global cell at the prefix rate, as the design always said. The door's concurrency tables hold at least twice the ticket capacity, so held connections can no longer fill them and lift the per-address limit.
+- `Health::budget_load` counts the slots holding a key that has not recovered. It counted claimed slots, which reach 1 in normal use with many clients (recovered keys are reclaimed only when a slot is needed), so `is_ok` reported a healthy bouncer as unhealthy.
+- `docs/API.md` named 0.5.0 as the current version.
 
 ### Added
 
 - Tests for threats T-1 (a peer that is not a trusted proxy cannot name a client), T-7 (a stream cut by revocation leaks at most the chunk in flight), T-18 (no printable value or event carries digest bytes), and T-20 (unverified datagram sources are never banned). Every test named in the threat table now exists under that name.
 - The full T-6 stress run uses 32 threads, as the threat table states (10^8 checkpoints with concurrent revocations; no missed revocation).
 - Timing tests for threat T-8 (`tests/timing.rs`, run with `--ignored` in release): admitted latency does not depend on neighbours' bans, and bind latency does not reveal digests near a banned one (Kolmogorov-Smirnov at p < 0.01, with a control that must separate).
+- The soak (`tests/soak.rs`, NFR-13): 100,000 connections a second with bans and revocations running; checks for missed revocations and for heap growth after warming.
+- The decoder fuzz targets frame part of their inputs (magic, lengths, CRC), so mutations reach the record decoders behind the checksums.
 
 ---
 

@@ -644,3 +644,95 @@ fn test_registry_flood_from_one_address_cannot_exhaust_it() {
         "a legitimate address is still admitted"
     );
 }
+
+// ---- Full budget tables -----------------------------------------------------
+
+fn prefix_v4(i: u32) -> IpAddr {
+    // One address in each /24: 10.0.0.0/8 and up.
+    IpAddr::from((0x0a00_0001 + (i << 8)).to_be_bytes())
+}
+
+#[test]
+fn test_full_budget_tables_charge_the_global_cell() {
+    // PLAN 7.9: a newcomer in a full table is charged against its parent,
+    // then the global cell. With the time frozen, no key recovers, so the
+    // tables fill with keys that are still limiting; newcomers after that
+    // must still be limited, together.
+    let clock = Arc::new(ManualClock::new());
+    let b = Bouncer::builder()
+        .clock(clock.clone())
+        .tickets(1024)
+        .budgets(
+            Budgets::off()
+                .door_rate(
+                    bouncer_io::Rate::per_second(5),
+                    bouncer_io::Rate::per_second(5),
+                )
+                .capacity(1024),
+        )
+        .try_build()
+        .unwrap();
+    // 16,384 prefixes, one connection each: far more than the tables hold.
+    let mut admitted_fill = 0;
+    for i in 0..16_384 {
+        if b.door(prefix_v4(i)).is_ok() {
+            admitted_fill += 1;
+        }
+    }
+    assert!(admitted_fill >= 1024, "the tables filled: {admitted_fill}");
+    // Newcomers: 1,000 new prefixes. At most one prefix budget's burst of
+    // them may pass, shared through the global cell.
+    let newcomers = (100_000..101_000)
+        .filter(|&i| b.door(prefix_v4(i)).is_ok())
+        .count();
+    assert!(
+        newcomers <= 5,
+        "{newcomers} newcomers admitted past full tables"
+    );
+    // A prefix that holds its own slot keeps its own budget.
+    assert!(b.door(IpAddr::from([10, 0, 0, 77])).is_ok());
+}
+
+#[test]
+fn test_budget_load_counts_keys_still_limiting() {
+    // Health: a table of recovered keys is not a full table (they are
+    // reclaimed on demand), so it does not make the bouncer unhealthy.
+    let clock = Arc::new(ManualClock::new());
+    let b = Bouncer::builder()
+        .clock(clock.clone())
+        .tickets(1024)
+        .budgets(Budgets::default().capacity(1024))
+        .try_build()
+        .unwrap();
+    for i in 0..20_000 {
+        let _ = b.door(prefix_v4(i));
+    }
+    assert!(b.health().budget_load > 0.9, "{:?}", b.health());
+    clock.advance(Duration::from_secs(60));
+    let h = b.health();
+    assert!(h.budget_load < 0.1, "{h:?}");
+    assert!(h.is_ok(), "{h:?}");
+}
+
+#[test]
+fn test_concurrency_limits_hold_with_every_ticket_in_use() {
+    // The concurrency tables hold every live connection's keys: with all
+    // tickets held by distinct addresses, the per-address limit still holds.
+    let b = Bouncer::builder()
+        .tickets(4096)
+        .budgets(Budgets::off().door_concurrency(2, 1_000).capacity(1024))
+        .try_build()
+        .unwrap();
+    let held: Vec<_> = (0..4000)
+        .filter_map(|i| b.door(prefix_v4(i)).ok())
+        .collect();
+    assert_eq!(held.len(), 4000);
+    let one = ip("192.0.2.200");
+    let first = b.door(one).unwrap();
+    let second = b.door(one).unwrap();
+    assert!(
+        b.door(one).is_err(),
+        "the third connection is over the limit"
+    );
+    drop((first, second, held));
+}

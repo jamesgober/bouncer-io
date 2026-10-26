@@ -380,6 +380,10 @@ impl Throttles {
 pub(crate) struct DoorBudgets {
     key: HashKey,
     rate: Option<[RateTier; 2]>,
+    /// The global cell, at the prefix rate: charged for every admission
+    /// whose prefix found no slot in a full table (PLAN 7.9), so newcomers
+    /// past a full table are limited together instead of not at all.
+    overflow: Option<Gcra>,
     concurrency: Option<[ConcurrencyTier; 2]>,
     throttles: Throttles,
 }
@@ -390,9 +394,12 @@ pub(crate) struct OverBudget(pub(crate) Duration);
 
 impl DoorBudgets {
     /// Allocates the tables. The configuration was validated by
-    /// [`Budgets::validate`]; an invalid tier is left out.
-    pub(crate) fn new(cfg: &Budgets, key: HashKey) -> DoorBudgets {
+    /// [`Budgets::validate`]; an invalid tier is left out. The concurrency
+    /// tables hold at least twice `tickets` keys, so the keys of every live
+    /// connection always fit (a held key is never reclaimed).
+    pub(crate) fn new(cfg: &Budgets, key: HashKey, tickets: u32) -> DoorBudgets {
         let cap = cfg.capacity.clamp(1, 1 << 24);
+        let conc_cap = cap.max(tickets.saturating_mul(2)).min(1 << 24);
         let rate = cfg.door_rate.and_then(|(addr, prefix)| {
             let tier = |r: Rate| -> Option<RateTier> {
                 let q = r.quota("budgets").ok()?;
@@ -406,12 +413,16 @@ impl DoorBudgets {
             };
             Some([tier(addr)?, tier(prefix)?])
         });
+        let overflow = rate.as_ref().and_then(|_| {
+            let (_, prefix) = cfg.door_rate?;
+            Some(Gcra::new(prefix.quota("budgets").ok()?))
+        });
         let concurrency = cfg
             .door_concurrency
             .filter(|&(a, p)| a > 0 && p > 0)
             .map(|(a, p)| {
                 let tier = |limit: u32| {
-                    let claims = Claims::new(cap);
+                    let claims = Claims::new(conc_cap);
                     let counts = (0..claims.len()).map(|_| AtomicU32::new(0)).collect();
                     ConcurrencyTier {
                         claims,
@@ -424,6 +435,7 @@ impl DoorBudgets {
         DoorBudgets {
             key,
             rate,
+            overflow,
             concurrency,
             throttles: Throttles::new(cap.min(16_384)),
         }
@@ -528,19 +540,13 @@ impl DoorBudgets {
         let now_d = Duration::from_nanos(now.as_nanos());
         let now_secs = now.secs();
         if let Some(tiers) = &self.rate {
-            for (tier, &key) in tiers.iter().zip(keys.iter()) {
+            for (i, (tier, &key)) in tiers.iter().zip(keys.iter()).enumerate() {
                 let n = self.factor(key, now_secs).saturating_mul(divisor);
-                let cells = &tier.cells;
-                let burst = tier.burst;
-                let idle = |slot: usize| cells[slot].peek_at(now_d).remaining() >= burst;
                 // A full table charges the next tier instead (hierarchical
-                // fallback): a flood of new keys cannot reset anyone's limit.
-                if let Some((slot, _)) = tier.claims.find_or_claim(key, idle, |s| cells[s].reset())
-                {
-                    if let Decision::Deny { retry_after } = cells[slot].check_n_at(n, now_d) {
-                        return Err(OverBudget(retry_after));
-                    }
-                }
+                // fallback), and past the prefix tier the global cell: a
+                // flood of new keys cannot reset anyone's limit, and is
+                // never unlimited.
+                self.charge(tier, i + 1 == tiers.len(), key, n, now_d)?;
             }
         }
         if let Some(tiers) = &self.concurrency {
@@ -585,17 +591,37 @@ impl DoorBudgets {
         let now_d = Duration::from_nanos(now.as_nanos());
         let now_secs = now.secs();
         let first = usize::from(!verified);
-        for (tier, &key) in tiers.iter().zip(keys.iter()).skip(first) {
+        for (i, (tier, &key)) in tiers.iter().zip(keys.iter()).enumerate().skip(first) {
             let n = self.factor(key, now_secs).saturating_mul(divisor);
             let key = if verified { key } else { unverified(key) };
-            let cells = &tier.cells;
-            let burst = tier.burst;
-            let idle = |slot: usize| cells[slot].peek_at(now_d).remaining() >= burst;
-            if let Some((slot, _)) = tier.claims.find_or_claim(key, idle, |s| cells[s].reset()) {
-                if let Decision::Deny { retry_after } = cells[slot].check_n_at(n, now_d) {
-                    return Err(OverBudget(retry_after));
-                }
-            }
+            self.charge(tier, i + 1 == tiers.len(), key, n, now_d)?;
+        }
+        Ok(())
+    }
+
+    /// Charges `n` to `key`'s cell in `tier`; when the table has no slot for
+    /// it and the tier is the last, to the global cell.
+    #[inline]
+    fn charge(
+        &self,
+        tier: &RateTier,
+        last: bool,
+        key: u64,
+        n: u32,
+        now: Duration,
+    ) -> Result<(), OverBudget> {
+        let cells = &tier.cells;
+        let burst = tier.burst;
+        let idle = |slot: usize| cells[slot].peek_at(now).remaining() >= burst;
+        let cell = match tier.claims.find_or_claim(key, idle, |s| cells[s].reset()) {
+            Some((slot, _)) => &cells[slot],
+            None => match (&self.overflow, last) {
+                (Some(global), true) => global,
+                _ => return Ok(()),
+            },
+        };
+        if let Decision::Deny { retry_after } = cell.check_n_at(n, now) {
+            return Err(OverBudget(retry_after));
         }
         Ok(())
     }
@@ -620,10 +646,18 @@ impl DoorBudgets {
         }
     }
 
-    /// The fullest table's load, 0 to 1.
-    pub(crate) fn load(&self) -> f32 {
-        let rate = self.rate.iter().flatten().map(|t| t.claims.load());
-        let conc = self.concurrency.iter().flatten().map(|t| t.claims.load());
+    /// The fullest table's load, 0 to 1: slots holding a key that has not
+    /// recovered (recovered keys are reclaimed on demand). A full scan.
+    pub(crate) fn load(&self, now: Now) -> f32 {
+        let now_d = Duration::from_nanos(now.as_nanos());
+        let rate = self.rate.iter().flatten().map(|t| {
+            t.claims
+                .active_load(|i| t.cells[i].peek_at(now_d).remaining() < t.burst)
+        });
+        let conc = self.concurrency.iter().flatten().map(|t| {
+            t.claims
+                .active_load(|i| t.counts[i].load(Ordering::Relaxed) > 0)
+        });
         rate.chain(conc).fold(0.0, f32::max)
     }
 
@@ -981,11 +1015,22 @@ impl IdentityBudgets {
         }
     }
 
-    /// The fullest table's load, 0 to 1.
-    pub(crate) fn load(&self) -> f32 {
-        let lanes = self.lanes.iter().flatten().map(|t| t.claims.load());
-        let tenant = self.tenant.iter().map(|t| t.claims.load());
-        let flight = self.in_flight.iter().map(|c| c.claims.load());
+    /// The fullest table's load, 0 to 1: slots holding a key that has not
+    /// recovered (recovered keys are reclaimed on demand). A full scan.
+    pub(crate) fn load(&self, now: Now) -> f32 {
+        let now_d = Duration::from_nanos(now.as_nanos());
+        let lanes = self.lanes.iter().flatten().map(|t| {
+            t.claims
+                .active_load(|i| t.cells[i].peek_at(now_d).remaining() < t.burst)
+        });
+        let tenant = self.tenant.iter().map(|t| {
+            t.claims
+                .active_load(|i| t.cells[i].available_at(now_d) < t.capacity)
+        });
+        let flight = self.in_flight.iter().map(|c| {
+            c.claims
+                .active_load(|i| c.counts[i].load(Ordering::Relaxed) > 0)
+        });
         lanes.chain(tenant).chain(flight).fold(0.0, f32::max)
     }
 
@@ -1015,7 +1060,7 @@ mod tests {
 
     fn budgets(cfg: Budgets) -> DoorBudgets {
         cfg.validate().unwrap();
-        DoorBudgets::new(&cfg, HashKey::new(1, 2))
+        DoorBudgets::new(&cfg, HashKey::new(1, 2), 1024)
     }
 
     #[test]

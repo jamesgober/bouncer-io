@@ -1791,7 +1791,7 @@ impl BouncerBuilder {
         let derived = |rng: &mut crate::hash::Rng| HashKey::new(rng.next_u64(), rng.next_u64());
         // The table's key: one keyed hash of a prefix serves the ban lookup
         // and the door budgets.
-        let budgets = DoorBudgets::new(&self.budgets, seeds.tables);
+        let budgets = DoorBudgets::new(&self.budgets, seeds.tables, self.tickets);
         let identity = IdentityBudgets::new(&self.budgets, derived(&mut rng), Now::default());
         let revocation_rate =
             rate_net::Quota::rate(self.revocation_rate_limit, Duration::from_secs(1))
