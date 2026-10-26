@@ -812,7 +812,7 @@ One per version, as hypothesis, method, expected cost.
 
 ## 15. Open decisions
 
-Every decision from the specification is answered below (and logged in section 17). One item waits on another repository and one on James.
+Every decision from the specification is answered below (and logged in section 17).
 
 | Id | Question | Answer | Status |
 |---|---|---|---|
@@ -831,7 +831,7 @@ Every decision from the specification is answered below (and logged in section 1
 | O-13 | Default mode of local heuristics | observe by default, switchable per category and by strict posture (decided by James 2026-10-21) | decided (D-010) |
 | O-14 | Request revocation on multiplexed connections | eject the connection by default; `keep_connection` for one request | decided (D-028) |
 | O-15 | Name of the gates crate | bouncer only sees `Actor::Gate`; no API impact | decided (D-029) |
-| O-16 | Publish 0.2.0 to crates.io (the name is free; nothing is published yet) | yes, as the release routine says, once the design lock is approved | **James** |
+| O-16 | Publish 0.2.0 to crates.io (the name is free; nothing is published yet) | yes, approved by James 2026-10-23; every release since is published | decided |
 
 ---
 

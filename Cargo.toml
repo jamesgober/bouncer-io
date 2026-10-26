@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Files kept out of the published package
-exclude = [".cargo/", "fuzz/", ".github/"]
+exclude = ["scripts/", ".cargo/", "fuzz/", ".github/"]
 
 # Description
 description = "Connection gate for Rust services: admission by address, prefix, fingerprint, session, and account; in-flight revocation through cheap checkpoints; wipe, replace, and eject of revoked requests; ban memory with prefix escalation. Protocol-free."
@@ -96,6 +96,14 @@ harness = false
 name    = "perf"
 harness = false
 
+[[bench]]
+name    = "storm"
+harness = false
+
+[[bench]]
+name    = "gate"
+harness = false
+
 
 # LINTS
 # #################################
@@ -111,3 +119,8 @@ lto           = "fat"
 codegen-units = 1
 panic         = "abort"
 strip         = "symbols"
+
+# Benches keep symbols: the instruction-count gate finds functions by name.
+[profile.bench]
+strip = "none"
+debug = "line-tables-only"

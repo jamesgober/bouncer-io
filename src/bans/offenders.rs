@@ -2,15 +2,25 @@
 //! outlives the bans, so a returning offender's next ban is longer.
 //!
 //! Kept inside the ban writer lock (it changes only when a ban is set) in a
-//! map sized at build. When full, the lowest decayed score among a sample is
-//! dropped.
+//! map sized at build. When full, of the two records noted longest ago,
+//! the one with the lowest decayed score is dropped: constant work per
+//! insert, never a scan.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use super::table::TableKey;
 
-/// Entries sampled to pick one to drop when the memory is full.
-const EVICT_SAMPLE: usize = 64;
+/// Records looked at, oldest first, to pick the one to drop when full.
+const CANDIDATES: usize = 2;
+
+/// log2 of a positive float, approximated from its bits (exponent plus a
+/// linear mantissa; error under 0.09). Zero and below rank lowest.
+fn approx_log2(x: f32) -> f32 {
+    if x <= 0.0 {
+        return f32::MIN;
+    }
+    x.to_bits() as f32 * (1.0 / (1u32 << 23) as f32) - 127.0
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Offence {
@@ -23,6 +33,9 @@ pub(crate) struct Offence {
 #[derive(Debug)]
 pub(crate) struct Offenders {
     map: HashMap<TableKey, Offence>,
+    /// Keys in the order they were first noted (keys already dropped are
+    /// skipped when they reach the front).
+    order: VecDeque<TableKey>,
     capacity: usize,
     half_life: u64,
 }
@@ -31,6 +44,7 @@ impl Offenders {
     pub(crate) fn new(capacity: usize, half_life_secs: u64) -> Offenders {
         Offenders {
             map: HashMap::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
             capacity: capacity.max(1),
             half_life: half_life_secs.max(1),
         }
@@ -75,27 +89,60 @@ impl Offenders {
             self.map.insert(key, Offence { score, last });
             return;
         }
-        if self.map.len() >= self.capacity {
-            let victim = self
-                .map
-                .iter()
-                .take(EVICT_SAMPLE)
-                .min_by(|a, b| {
-                    self.decayed(a.1, now_secs)
-                        .total_cmp(&self.decayed(b.1, now_secs))
-                })
-                .map(|(k, _)| *k);
-            if let Some(k) = victim {
-                self.map.remove(&k);
-            }
-        }
+        self.make_room(now_secs);
         self.map.insert(key, Offence { score: 1.0, last });
+        self.order.push_back(key);
     }
 
-    /// Sets a record as loaded or imported.
+    /// Drops one record when full: of the oldest few (by first offence),
+    /// the one with the lowest decayed score. Constant work per insert.
+    fn make_room(&mut self, now_secs: u64) {
+        if self.map.len() < self.capacity {
+            return;
+        }
+        let mut candidates: [Option<TableKey>; CANDIDATES] = [None; CANDIDATES];
+        let mut n = 0;
+        while n < CANDIDATES {
+            let Some(k) = self.order.pop_front() else {
+                break;
+            };
+            if self.map.contains_key(&k) {
+                candidates[n] = Some(k);
+                n += 1;
+            }
+        }
+        // Compared at one moment, decayed scores order as
+        // `log2(score) + last / half_life`; an approximate log2 from the
+        // float's bits (error under 0.09) is enough to choose, and needs no
+        // `powf` per candidate.
+        let rank = |k: &TableKey| {
+            self.map.get(k).map_or(f32::MIN, |o| {
+                approx_log2(o.score) + o.last as f32 / self.half_life as f32
+            })
+        };
+        let lowest = candidates[..n]
+            .iter()
+            .flatten()
+            .min_by(|a, b| rank(a).total_cmp(&rank(b)))
+            .copied();
+        let _ = now_secs;
+        if let Some(k) = lowest {
+            self.map.remove(&k);
+        }
+        // The others keep their place at the front.
+        for k in candidates[..n].iter().rev().flatten() {
+            if Some(*k) != lowest {
+                self.order.push_front(*k);
+            }
+        }
+    }
+
     pub(crate) fn set(&mut self, key: TableKey, offence: Offence) {
-        if self.map.len() < self.capacity || self.map.contains_key(&key) {
+        if self.map.contains_key(&key) {
             self.map.insert(key, offence);
+        } else if self.map.len() < self.capacity {
+            self.map.insert(key, offence);
+            self.order.push_back(key);
         }
     }
 
@@ -135,6 +182,14 @@ mod tests {
         // A new offence adds to the decayed score.
         o.record(k(1), 100);
         assert_eq!(o.offences(&k(1), 100), 3);
+    }
+
+    #[test]
+    fn test_approx_log2_close_enough() {
+        for x in [0.001f32, 0.5, 1.0, 1.5, 2.0, 3.0, 100.0, 1e6] {
+            assert!((approx_log2(x) - x.log2()).abs() < 0.09, "{x}");
+        }
+        assert_eq!(approx_log2(0.0), f32::MIN);
     }
 
     #[test]

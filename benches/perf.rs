@@ -248,4 +248,93 @@ fn main() {
             black_box(f.bouncer.now());
         }),
     );
+    // The other PLAN 11 targets.
+    row(
+        "before_commit",
+        measure(|_| {
+            black_box(req.before_commit().is_pass());
+        }),
+    );
+    let tag = f.bouncer.door(f.admitted[1]).unwrap().into_tag();
+    row(
+        "egress by connection tag",
+        measure(|_| {
+            black_box(f.bouncer.egress(tag).is_pass());
+        }),
+    );
+    f.bouncer.release(tag);
+    row(
+        "request + bind_session",
+        measure(|i| {
+            let mut r = conn.request(RequestId(i as u128 + 1 << 40)).unwrap();
+            let mut d = [0u8; 16];
+            d[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            black_box(
+                r.bind_session(bouncer_io::SessionKey::from_digest(d))
+                    .is_pass(),
+            );
+        }),
+    );
+    let fresh = Bouncer::builder()
+        .budgets(Budgets::off())
+        .ban_capacity(1 << 21)
+        .revocation_capacity(1 << 21)
+        .escalation(bouncer_io::EscalationPolicy::default().off())
+        .try_build()
+        .unwrap();
+    let mut n = 0u32;
+    row(
+        "ban insert (table filling to 1.2m)",
+        measure(|_| {
+            n = n.wrapping_add(1);
+            let a = IpAddr::from((0x4000_0000u32 | n.wrapping_mul(2_654_435_761)).to_be_bytes());
+            black_box(fresh.ban(a).is_ok());
+        }),
+    );
+    let mut k = 0u128;
+    row(
+        "revoke (account)",
+        measure(|_| {
+            k += 1;
+            black_box(
+                fresh
+                    .revoke(bouncer_io::AccountKey(k), bouncer_io::Reason::ADMIN)
+                    .is_ok(),
+            );
+        }),
+    );
+    let cap = fresh.capacity();
+    println!(
+        "memory per ban: {:.1} B (dynamic table {} B for {} entries)",
+        cap.table_bytes as f64 / f64::from(cap.bans),
+        cap.table_bytes,
+        cap.bans
+    );
+    // An eject-now sweep over a full registry.
+    let swept = Bouncer::builder()
+        .budgets(Budgets::off())
+        .tickets(65_536)
+        .try_build()
+        .unwrap();
+    let held: Vec<_> = (0..65_535u32)
+        .map(|i| {
+            swept
+                .door(IpAddr::from((0x0b00_0000 | i).to_be_bytes()))
+                .unwrap()
+        })
+        .collect();
+    let mut sweeps = Vec::new();
+    for s in 0..21u128 {
+        let start = Instant::now();
+        let _ =
+            swept.apply(bouncer_io::Directive::revoke(bouncer_io::AccountKey(s + 1)).eject_now());
+        sweeps.push(start.elapsed().as_nanos() as f64 / 1e3);
+    }
+    sweeps.sort_by(f64::total_cmp);
+    println!(
+        "eject-now sweep, 65,535 live cells: fastest {:.0} us, median {:.0} us",
+        sweeps[0],
+        sweeps[sweeps.len() / 2]
+    );
+    drop(held);
 }

@@ -1292,6 +1292,17 @@ impl BanMemory {
     }
 
     /// Lookup of one table key, for identity checks.
+    /// Whether any ban of an identity kind may be held (a fingerprint bind
+    /// also checks compound keys).
+    #[inline]
+    pub(crate) fn may_hold(&self, kind: u8) -> bool {
+        let mut mask = 1u64 << (kind & 63);
+        if kind == table::KIND_FINGERPRINT {
+            mask |= 1u64 << table::KIND_FINGERPRINT_IN;
+        }
+        self.present_ident.load(Ordering::Acquire) & mask != 0
+    }
+
     pub(crate) fn lookup_key(&self, key: &TableKey, now_secs: u64) -> Probe {
         if self.present_ident.load(Ordering::Acquire) & (1u64 << (key.kind & 63)) == 0 {
             return Probe::Miss;

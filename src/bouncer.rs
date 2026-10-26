@@ -29,7 +29,7 @@ use crate::{
     revoke::{Record, Revocation, RevocationEpoch, Revocations, RevokeMode, Target, target_key},
     share::NodeId,
     strikes::{Counters, Enforcement, Posture, StrikeRules},
-    sync::{AtomicU32, Ordering},
+    sync::{AtomicU32, AtomicU64, Ordering},
     ticket::{self, Issue, Ticket, TicketKind, TicketTag, mark_revoked, subject_of},
     time::Now,
     verdict::{DenialCode, DenialTable, Reference, Verdict},
@@ -55,6 +55,9 @@ pub(crate) struct Shared {
     pub(crate) allow: Published<PrefixSet<AllowKind>>,
     /// Entries in the allow list now: the door skips the list when zero.
     pub(crate) allow_len: AtomicU32,
+    /// The latest whole second the door has seen: a clock reading for
+    /// coarse uses (shared-address windows) without reading the clock.
+    seen_secs: AtomicU64,
     pub(crate) proxies: PrefixSet<()>,
     pub(crate) references: HashKey,
     pub(crate) tickets_capacity: u32,
@@ -89,6 +92,25 @@ impl Shared {
     #[inline]
     pub(crate) fn now(&self) -> Now {
         Now::from_duration(self.clock.now().saturating_duration_since(self.start))
+    }
+
+    /// Notes a time the door saw (cheap: one load, a store once a second).
+    #[inline]
+    pub(crate) fn saw(&self, now: Now) {
+        let s = now.secs();
+        if s > self.seen_secs.load(Ordering::Relaxed) {
+            self.seen_secs.store(s, Ordering::Relaxed);
+        }
+    }
+
+    /// Whole seconds, as of the door's latest check (the clock itself when
+    /// the door has seen nothing yet). For coarse windows only.
+    #[inline]
+    pub(crate) fn recent_secs(&self) -> u64 {
+        match self.seen_secs.load(Ordering::Relaxed) {
+            0 => self.now().secs(),
+            s => s,
+        }
     }
 
     /// The wall clock now.
@@ -524,6 +546,7 @@ impl Bouncer {
     ) -> Result<Ticket, Refusal> {
         let shared = &self.inner.shared;
         let peer = normalize(peer);
+        shared.saw(now);
         let mut hashes = crate::bans::AddrHashes::new(shared.bans.hasher(), peer);
         let (mut flags, source, charge) =
             match shared.judge_hashed(peer, provenance, now, &mut hashes) {
@@ -1796,6 +1819,7 @@ impl BouncerBuilder {
                 seeds.rng,
             ),
             allow_len: AtomicU32::new(allow.len() as u32),
+            seen_secs: AtomicU64::new(0),
             allow: Published::new(allow),
             proxies,
             references: seeds.references,

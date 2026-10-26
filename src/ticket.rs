@@ -226,6 +226,16 @@ pub struct Ticket {
     fast: u32,
 }
 
+/// What the shared half of a bind found.
+enum Bound {
+    /// Stale, or the kind is already bound.
+    Invalid,
+    /// Banned or revoked: the cell is revoked with this code.
+    Refused(DenialCode),
+    /// Bound; the checkpoint decides.
+    Written,
+}
+
 /// What a new cell starts with.
 pub(crate) struct Issue {
     pub(crate) kind: TicketKind,
@@ -942,15 +952,42 @@ impl Ticket {
         kind: u8,
         banned: impl FnOnce(&Shared, u64) -> Probe,
     ) -> Verdict {
-        let shard = Arc::clone(&self.shard);
-        let shared = &shard.shared;
+        match self.bind_key(bit, at, hi, lo, kind, banned) {
+            Bound::Invalid => self.deny(DenialCode::Unavailable),
+            Bound::Refused(code) => {
+                self.seen = SEEN_ALWAYS_CHECK;
+                self.deny(code)
+            }
+            Bound::Written => {
+                let verdict = self.checkpoint();
+                if verdict.is_pass() && (kind == table::KIND_SESSION || kind == table::KIND_ACCOUNT)
+                {
+                    self.note_identity(hi.unwrap_or(0), lo);
+                }
+                verdict
+            }
+        }
+    }
+
+    /// The shared-state half of [`bind`](Self::bind): it only reads `self`,
+    /// so no reference to the shard is cloned.
+    fn bind_key(
+        &self,
+        bit: u64,
+        at: usize,
+        hi: Option<u64>,
+        lo: u64,
+        kind: u8,
+        banned: impl FnOnce(&Shared, u64) -> Probe,
+    ) -> Bound {
+        let shared = &*self.shard.shared;
         let cell = shared.registry.cell(self.index);
         let st = cell.state.load(Ordering::Acquire);
         if generation(st) != self.generation || st & F_LIVE == 0 {
-            return self.deny(DenialCode::Unavailable);
+            return Bound::Invalid;
         }
         if cell.present() & bit != 0 {
-            return self.deny(DenialCode::Unavailable);
+            return Bound::Invalid;
         }
         match hi {
             Some(hi) => {
@@ -964,31 +1001,24 @@ impl Ticket {
             .fetch_or(bit << PRESENT_SHIFT, Ordering::AcqRel);
         if (before >> PRESENT_SHIFT) & bit != 0 {
             // Another thread bound the same kind first.
-            return self.deny(DenialCode::Unavailable);
+            return Bound::Invalid;
         }
         fence(Ordering::SeqCst);
-        let now_secs = shared.now().secs();
-        match banned(shared, now_secs) {
-            Probe::Hit(_) | Probe::Busy => {
-                mark_revoked(cell, self.generation, DenialCode::Forbidden);
-                self.seen = SEEN_ALWAYS_CHECK;
-                return self.deny(DenialCode::Forbidden);
+        // The clock is read only when a ban of this kind exists to expire.
+        if shared.bans.may_hold(kind) {
+            match banned(shared, shared.now().secs()) {
+                Probe::Hit(_) | Probe::Busy => {
+                    mark_revoked(cell, self.generation, DenialCode::Forbidden);
+                    return Bound::Refused(DenialCode::Forbidden);
+                }
+                Probe::Miss => {}
             }
-            Probe::Miss => {}
         }
-        let key = match hi {
-            Some(hi) => TableKey {
-                kind,
-                len: 0,
-                k0: hi,
-                k1: lo,
-            },
-            None => TableKey {
-                kind,
-                len: 0,
-                k0: 0,
-                k1: lo,
-            },
+        let key = TableKey {
+            kind,
+            len: 0,
+            k0: hi.unwrap_or(0),
+            k1: lo,
         };
         if let Some(hit) = shared.revocations.matches_key(&key) {
             mark_revoked(cell, self.generation, hit.code);
@@ -1001,27 +1031,28 @@ impl Ticket {
                     (generation(st) == generation_now).then_some(st | F_KEEP_CONNECTION)
                 });
             }
-            self.seen = SEEN_ALWAYS_CHECK;
-            return self.deny(hit.code);
+            return Bound::Refused(hit.code);
         }
-        let verdict = self.checkpoint();
-        if verdict.is_pass() && (kind == table::KIND_SESSION || kind == table::KIND_ACCOUNT) {
-            if let Some(src) = source_of(cell) {
-                let now = shared.now().secs();
-                if shared.sources.note(src, hi.unwrap_or(0), lo, now) {
-                    let subject = Subject {
-                        source: Some(src),
-                        ..Subject::default()
-                    };
-                    events::Emit {
-                        subject,
-                        ..events::Emit::new(events::signals::SOURCE_SHARED_SUSPECTED)
-                    }
-                    .send(shared);
+        Bound::Written
+    }
+
+    /// Counts a session or account toward shared-address detection.
+    fn note_identity(&self, k0: u64, k1: u64) {
+        let shared = &*self.shard.shared;
+        let cell = shared.registry.cell(self.index);
+        if let Some(src) = source_of(cell) {
+            if shared.sources.note(src, k0, k1, shared.recent_secs()) {
+                let subject = Subject {
+                    source: Some(src),
+                    ..Subject::default()
+                };
+                events::Emit {
+                    subject,
+                    ..events::Emit::new(events::signals::SOURCE_SHARED_SUSPECTED)
                 }
+                .send(shared);
             }
         }
-        verdict
     }
 
     /// Reports misbehaviour seen by any layer (a failed handshake, malformed
