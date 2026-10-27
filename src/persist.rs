@@ -11,8 +11,11 @@
 //!
 //! The snapshot's MAC is a keyed BLAKE3 over everything before it. Each
 //! journal batch's MAC covers the previous MAC and the batch, so batches
-//! cannot be dropped, reordered, or spliced in from another file without
-//! the key. A batch from another epoch (left by a crash during compaction)
+//! cannot be altered, reordered, dropped from the middle, or spliced in from
+//! another file without the key. Cutting the journal after a whole batch,
+//! or putting back an older snapshot and journal together, is not detected:
+//! that needs a counter kept outside the files (see `docs/SECURITY.md`). A
+//! batch from another epoch (left by a crash during compaction)
 //! is ignored. Writing happens off the hot path: changes queue in memory
 //! and the maintainer writes and syncs them about every second.
 
@@ -33,8 +36,10 @@ use crate::{
 
 /// The snapshot file's magic bytes.
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"BNCR";
-/// The snapshot and journal format this version writes.
-pub const SNAPSHOT_FORMAT: u16 = 1;
+/// The snapshot and journal format this version writes: 2 since lifts carry
+/// their scope (lifts of one origin's bans or of every origin's). Format 1
+/// is still read, and rewritten as format 2 as soon as it is loaded.
+pub const SNAPSHOT_FORMAT: u16 = 2;
 
 const BATCH_MAGIC: [u8; 4] = *b"BNCJ";
 const HEADER: usize = 4 + 2 + 2 + 8 + 8 + 2 + 8 + 8;
@@ -278,6 +283,8 @@ fn mac(key: &Key, parts: &[&[u8]]) -> [u8; MAC_LEN] {
 /// The fields of a snapshot header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Header {
+    /// The format read (encoding always writes [`SNAPSHOT_FORMAT`]).
+    pub(crate) format: u16,
     pub(crate) created: u64,
     pub(crate) epoch: u64,
     pub(crate) node: u16,
@@ -380,6 +387,7 @@ pub(crate) fn decode_snapshot(
         tag.copy_from_slice(given);
     }
     let header = Header {
+        format,
         created: r.u64().map_err(bad)?,
         epoch: r.u64().map_err(bad)?,
         node: r.u16().map_err(bad)?,
@@ -660,6 +668,7 @@ mod tests {
 
     fn header() -> Header {
         Header {
+            format: SNAPSHOT_FORMAT,
             created: 1_800_000_000,
             epoch: 3,
             node: 1,
@@ -682,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_truncated_anywhere_is_refused() {
-        // Edge case 59.
+        // Edge case 61.
         let key = Key([7; 32]);
         let recs: Vec<Envelope> = (0..3).map(rec).collect();
         for k in [None, Some(&key)] {
@@ -701,7 +710,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_mac_rules() {
-        // Edge case 61, and the downgrade the other way.
+        // Edge case 63, and the downgrade the other way.
         let key = Key([7; 32]);
         let other = Key([8; 32]);
         let (mac_d, _) = encode_snapshot(&header(), &[rec(1)], Some(&key));
@@ -725,7 +734,7 @@ mod tests {
 
     #[test]
     fn test_journal_replay_stops_at_damage_and_skips_old_epochs() {
-        // Edge case 60, and the torn tail.
+        // Edge case 62, and the torn tail.
         let key = Key([7; 32]);
         for k in [None, Some(&key)] {
             let chain0 = [1u8; 32];

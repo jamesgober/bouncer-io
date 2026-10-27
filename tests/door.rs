@@ -3,14 +3,14 @@
 
 use std::{
     net::IpAddr,
-    sync::{Arc, Barrier},
+    sync::{Arc, Barrier, Mutex},
     time::Duration,
 };
 
 use bouncer_io::{
     AccountKey, Actor, AllowList, BanKey, BanSpec, Bouncer, BouncerError, Budgets, Cidr, ConnId,
-    DenialCode, DurationPolicy, FingerprintKey, LiftSpec, Now, Provenance, Refusal, RequestId,
-    SessionKey, Verdict,
+    DenialCode, DurationPolicy, Event, EventSink, FingerprintKey, LiftSpec, Now, Provenance,
+    Reason, Refusal, RequestId, SessionKey, Verdict, signals,
 };
 use clock_lib::ManualClock;
 
@@ -192,6 +192,45 @@ fn test_ban_trusted_proxy_refused() {
 }
 
 #[test]
+fn test_door_forwarded_header_from_untrusted_peer_not_bound() {
+    // Threat T-1: a peer that is not a trusted proxy cannot name another
+    // client, to evade its own ban or to frame someone else.
+    let b = Bouncer::builder()
+        .trusted_proxies(&[c("10.0.0.1/32")])
+        .tickets(64)
+        .ban_capacity(64)
+        .try_build()
+        .unwrap();
+    b.ban(ip("198.51.100.66")).unwrap();
+    let peer = ip("192.0.2.7");
+    let conn = b.door(peer).unwrap();
+    assert_eq!(conn.source(), Some(peer));
+    let mut req = conn.request(RequestId(1)).unwrap();
+    for provenance in [
+        Provenance::ForwardedHeader,
+        Provenance::ProxyProtocol,
+        Provenance::FastCgi,
+    ] {
+        // Naming an innocent address, and naming a banned one.
+        for named in ["203.0.113.5", "198.51.100.66"] {
+            let v = req.bind_client(ip(named), provenance);
+            assert!(
+                matches!(v, Verdict::Deny(d) if d.code == DenialCode::Unavailable),
+                "{named} via {provenance:?}"
+            );
+        }
+    }
+    assert_eq!(req.source(), Some(peer), "the socket peer stays the source");
+    // Not a trusted provenance at all, from a trusted proxy.
+    let hop = b.door(ip("10.0.0.1")).unwrap();
+    let mut via = hop.request(RequestId(2)).unwrap();
+    for provenance in [Provenance::Socket, Provenance::Local] {
+        assert!(via.bind_client(ip("203.0.113.5"), provenance).is_deny());
+    }
+    assert_eq!(via.source(), None, "still waiting for a trusted client");
+}
+
+#[test]
 fn test_ban_ipv6_rotation_within_64_refused() {
     // Threat T-2.
     let b = small();
@@ -272,11 +311,29 @@ fn test_registry_concurrent_issue_n_minus_one_n_n_plus_one() {
 
 #[test]
 fn test_ticket_dropped_on_another_thread() {
-    // Edge case 16.
+    // Edge case 16: tickets issued on one thread's shard and dropped on
+    // another thread (another shard) go back to their own cells.
     let b = Bouncer::builder().tickets(1).try_build().unwrap();
     let t = b.door(ip("192.0.2.1")).unwrap();
     std::thread::spawn(move || drop(t)).join().unwrap();
     assert!(admitted(&b, "192.0.2.1"));
+    let b = Arc::new(Bouncer::builder().shards(4).tickets(4).try_build().unwrap());
+    for _ in 0..3 {
+        // Each thread takes the next shard: issue on four, drop on four others.
+        let issued: Vec<_> = (0..4u8)
+            .map(|i| {
+                let b = Arc::clone(&b);
+                std::thread::spawn(move || b.door(IpAddr::from([192, 0, 2, 10 + i])).unwrap())
+                    .join()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(b.health().tickets_live, 4);
+        for t in issued {
+            std::thread::spawn(move || drop(t)).join().unwrap();
+        }
+        assert_eq!(b.health().tickets_live, 0, "every cell came back");
+    }
 }
 
 #[test]
@@ -604,4 +661,189 @@ fn test_registry_flood_from_one_address_cannot_exhaust_it() {
         b.door(ip("192.0.2.77")).is_ok(),
         "a legitimate address is still admitted"
     );
+}
+
+// ---- Full budget tables -----------------------------------------------------
+
+fn prefix_v4(i: u32) -> IpAddr {
+    // One address in each /24: 10.0.0.0/8 and up.
+    IpAddr::from((0x0a00_0001 + (i << 8)).to_be_bytes())
+}
+
+#[test]
+fn test_full_budget_tables_charge_the_global_cell() {
+    // PLAN 7.9: a newcomer in a full table is charged against its parent,
+    // then the global cell. With the time frozen, no key recovers, so the
+    // tables fill with keys that are still limiting; newcomers after that
+    // must still be limited, together.
+    let clock = Arc::new(ManualClock::new());
+    let b = Bouncer::builder()
+        .clock(clock.clone())
+        .tickets(1024)
+        .budgets(
+            Budgets::off()
+                .door_rate(
+                    bouncer_io::Rate::per_second(5),
+                    bouncer_io::Rate::per_second(5),
+                )
+                .capacity(1024),
+        )
+        .try_build()
+        .unwrap();
+    // 16,384 prefixes, one connection each: far more than the tables hold.
+    let mut admitted_fill = 0;
+    for i in 0..16_384 {
+        if b.door(prefix_v4(i)).is_ok() {
+            admitted_fill += 1;
+        }
+    }
+    assert!(admitted_fill >= 1024, "the tables filled: {admitted_fill}");
+    // Newcomers: 1,000 new prefixes. At most one prefix budget's burst of
+    // them may pass, shared through the global cell.
+    let newcomers = (100_000..101_000)
+        .filter(|&i| b.door(prefix_v4(i)).is_ok())
+        .count();
+    assert!(
+        newcomers <= 5,
+        "{newcomers} newcomers admitted past full tables"
+    );
+    // A prefix that holds its own slot keeps its own budget.
+    assert!(b.door(IpAddr::from([10, 0, 0, 77])).is_ok());
+}
+
+#[test]
+fn test_budget_load_counts_keys_still_limiting() {
+    // Health: a table of recovered keys is not a full table (they are
+    // reclaimed on demand), so it does not make the bouncer unhealthy.
+    let clock = Arc::new(ManualClock::new());
+    let b = Bouncer::builder()
+        .clock(clock.clone())
+        .tickets(1024)
+        .budgets(Budgets::default().capacity(1024))
+        .try_build()
+        .unwrap();
+    for i in 0..20_000 {
+        let _ = b.door(prefix_v4(i));
+    }
+    assert!(b.health().budget_load > 0.9, "{:?}", b.health());
+    clock.advance(Duration::from_secs(60));
+    let h = b.health();
+    assert!(h.budget_load < 0.1, "{h:?}");
+    assert!(h.is_ok(), "{h:?}");
+}
+
+#[test]
+fn test_concurrency_limits_hold_with_every_ticket_in_use() {
+    // The concurrency tables hold every live connection's keys: with all
+    // tickets held by distinct addresses, the per-address limit still holds.
+    let b = Bouncer::builder()
+        .tickets(4096)
+        .budgets(Budgets::off().door_concurrency(2, 1_000).capacity(1024))
+        .try_build()
+        .unwrap();
+    let held: Vec<_> = (0..4000)
+        .filter_map(|i| b.door(prefix_v4(i)).ok())
+        .collect();
+    assert_eq!(held.len(), 4000);
+    let one = ip("192.0.2.200");
+    let first = b.door(one).unwrap();
+    let second = b.door(one).unwrap();
+    assert!(
+        b.door(one).is_err(),
+        "the third connection is over the limit"
+    );
+    drop((first, second, held));
+}
+
+#[derive(Default)]
+struct Seen(Mutex<Vec<(u32, Reason, u32)>>);
+impl EventSink for Seen {
+    fn event(&self, e: &Event<'_>) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((e.signal.id, e.reason, e.count));
+    }
+}
+
+impl Seen {
+    fn count(&self, id: u32) -> usize {
+        self.0.lock().unwrap().iter().filter(|e| e.0 == id).count()
+    }
+}
+
+#[test]
+fn test_connection_closed_under_live_requests_reports_them_revoked() {
+    // Edge case 17: the requests are denied, and reported as revoked
+    // because the connection closed.
+    let seen = Arc::new(Seen::default());
+    let b = Bouncer::builder()
+        .event_sink(seen.clone())
+        .budgets(Budgets::off())
+        .try_build()
+        .unwrap();
+    let conn = b.door(ip("192.0.2.17")).unwrap();
+    let mut r1 = conn.request(RequestId(1)).unwrap();
+    let mut r2 = conn.request(RequestId(2)).unwrap();
+    drop(conn);
+    assert!(r1.checkpoint().is_deny() && r2.checkpoint().is_deny());
+    let events = seen.0.lock().unwrap().clone();
+    assert!(
+        events.contains(&(signals::REVOKE_APPLIED.id, Reason::CONNECTION_CLOSED, 2)),
+        "{events:?}"
+    );
+    // A connection closed with no request left reports nothing.
+    let quiet = b.door(ip("192.0.2.18")).unwrap();
+    drop(quiet.request(RequestId(3)).unwrap());
+    let before = seen.count(signals::REVOKE_APPLIED.id);
+    drop(quiet);
+    assert_eq!(seen.count(signals::REVOKE_APPLIED.id), before);
+}
+
+#[test]
+fn test_proxy_hop_without_a_client_reported_after_the_deadline() {
+    // Edge case 22: a proxied request whose adapter never binds the real
+    // client is denied at every checkpoint, and reported once it has waited
+    // `max_unchecked`, by the next maintenance run; its release reports
+    // nothing more.
+    let clock = Arc::new(clock_lib::ManualClock::new());
+    let seen = Arc::new(Seen::default());
+    let b = Bouncer::builder()
+        .clock(clock.clone())
+        .trusted_proxies(&[c("10.0.0.1/32")])
+        .max_unchecked(Duration::from_secs(30))
+        .event_sink(seen.clone())
+        .budgets(Budgets::off())
+        .try_build()
+        .unwrap();
+    let hop = b.door(ip("10.0.0.1")).unwrap();
+    let mut waiting = hop.request(RequestId(1)).unwrap();
+    assert!(waiting.checkpoint().is_deny());
+    let unresolved = signals::DOOR_PROXY_HOP_UNRESOLVED.id;
+    let _ = b.maintain(b.now());
+    assert_eq!(seen.count(unresolved), 0, "first seen, not late yet");
+    clock.advance(Duration::from_secs(10));
+    let _ = b.maintain(b.now());
+    assert_eq!(seen.count(unresolved), 0);
+    clock.advance(Duration::from_secs(25));
+    let _ = b.maintain(b.now());
+    assert_eq!(seen.count(unresolved), 1, "past the deadline");
+    let _ = b.maintain(b.now());
+    assert_eq!(seen.count(unresolved), 1, "once");
+    assert!(waiting.checkpoint().is_deny());
+    drop(waiting);
+    assert_eq!(seen.count(unresolved), 1, "the release adds nothing");
+    // A request bound in time is never reported; one released before any
+    // run is reported at its release.
+    let mut bound = hop.request(RequestId(2)).unwrap();
+    assert!(
+        bound
+            .bind_client(ip("192.0.2.22"), Provenance::ForwardedHeader)
+            .is_pass()
+    );
+    clock.advance(Duration::from_secs(60));
+    let _ = b.maintain(b.now());
+    drop(hop.request(RequestId(3)).unwrap());
+    assert_eq!(seen.count(unresolved), 2);
+    drop(bound);
 }

@@ -126,12 +126,12 @@ Loading happens in `try_build`, before the first door check: the snapshot (refus
 Every local change also goes to a bounded outbound log (65,536 records). `export_delta(since)` encodes what came after `since`; `import` merges:
 
 - a record is identified by (origin node, origin sequence), and a record seen before is skipped;
-- for one key, the ban with the latest end wins, permanent above all;
-- a lift is a tombstone stamped with a hybrid logical clock; it removes bans issued before it, and a ban issued after it wins;
+- each node's ban on a key is kept apart (the ledger, beside the ban table); of one node's bans the latest stamp wins, and the ban table holds the merge of every node's ban in force: the latest end, permanent above all;
+- a lift is stamped with a hybrid logical clock and covers bans stamped at or before it: its own node's, or every node's for an administrator's lift delivered by an administrator;
 - stamps further in the future than `max_clock_skew` are refused;
-- a channel cannot touch the allow list and can lift only bans its own node issued.
+- a channel cannot touch the allow list and carries only lifts its own node made, which reach only that node's bans.
 
-The result is a last-writer-wins map per key, so any order and any repetition of delivery converge. Revocations travel too and reach the requests running on every node. Each node always enforces locally; a node cut off keeps protecting itself.
+Each rule is a per-origin last-writer-wins register, so any order and any repetition of delivery converge. Revocations travel too and reach the requests running on every node. Each node always enforces locally; a node cut off keeps protecting itself.
 
 ## Maintenance
 

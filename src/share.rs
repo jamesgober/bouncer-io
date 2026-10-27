@@ -10,7 +10,7 @@
 //! so stamps from different nodes compare by wall time and never repeat.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -20,7 +20,6 @@ use std::{
 use crate::{
     codec::{self, Envelope, Reader, Writer},
     error::{BouncerError, ImportError},
-    keys::BanKey,
 };
 
 /// A node of a cluster, stamped on every record it exports. 0 is not a
@@ -73,7 +72,9 @@ impl Sequence {
 }
 
 const MAGIC: [u8; 4] = *b"BNCD";
-const FORMAT: u16 = 1;
+/// The delta format: 2 since lifts carry their scope (D-096); format 1 is
+/// still read.
+const FORMAT: u16 = 2;
 const HEADER: usize = 4 + 2 + 2 + 2 + 8 + 4;
 /// Largest delta accepted or produced.
 pub(crate) const MAX_DELTA: usize = 16 << 20;
@@ -81,8 +82,6 @@ pub(crate) const MAX_DELTA: usize = 16 << 20;
 const LOG: usize = 65_536;
 /// Record ids remembered to count and skip duplicates.
 const SEEN: usize = 1 << 20;
-/// Lift tombstones remembered.
-const TOMBSTONES: usize = 65_536;
 
 /// Encoded records for another node, at most 16 MiB. The transport is the
 /// caller's (a node link, the back-channel, a replicated log), authenticated
@@ -257,14 +256,6 @@ pub struct ImportReport {
     pub rejected: u32,
 }
 
-/// Lift tombstones by key, and keys in the order first noted (for
-/// forgetting the oldest in constant time).
-#[derive(Default)]
-struct Tombstones {
-    map: HashMap<BanKey, (u64, u16)>,
-    order: VecDeque<BanKey>,
-}
-
 /// Record ids seen, and their order for forgetting the oldest.
 type Seen = (HashSet<(u16, u64)>, VecDeque<(u16, u64)>);
 
@@ -273,8 +264,13 @@ pub(crate) struct Share {
     hlc: AtomicU64,
     log: Mutex<VecDeque<(u64, Envelope)>>,
     next: AtomicU64,
+    /// The first log position of this run.
+    base: AtomicU64,
+    /// Whether the log still holds every record this node exported: no
+    /// record has dropped off it, and no state was loaded from before this
+    /// run. A peer behind the log then gets the log, otherwise a snapshot.
+    whole: core::sync::atomic::AtomicBool,
     seen: Mutex<Seen>,
-    tombstones: Mutex<Tombstones>,
     /// Records accepted per second from channels (a storm defence).
     pub(crate) channel_rate: Option<rate_net::Gcra>,
 }
@@ -285,8 +281,9 @@ impl Share {
             hlc: AtomicU64::new(0),
             log: Mutex::new(VecDeque::new()),
             next: AtomicU64::new(1),
+            base: AtomicU64::new(1),
+            whole: core::sync::atomic::AtomicBool::new(true),
             seen: Mutex::new((HashSet::new(), VecDeque::new())),
-            tombstones: Mutex::new(Tombstones::default()),
             channel_rate: rate_net::Quota::rate(
                 channel_per_second.max(1),
                 core::time::Duration::from_secs(1),
@@ -327,15 +324,34 @@ impl Share {
         self.next.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// The log no longer holds everything this node holds (state was loaded
+    /// from before this run).
+    pub(crate) fn mark_partial(&self) {
+        self.whole.store(false, Ordering::Release);
+    }
+
+    /// Starts sequence numbers and log positions at `start` or later: a
+    /// stamp of this node's clock, which only moves forward across restarts
+    /// (it is persisted), so records after a restart are never taken for
+    /// ones seen before, and a peer's position is never ahead of the log.
+    pub(crate) fn seed(&self, start: u64) {
+        let start = start.max(1);
+        self.next.fetch_max(start, Ordering::AcqRel);
+        self.base.fetch_max(start, Ordering::AcqRel);
+    }
+
     /// Adds a record to the outbound log.
     pub(crate) fn push(&self, env: Envelope) {
         let mut log = self
             .log
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pos = log.back().map_or(1, |(p, _)| p + 1);
+        let pos = log
+            .back()
+            .map_or_else(|| self.base.load(Ordering::Acquire), |(p, _)| p + 1);
         if log.len() >= LOG {
             log.pop_front();
+            self.whole.store(false, Ordering::Release);
         }
         log.push_back((pos, env));
     }
@@ -349,7 +365,7 @@ impl Share {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let last = log.back().map_or(since, |(p, _)| *p);
         if let Some((first, _)) = log.front() {
-            if since + 1 < *first {
+            if since + 1 < *first && !self.whole.load(Ordering::Acquire) {
                 return None;
             }
         }
@@ -368,15 +384,24 @@ impl Share {
             .map_or(0, |(p, _)| *p)
     }
 
-    /// Remembers a record id; `false` when it was already seen.
-    pub(crate) fn first_time(&self, origin: u16, seq: u64) -> bool {
+    /// Whether a record id was seen (and applied) before.
+    pub(crate) fn seen(&self, origin: u16, seq: u64) -> bool {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+            .contains(&(origin, seq))
+    }
+
+    /// Remembers a record id as applied.
+    pub(crate) fn remember(&self, origin: u16, seq: u64) {
         let mut g = self
             .seen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (set, order) = &mut *g;
         if !set.insert((origin, seq)) {
-            return false;
+            return;
         }
         order.push_back((origin, seq));
         if order.len() > SEEN {
@@ -384,52 +409,5 @@ impl Share {
                 set.remove(&old);
             }
         }
-        true
-    }
-
-    /// Records a lift tombstone; keeps the later stamp.
-    pub(crate) fn tombstone(&self, key: BanKey, stamp: u64, origin: u16) {
-        let mut t = self
-            .tombstones
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let t = &mut *t;
-        if !t.map.contains_key(&key) {
-            // Full: forget the tombstone noted longest ago.
-            while t.map.len() >= TOMBSTONES {
-                match t.order.pop_front() {
-                    Some(old) => {
-                        t.map.remove(&old);
-                    }
-                    None => break,
-                }
-            }
-            t.order.push_back(key);
-        }
-        let e = t.map.entry(key).or_insert((stamp, origin));
-        if stamp > e.0 {
-            *e = (stamp, origin);
-        }
-    }
-
-    /// The latest lift stamp of a key.
-    pub(crate) fn lifted_at(&self, key: &BanKey) -> Option<u64> {
-        self.tombstones
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .map
-            .get(key)
-            .map(|(s, _)| *s)
-    }
-
-    /// Every tombstone (snapshots and full exports).
-    pub(crate) fn tombstones(&self) -> Vec<(BanKey, u64, u16)> {
-        self.tombstones
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .map
-            .iter()
-            .map(|(k, (s, o))| (*k, *s, *o))
-            .collect()
     }
 }

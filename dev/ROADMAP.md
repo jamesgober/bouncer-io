@@ -77,15 +77,30 @@ The plan to reach NFR-10 (each estimate marked as such until built and measured)
 | connection release without the link swap (a store-load pairing proved by a loom model) | about -4 ns [est.] | a new loom model |
 | a fast monotonic clock in clock-lib, for `door` | `door` -15 to -20 ns [est.] | clock-lib's own release; `door_at` does not need it |
 
+Moves recorded at 0.7: the loopback half of edge case 47 (the transport aborting a slow reader after the flush deadline) moves to 0.8 with the net-io feature (reason: the abort is the transport's; bouncer's part, handing over the deadline, is tested at 0.7).
+
 Moves recorded at 0.6: the table rebuild with a fresh seed (T-9) and 8-byte keys with 32-byte slots move with the plan above (reason: both are parts of the ban-table redesign; with SipHash under a random key an attacker cannot choose colliding keys without the key, and an insert past the probe bound still fails cleanly as `BanTableFull` with an event).
 
 ## v0.7.0 - Hardening
 Items: every fuzz target run 24 h without findings; every attack test of PLAN 8; the timing test (T-8); 24 h soak (NFR-13); three-node simulation with partitions, skew, and reordering; adversarial review with every finding fixed test-first; `docs/SECURITY.md`, `docs/PLATFORM-NOTES.md`.
 Exit:
-- [ ] Zero open findings.
-- [ ] Soak shows flat memory and no missed revocation.
-- [ ] Timing distributions not separable.
-- [ ] Edge cases 69 to 71 pass.
+- [x] Zero open findings (the table below; every fuzz target ran 24 hours on the final code with no findings).
+- [x] Soak shows flat memory and no missed revocation (24 hours on the final code: 540 million connections, 57.1 million revocations, none missed; live heap 45.98 MB from the first hour to the last, varying by under 6 KB).
+- [x] Timing distributions not separable (D-093: admitted latency against neighbours' bans, bind latency near banned digests; the control separates).
+- [x] Edge cases 69 to 71 pass (69: correctness under 32 threads, and 10^5 bans and lifts a second on one thread, measured 2.3 million; 71: a blocking sink sees no admitted connection and 100 refusals a second).
+
+Review findings (each fixed test-first; open until its fix lands):
+
+| Finding | Status |
+|---|---|
+| Forged datagrams drained a real prefix's budget, refusing its TCP connections | fixed, D-092 |
+| Full budget tables admitted newcomers uncharged; concurrency tables smaller than the registry lifted the per-address limit; `budget_load` reported a healthy bouncer as unhealthy | fixed, D-094 |
+| Decoder fuzz targets stopped at the checksum (`delta_decode` coverage 53) | fixed, D-095 |
+| Sharing does not converge: a lift is ordered against the held ban's local issue time in whole seconds, clamped to this node's start, instead of the ban's stamp; and one merged entry per key cannot apply "a channel lifts only its own node's bans" in an order-independent way when two nodes ban the same key (`tests/cluster.rs`, seed 1: diverges in 15 steps) | fixed, D-096: per-origin bans with their stamps; the simulation passes over 5,000 seeds |
+| Adversarial review: a node channel could forge another node's records, poison the seen-set, or pin bans; a restart made peers drop a node's new records; import evictions grew the ledger; origins per key unbounded; imported bans skipped the placement rules; a request could outlive its connection on the fast path; revoking a connection from a request left its siblings passing; persistence rollback undetected without a counter outside the files | fixed, D-101 (rollback documented as not covered, `docs/SECURITY.md`) |
+| Edge cases 34, 40, 45, 47 had no test; 16, 17, 22, 30, 32, 33, 39, 43, 46, 48, 59, 67, 69, 71 were partly tested; test comments numbered edge cases by an older list | fixed: every one tested; on the way, D-097 (the handshake deadline), D-098 (sampled events were not sampled), D-099 (a strike into a full table revoked nothing; a stronger later revocation did not raise the code), D-100 (the epoch steps over `u64::MAX`) |
+
+The 24-hour fuzz and soak runs ran on the final 0.7 code (2026-10-26 to 2026-10-27).
 
 ## v0.8.0 - Alpha
 Needs a published net-io 0.3 or later.

@@ -1207,13 +1207,25 @@ impl Ticket {
                 crate::bans::Lookup::Banned(_)
             );
         }
-        // 6. Report.
-        events::emit_ticket(
-            shared,
-            events::signals::DENIAL_WIPE_EJECT,
-            cell,
-            d.reference,
-        );
+        // 6. Report, noting whether the connection was ejected (without an
+        // `Ejector`, or with the connection kept, the caller closes it).
+        if shared.sink.is_some() {
+            const EJECTED: &[(&str, crate::directive::EvidenceValue<'static>)] =
+                &[("ejected", crate::directive::EvidenceValue::Flag(true))];
+            const NOT_EJECTED: &[(&str, crate::directive::EvidenceValue<'static>)] =
+                &[("ejected", crate::directive::EvidenceValue::Flag(false))];
+            events::Emit {
+                subject: subject_of(cell),
+                reference: d.reference,
+                evidence: crate::directive::Evidence::new(if out.ejected {
+                    EJECTED
+                } else {
+                    NOT_EJECTED
+                }),
+                ..events::Emit::new(events::signals::DENIAL_WIPE_EJECT)
+            }
+            .send(shared);
+        }
         out
     }
 
@@ -1283,10 +1295,26 @@ pub(crate) fn issue_request(
         },
     );
     match issued {
-        Some(t) => {
+        Some(mut t) => {
             // The connection's latest request, followed by the egress check:
             // a plain store, published after the child's state.
             pcell.keys[K_LATEST].store(u64::from(t.index), Ordering::Release);
+            // The connection may have been released or revoked since it was
+            // checked above, and the epoch moved for that before this ticket
+            // read it: look again, and deny the request at every checkpoint
+            // if the connection is gone. The fence pairs with the epoch's.
+            fence(Ordering::SeqCst);
+            let pst = pcell.state.load(Ordering::Acquire);
+            let gone = generation(pst) != parent_gen || pst & F_LIVE == 0;
+            if gone || pst & F_REVOKED != 0 {
+                let code = if gone {
+                    DenialCode::Unavailable
+                } else {
+                    code_of(pst)
+                };
+                mark_revoked(shared.registry.cell(t.index), t.generation, code);
+                t.seen = SEEN_ALWAYS_CHECK;
+            }
             Ok(t)
         }
         None => {
@@ -1314,6 +1342,17 @@ pub(crate) fn check_cell(
         return Err(DenialCode::Unavailable);
     }
     if st & F_REVOKED != 0 {
+        // A later, stronger revocation raises the code (precedence); only
+        // tickets already denied pay for the look.
+        if let Some(hit) = (!shared.revocations.is_empty())
+            .then(|| shared.revocations.matches(cell))
+            .flatten()
+        {
+            if hit.code > code_of(st) {
+                mark_revoked(cell, gen_, hit.code);
+                return Err(code_of(cell.state.load(Ordering::Acquire)));
+            }
+        }
         return Err(code_of(st));
     }
     if st & F_PENDING_CLIENT != 0 {
@@ -1352,7 +1391,10 @@ pub(crate) fn check_cell(
             }
             if request && !hit.keep_connection {
                 if let Some((p, pg)) = parent_cell {
-                    mark_revoked(p, pg, hit.code);
+                    // Its siblings and the connection must notice.
+                    if mark_revoked(p, pg, hit.code) {
+                        shared.epoch.bump();
+                    }
                 }
             }
             return Err(hit.code);
@@ -1363,10 +1405,15 @@ pub(crate) fn check_cell(
 }
 
 /// Revokes the connection a request cell belongs to.
+///
+/// The epoch moves when this revokes it: the connection's other requests
+/// and the connection itself may sit on their fast paths.
 fn revoke_parent(shared: &Shared, cell: &Cell, code: DenialCode) {
     let link = cell.link.load(Ordering::Relaxed);
     let (pi, pg) = ((link >> 32) as u32, link as u32);
-    mark_revoked(shared.registry.cell(pi), pg, code);
+    if mark_revoked(shared.registry.cell(pi), pg, code) {
+        shared.epoch.bump();
+    }
 }
 
 /// Sets the revoked flag and denial code on a cell of generation `gen_`. The
@@ -1489,8 +1536,22 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
         TicketKind::Connection => {
             let old = cell.link.swap(u64::from(next_gen) << 32, Ordering::AcqRel);
             if generation(old) == gen_ && old as u32 > 0 {
-                // Live requests remain: they must see their connection is gone.
+                // Live requests remain: they must see their connection is gone
+                // (edge case 17: they are denied, reported as revoked because
+                // the connection closed).
                 shard.epoch.bump();
+                if shared.sink.is_some() {
+                    events::Emit {
+                        reason: crate::directive::Reason::CONNECTION_CLOSED,
+                        subject: Subject {
+                            conn: Some(ConnId(cell.conn.load(Ordering::Relaxed))),
+                            ..Subject::default()
+                        },
+                        count: old as u32,
+                        ..events::Emit::new(events::signals::REVOKE_APPLIED)
+                    }
+                    .send(shared);
+                }
             }
             if st & F_CHARGED != 0 {
                 shared
@@ -1501,7 +1562,10 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
         TicketKind::Request => {
             let link = cell.link.load(Ordering::Relaxed);
             let (pi, pg) = ((link >> 32) as u32, link as u32);
-            if st & F_PENDING_CLIENT != 0 && shared.sink.is_some() {
+            if st & F_PENDING_CLIENT != 0
+                && shared.sink.is_some()
+                && !shared.maintenance.reported_pending(index, gen_)
+            {
                 // A proxied request ended without its real client: the
                 // adapter never called `bind_client`.
                 events::Emit {
@@ -1663,8 +1727,8 @@ mod tests {
 
     #[test]
     fn test_ticket_stale_generation_denied() {
-        // Threat T-10, edge case 25: a handle whose cell was released and
-        // reissued is denied, never mistaken for the new ticket.
+        // Threat T-10, edge cases 25 and 40: a handle whose cell was
+        // released and reissued is denied, never mistaken for the new ticket.
         let b = one_ticket();
         let first = b.door(ip("192.0.2.1")).unwrap();
         let (shard, index, old_gen) = (Arc::clone(&first.shard), first.index, first.generation);
@@ -1685,6 +1749,7 @@ mod tests {
         assert!(
             matches!(stale.checkpoint(), Verdict::Deny(d) if d.code == DenialCode::Unavailable)
         );
+        assert!(stale.before_commit().is_deny(), "edge case 40");
         assert!(stale.request(RequestId(1)).is_err());
         assert!(
             stale

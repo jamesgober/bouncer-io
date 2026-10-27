@@ -294,3 +294,46 @@ fn test_identity_throttles_divide_lane_and_tenant() {
             .is_err()
     );
 }
+
+#[test]
+fn test_tenant_revoked_at_its_in_flight_cap() {
+    // Edge case 39: the tenant holds its whole in-flight budget when it is
+    // revoked; the count returns as the tickets are released, and never
+    // goes below zero.
+    let b = Bouncer::builder()
+        .budgets(Budgets::off().tenant_in_flight(2))
+        .try_build()
+        .unwrap();
+    let remaining = || {
+        b.explain(TenantKey(9))
+            .budgets
+            .iter()
+            .find(|s| s.class == "tenant.in_flight")
+            .map(|s| s.remaining)
+            .unwrap()
+    };
+    let conn = b.door(ip("192.0.2.39")).unwrap();
+    let mut held = Vec::new();
+    for id in 0..2 {
+        let mut r = conn.request(RequestId(id)).unwrap();
+        assert!(r.bind_tenant(TenantKey(9)).is_pass());
+        held.push(r);
+    }
+    assert_eq!(remaining(), 0, "at its cap");
+    let mut over = conn.request(RequestId(5)).unwrap();
+    assert_eq!(
+        code(over.bind_tenant(TenantKey(9))),
+        Some(DenialCode::TooManyRequests)
+    );
+    drop(over);
+    b.revoke(TenantKey(9), Reason::ADMIN).unwrap();
+    for r in &mut held {
+        assert!(r.checkpoint().is_deny());
+    }
+    drop(held.pop());
+    assert_eq!(remaining(), 1);
+    drop(held);
+    assert_eq!(remaining(), 2, "every slot back, none lost or doubled");
+    drop(conn);
+    assert_eq!(remaining(), 2);
+}

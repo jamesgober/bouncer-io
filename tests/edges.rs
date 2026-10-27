@@ -1,4 +1,4 @@
-//! Edge cases 53, 55, 58, 65, 66, and 67 (0.5).
+//! Edge cases 55, 57, 60, 69, 70, and 71 (numbered as in dev/PLAN.md 12.5).
 
 use std::{
     net::IpAddr,
@@ -26,7 +26,7 @@ fn length(b: &Bouncer, addr: IpAddr) -> u64 {
 
 #[test]
 fn test_duration_arithmetic_at_the_limits() {
-    // Edge case 53: at `step_cap`, at `max`, with factor 1, with no jitter.
+    // Edge case 55: at `step_cap`, at `max`, with factor 1, with no jitter.
     let clock = Arc::new(ManualClock::new());
     let run = |policy: DurationPolicy, rounds: usize| -> Vec<u64> {
         let b = Bouncer::builder()
@@ -55,7 +55,7 @@ fn test_duration_arithmetic_at_the_limits() {
 
 #[test]
 fn test_monotonic_expiry_ignores_the_wall_clock() {
-    // Edge cases 55 and 58: a manual clock past the end admits; wall steps
+    // Edge cases 57 and 60: a manual clock past the end admits; wall steps
     // (a leap second, an NTP step) change nothing in process.
     let clock = Arc::new(ManualClock::new());
     let b = Bouncer::builder().clock(clock.clone()).try_build().unwrap();
@@ -75,7 +75,7 @@ fn test_monotonic_expiry_ignores_the_wall_clock() {
 
 #[test]
 fn test_hammering_one_shard_while_banning_and_lifting() {
-    // Edge case 65: 32 threads on one shard, one thread banning and lifting.
+    // Edge case 69: 32 threads on one shard, one thread banning and lifting.
     let b = Arc::new(
         Bouncer::builder()
             .shards(1)
@@ -117,7 +117,25 @@ fn test_hammering_one_shard_while_banning_and_lifting() {
     for w in workers {
         w.join().unwrap();
     }
+    let per_second = f64::from(ops) * 2.0 / started.elapsed().as_secs_f64();
+    println!("bans and lifts per second under the hammering: {per_second:.0}");
     assert!(ops > 100 && checks.load(Ordering::Relaxed) > 100);
+    // Under 32 spinning threads the banning thread gets what the scheduler
+    // leaves it, so the rate is checked on its own: in an optimized build,
+    // one thread bans and lifts at 10^5 per second or more.
+    if !cfg!(debug_assertions) {
+        let started = Instant::now();
+        let mut n = 0u32;
+        while started.elapsed() < Duration::from_millis(200) {
+            let addr = IpAddr::from([203, 0, (n >> 8) as u8, n as u8]);
+            b.ban(addr).unwrap();
+            b.lift(addr).unwrap();
+            n += 1;
+        }
+        let alone = f64::from(n) * 2.0 / started.elapsed().as_secs_f64();
+        println!("bans and lifts per second, one thread: {alone:.0}");
+        assert!(alone >= 100_000.0, "{alone:.0} per second");
+    }
 }
 
 /// An ejector that panics on the maintainer thread only.
@@ -132,7 +150,7 @@ impl Ejector for PanicsOnMaintainer {
 
 #[test]
 fn test_maintainer_death_leaves_enforcement_and_maintain() {
-    // Edge case 66.
+    // Edge case 70.
     let b = Bouncer::builder()
         .maintainer(true)
         .ejector(Arc::new(PanicsOnMaintainer))
@@ -172,7 +190,7 @@ impl EventSink for Slow {
 
 #[test]
 fn test_blocking_sink_never_slows_checkpoints() {
-    // Edge case 67.
+    // Edge case 71.
     let b = Bouncer::builder()
         .event_sink(Arc::new(Slow))
         .budgets(Budgets::off())
@@ -190,6 +208,68 @@ fn test_blocking_sink_never_slows_checkpoints() {
         "checkpoints never call the sink: {:?}",
         started.elapsed()
     );
+}
+
+/// A sink that blocks a millisecond per event and keeps the counts.
+#[derive(Default)]
+struct SlowCounting(std::sync::Mutex<Vec<(u32, u32)>>);
+impl EventSink for SlowCounting {
+    fn event(&self, e: &Event<'_>) {
+        std::thread::sleep(Duration::from_millis(1));
+        self.0.lock().unwrap().push((e.signal.id, e.count));
+    }
+}
+
+#[test]
+fn test_blocking_sink_slows_only_sampled_event_paths() {
+    // Edge case 71: admitted connections emit nothing, so a blocking sink
+    // never touches them; refusals of a banned source are sampled, so the
+    // sink is called at most 100 times a second however many arrive, and
+    // the counts add up to every refusal.
+    let clock = Arc::new(ManualClock::new());
+    let sink = Arc::new(SlowCounting::default());
+    let b = Bouncer::builder()
+        .clock(clock.clone())
+        .event_sink(sink.clone())
+        .budgets(Budgets::off())
+        .try_build()
+        .unwrap();
+    let started = Instant::now();
+    for i in 0..10_000u32 {
+        drop(b.door(IpAddr::from([192, 0, 2, (i % 250) as u8])).unwrap());
+    }
+    assert!(sink.0.lock().unwrap().is_empty(), "admitted: no events");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    b.ban(ip("203.0.113.71")).unwrap();
+    sink.0.lock().unwrap().clear();
+    let started = Instant::now();
+    for _ in 0..10_000 {
+        assert!(b.door(ip("203.0.113.71")).is_err());
+    }
+    let refused = bouncer_io::signals::DOOR_REFUSED_BAN.id;
+    let calls = |s: &SlowCounting| {
+        s.0.lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.0 == refused)
+            .count()
+    };
+    assert_eq!(calls(&sink), 100, "one second's sample");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "10,000 refusals did not wait on the sink 10,000 times"
+    );
+    clock.advance(Duration::from_secs(1));
+    assert!(b.door(ip("203.0.113.71")).is_err());
+    let total: u32 = sink
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.0 == refused)
+        .map(|e| e.1)
+        .sum();
+    assert_eq!(total, 10_001, "every refusal is counted");
 }
 
 #[derive(Default)]

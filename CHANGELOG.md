@@ -11,6 +11,42 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-27
+
+### Fixed
+
+- Forged datagrams no longer spend a real source's budget. Unverified datagrams were charged at their prefix under the same key as the prefix's connections and verified datagrams, so a flood of forged UDP naming a victim's /24 or /48 could get the victim's TCP connections refused. They now have a prefix key of their own.
+- Full budget tables no longer admit uncharged. Once both rate tiers were full of keys still limiting, newcomers passed with no budget at all; they are now charged together to one global cell at the prefix rate, as the design always said. The door's concurrency tables hold at least twice the ticket capacity, so held connections can no longer fill them and lift the per-address limit.
+- A node channel carries only its own node's records. A hostile node could replay or forge another node's records to shorten or erase its bans, pin bans that node could not lift, or mark its records as seen so they were dropped. Records are no longer passed on; every node exchanges deltas with every other node.
+- A restarted node's records reach its peers. Sequence numbers and log positions restarted at 1, so peers dropped the new records as seen.
+- A ban an import evicts from a full table leaves the sharing ledger, which could otherwise grow without bound; one key holds the bans of at most 64 nodes; a channel's bans follow the placement rules of their actor and never cover a whole address family.
+- A request issued while its connection was being released or revoked could pass every checkpoint; it is now revoked. Revoking a connection from one of its requests now stops the connection's other requests at once.
+- Sharing converges. A lift was ordered against the held ban's local issue time in whole seconds (clamped to the node's start), and one merged ban per key could not apply "a node lifts only its own bans" in an order-independent way, so nodes could disagree after every delta was delivered. Each node's ban on a key is now kept apart with its stamp, and lifts are scoped: to their own node's bans, or to every node's for an administrator's lift delivered through the administration channel (`import(.., Actor::Admin(..))`).
+- An enforced strike whose ban did not fit (the table full of bans it may not evict) left the striking peer running; it now revokes the ticket all the same (`StrikeOutcome::RevokedNotBanned`).
+- Events documented as sampled (door refusals, identity budget refusals, expiries) were delivered once per occurrence; they are now sampled, at most 100 a second per signal, each carrying the count it stands for.
+- A revoked ticket now reports the stronger code when a stronger revocation matches it later.
+- A proxied request whose adapter never binds the client is reported once it has waited `max_unchecked` (at the next maintenance run), not only when it ends.
+- The revocation epoch steps over `u64::MAX`, the mark of always-checking tickets (reachable only after 2^64 revocations).
+- `Health::budget_load` counts the slots holding a key that has not recovered. It counted claimed slots, which reach 1 in normal use with many clients (recovered keys are reclaimed only when a slot is needed), so `is_ok` reported a healthy bouncer as unhealthy.
+- `docs/API.md` named 0.5.0 as the current version.
+
+### Changed
+
+- Snapshots, journals, and deltas are format 2 (`SNAPSHOT_FORMAT` is 2): a lift records its scope. Format 1 files and deltas are read, and a format-1 snapshot is rewritten as format 2 when it is loaded; 0.5 and 0.6 refuse format 2 with `UnsupportedFormat`.
+- `import` needs a node id (`NodeIdUnset` otherwise), as `export_delta` did.
+- On a node that shares, a lift by an automated actor removes only that node's own ban on the key; another node's ban on it stays.
+
+### Added
+
+- Tests for threats T-1 (a peer that is not a trusted proxy cannot name a client), T-7 (a stream cut by revocation leaks at most the chunk in flight), T-18 (no printable value or event carries digest bytes), and T-20 (unverified datagram sources are never banned). Every test named in the threat table now exists under that name.
+- The full T-6 stress run uses 32 threads, as the threat table states (10^8 checkpoints with concurrent revocations; no missed revocation).
+- Timing tests for threat T-8 (`tests/timing.rs`, run with `--ignored` in release): admitted latency does not depend on neighbours' bans, and bind latency does not reveal digests near a banned one (Kolmogorov-Smirnov at p < 0.01, with a control that must separate).
+- The soak (`tests/soak.rs`, NFR-13): 100,000 connections a second with bans and revocations running; checks for missed revocations and for heap growth after warming.
+- A connection closed while requests under it are live reports them revoked (`revoke.applied`, reason `CONNECTION_CLOSED`); a wipe-and-eject event says whether the connection was ejected.
+- Tests for every edge case of the plan that lacked one or was partly tested (16, 17, 22, 30, 32, 33, 34, 39, 40, 43, 45 to 48, 59, 67, 69, 71); test comments use the plan's numbering.
+- A three-node simulation (`tests/cluster.rs`): partitions, a clock 30 seconds ahead, reordering, and duplication; every node agrees after healing.
+- The decoder fuzz targets frame part of their inputs (magic, lengths, CRC), so mutations reach the record decoders behind the checksums.
+
 ---
 
 ## [0.6.0] - 2026-10-26
@@ -262,7 +298,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/bouncer-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/bouncer-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/bouncer-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/bouncer-io/compare/v0.3.0...v0.4.0

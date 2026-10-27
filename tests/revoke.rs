@@ -143,8 +143,13 @@ fn test_revoke_deny_with_not_found() {
 
 #[test]
 fn test_revoke_twice_one_entry_strongest_code() {
-    // Edge case 33.
-    let b = plain();
+    // Edge case 33: idempotent, two events, one entry.
+    let events = Arc::new(Events::default());
+    let b = Bouncer::builder()
+        .budgets(Budgets::off())
+        .event_sink(events.clone())
+        .try_build()
+        .unwrap();
     let conn = b.door(ip("192.0.2.1")).unwrap();
     let mut r = conn.request(RequestId(1)).unwrap();
     b.apply(Directive::revoke(RequestId(1)).deny_with(DenialCode::NotFound))
@@ -152,6 +157,7 @@ fn test_revoke_twice_one_entry_strongest_code() {
     b.apply(Directive::revoke(RequestId(1)).deny_with(DenialCode::Forbidden))
         .unwrap();
     assert_eq!(denied(r.checkpoint()), Some(DenialCode::Forbidden));
+    assert_eq!(events.count(signals::REVOKE_APPLIED.id), 2, "two events");
     drop(r);
     drop(conn);
     assert_eq!(
@@ -163,11 +169,22 @@ fn test_revoke_twice_one_entry_strongest_code() {
 
 #[test]
 fn test_revoke_never_issued_connection_reclaimed() {
-    // Edge case 32.
+    // Edge case 32: a connection id never issued, and one already
+    // released: a receipt, nothing matched, the entries cleaned up.
     let b = plain();
     let receipt = b.revoke(ConnId(123_456), Reason::ADMIN).unwrap();
     assert!(receipt.epoch > 0);
     let mut live = b.door(ip("192.0.2.1")).unwrap();
+    assert!(live.checkpoint().is_pass());
+    assert_eq!(b.maintain(b.now()).reclaimed, 1);
+    let gone = b.door(ip("192.0.2.2")).unwrap();
+    let gone_id = gone.conn();
+    drop(gone);
+    let receipt = b.revoke(gone_id, Reason::ADMIN).unwrap();
+    assert!(receipt.epoch > 0);
+    let mut next = b.door(ip("192.0.2.2")).unwrap();
+    assert_ne!(next.conn(), gone_id);
+    assert!(next.checkpoint().is_pass(), "a new connection is not hit");
     assert!(live.checkpoint().is_pass());
     assert_eq!(b.maintain(b.now()).reclaimed, 1);
 }
@@ -329,6 +346,55 @@ fn test_tags_request_egress_release() {
         b.egress(bouncer_io::TicketTag::from_raw(u64::MAX))
             .is_deny()
     );
+}
+
+#[test]
+fn test_egress_after_revoke_writes_only_denial() {
+    // Threat T-7 (in process): a transport streaming 10 MiB in 16 KiB
+    // chunks checks egress before each write; another thread revokes the
+    // connection mid-stream. After `revoke` returns, at most the chunk whose
+    // check had already passed leaves, then only the denial.
+    const CHUNK: usize = 16 * 1024;
+    const CHUNKS: usize = 640;
+    for round in 0..50u64 {
+        let b = Arc::new(plain());
+        let conn = b.door(ip("192.0.2.1")).unwrap();
+        let id = conn.conn();
+        let tag = conn.into_tag();
+        let written = Arc::new(AtomicU64::new(0));
+        let writer = {
+            let (b, written) = (Arc::clone(&b), Arc::clone(&written));
+            std::thread::spawn(move || {
+                let mut out: Vec<u8> = Vec::with_capacity(CHUNK * CHUNKS);
+                for n in 0..CHUNKS {
+                    if b.egress(tag).is_deny() {
+                        out.extend_from_slice(b"DENIED");
+                        return (out, true);
+                    }
+                    out.extend(std::iter::repeat_n((n % 251) as u8, CHUNK));
+                    written.fetch_add(1, Ordering::SeqCst);
+                }
+                (out, false)
+            })
+        };
+        let at = 20 + (round as usize * 11) % 400;
+        while written.load(Ordering::SeqCst) < at as u64 && !writer.is_finished() {
+            std::hint::spin_loop();
+        }
+        b.revoke(id, Reason::ADMIN).unwrap();
+        let after_revoke = written.load(Ordering::SeqCst);
+        let (out, denied) = writer.join().unwrap();
+        let chunks = (out.len() / CHUNK) as u64;
+        if after_revoke < CHUNKS as u64 {
+            assert!(denied, "round {round}: the stream was cut");
+            assert!(out.ends_with(b"DENIED"));
+            assert!(
+                chunks <= after_revoke + 1,
+                "round {round}: {chunks} chunks left, {after_revoke} when revoke returned"
+            );
+        }
+        b.release(tag);
+    }
 }
 
 #[test]
@@ -528,7 +594,7 @@ fn test_maintainer_thread_parks_and_cleans_up() {
 
 #[test]
 fn test_connection_dropped_with_live_request_after_revocation() {
-    // Edge case 39-style: counts and state stay consistent.
+    // Counts and state stay consistent (edge case 39 is in tests/posture.rs).
     let b = plain();
     let conn = b.door(ip("192.0.2.1")).unwrap();
     let mut req = conn.request(RequestId(1)).unwrap();
@@ -833,4 +899,71 @@ fn test_shared_epoch_word() {
     let before = epoch.current();
     b.revoke(AccountKey(1), Reason::ADMIN).unwrap();
     assert_eq!(epoch.current(), before + 1);
+}
+
+#[test]
+fn test_strike_ban_into_a_full_table_still_denies_and_ejects() {
+    // Edge case 48: the table holds only permanent bans; a strike's ban
+    // fails with `BanTableFull` and an event, and the striking connection is
+    // still denied and ejected.
+    let events = Arc::new(Events::default());
+    let kills = Arc::new(Kills::default());
+    let b = Bouncer::builder()
+        .budgets(Budgets::off())
+        .ban_capacity(64)
+        .enforcement(Enforcement::enforce_all())
+        .event_sink(events.clone())
+        .ejector(kills.clone())
+        .try_build()
+        .unwrap();
+    let mut full = false;
+    for i in 0..10_000u32 {
+        let a = IpAddr::from((0x0a00_0000 + (i << 8)).to_be_bytes());
+        if matches!(
+            b.ban(BanSpec::address(a).permanent()),
+            Err(BouncerError::BanTableFull { .. })
+        ) {
+            full = true;
+            break;
+        }
+    }
+    assert!(full, "the table filled with permanent bans");
+    let before = events.count(signals::BAN_TABLE_FULL.id);
+    let mut conn = b.door(ip("203.0.113.48")).unwrap();
+    let outcomes: Vec<_> = (0..10)
+        .map(|_| conn.strike(StrikeKind::Malformed))
+        .collect();
+    assert!(
+        outcomes.contains(&StrikeOutcome::RevokedNotBanned),
+        "{outcomes:?}"
+    );
+    assert!(events.count(signals::BAN_TABLE_FULL.id) > before);
+    assert!(conn.checkpoint().is_deny(), "denied without the ban");
+    let id = conn.conn();
+    let out = conn.deny_and_eject(&mut bouncer_io::Collected::new());
+    assert!(out.ejected && !out.remembered);
+    assert!(kills.0.lock().unwrap().contains(&id), "and ejected");
+}
+
+#[test]
+fn test_revoked_session_bound_on_one_stream_stops_its_siblings() {
+    // A request binding a revoked session revokes its connection (unless the
+    // revocation keeps it); the connection's other requests, already past
+    // their checks, and the connection itself must notice at once.
+    let b = plain();
+    let session = SessionKey::from_digest([0x5e; 16]);
+    b.revoke(session, Reason::LOGOUT).unwrap();
+    let conn = b.door(ip("192.0.2.80")).unwrap();
+    let tag = conn.into_tag();
+    let mut sibling = b.request(tag, RequestId(1)).unwrap();
+    assert!(sibling.checkpoint().is_pass(), "on its fast path");
+    let sibling_tag = sibling.tag();
+    assert!(b.egress(sibling_tag).is_pass());
+    let mut stream = b.request(tag, RequestId(2)).unwrap();
+    assert!(stream.bind_session(session).is_deny());
+    assert!(sibling.checkpoint().is_deny(), "the sibling is stopped");
+    assert!(b.egress(sibling_tag).is_deny(), "nothing more leaves");
+    assert!(b.egress(tag).is_deny());
+    drop((sibling, stream));
+    b.release(tag);
 }

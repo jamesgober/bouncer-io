@@ -1,5 +1,5 @@
 //! Sharing across nodes (0.5): deltas converge under every order and
-//! repetition. Threats T-17, T-27; edge cases 62 to 64.
+//! repetition. Threats T-17, T-27; edge cases 64 to 68.
 
 use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
 
@@ -120,6 +120,7 @@ fn heap(a: &mut Vec<usize>, k: usize, out: &mut Vec<Vec<usize>>) {
 
 #[test]
 fn test_revocation_on_one_node_stops_a_request_on_another() {
+    // Edge case 68.
     let clock = Arc::new(ManualClock::new());
     let a = node(1, &clock);
     let b = node(2, &clock);
@@ -131,13 +132,13 @@ fn test_revocation_on_one_node_stops_a_request_on_another() {
     let report = b
         .import(&a.export_delta(Sequence::START).unwrap(), Actor::Channel(1))
         .unwrap();
-    assert_eq!(report.revocations, 1);
+    assert_eq!(report.revocations, 1, "{report:?}");
     assert!(req.checkpoint().is_deny(), "logged out everywhere");
 }
 
 #[test]
 fn test_duplicate_and_future_format_deltas() {
-    // Edge cases 62 and 63.
+    // Edge cases 64 and 65.
     let clock = Arc::new(ManualClock::new());
     let a = node(1, &clock);
     let b = node(2, &clock);
@@ -169,7 +170,7 @@ fn test_duplicate_and_future_format_deltas() {
 
 #[test]
 fn test_lift_older_than_a_local_ban_leaves_it() {
-    // Edge case 64.
+    // Edge case 66.
     let clock = Arc::new(ManualClock::new());
     let a = node(1, &clock);
     let b = node(2, &clock);
@@ -220,6 +221,55 @@ fn test_import_cannot_touch_allowlist_and_foreign_lifts_refused() {
     );
 }
 
+#[derive(Default)]
+struct Rejected(std::sync::atomic::AtomicU32);
+impl bouncer_io::EventSink for Rejected {
+    fn event(&self, e: &bouncer_io::Event<'_>) {
+        if e.signal == bouncer_io::signals::IMPORT_REJECTED {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[test]
+fn test_delta_past_the_skew_bound_refused_with_an_event() {
+    // Edge case 67: each record stamped past `max_clock_skew` is refused
+    // (`ClockSkew`) and reported; the rest of the delta applies.
+    let clock = Arc::new(ManualClock::new());
+    let ahead = Arc::new(ManualClock::new());
+    ahead.step_wall_forward(Duration::from_secs(600));
+    let rejected = Arc::new(Rejected::default());
+    let b = Bouncer::builder()
+        .node(NodeId(2))
+        .clock(clock.clone())
+        .event_sink(rejected.clone())
+        .budgets(Budgets::off())
+        .try_build()
+        .unwrap();
+    let c = node(3, &ahead);
+    c.ban(ip("198.51.100.67")).unwrap();
+    let report = b
+        .import(&c.export_delta(Sequence::START).unwrap(), Actor::Channel(3))
+        .unwrap();
+    assert!(report.rejected >= 1, "{report:?}");
+    assert_eq!(
+        u64::from(rejected.0.load(std::sync::atomic::Ordering::SeqCst)),
+        u64::from(report.rejected),
+        "one event per refused record"
+    );
+    assert!(b.door(ip("198.51.100.67")).is_ok());
+    // Five minutes ahead is the bound: four are accepted.
+    let near = Arc::new(ManualClock::new());
+    near.step_wall_forward(Duration::from_secs(240));
+    let d = node(4, &near);
+    d.ban(ip("198.51.100.68")).unwrap();
+    let report = b
+        .import(&d.export_delta(Sequence::START).unwrap(), Actor::Channel(4))
+        .unwrap();
+    assert_eq!(report.rejected, 0, "{report:?}");
+    assert!(b.door(ip("198.51.100.68")).is_err());
+}
+
 #[test]
 fn test_node_a_day_ahead_cannot_poison_the_cluster() {
     // T-27: a node with a broken clock is one day ahead.
@@ -266,4 +316,57 @@ fn test_old_since_exports_everything() {
             .len()
             < 64
     );
+}
+
+#[test]
+fn test_a_channel_carries_only_its_own_nodes_records() {
+    // T-17: a hostile node cannot replay or forge another node's records to
+    // shorten or erase its bans, and a refused record is not remembered as
+    // seen (it cannot shadow the genuine one).
+    let clock = Arc::new(ManualClock::new());
+    let a = node(1, &clock);
+    let c = node(3, &clock);
+    let k = ip("198.51.100.77");
+    a.ban(BanSpec::address(k).permanent()).unwrap();
+    let _ = c
+        .import(&a.export_delta(Sequence::START).unwrap(), Actor::Channel(1))
+        .unwrap();
+    assert!(c.door(k).is_err());
+    // A node posing as node 1, a second later, with a one-second ban.
+    clock.advance(Duration::from_secs(1));
+    clock.step_wall_forward(Duration::from_secs(1));
+    let forger = node(1, &clock);
+    forger
+        .ban(BanSpec::address(k).for_duration(Duration::from_secs(1)))
+        .unwrap();
+    let forged = forger.export_delta(Sequence::START).unwrap();
+    let report = c.import(&forged, Actor::Channel(2)).unwrap();
+    assert_eq!(report.applied, 0, "{report:?}");
+    assert!(report.rejected >= 1);
+    assert_eq!(c.explain(k).bans[0].until, None, "still permanent");
+    // Node 1's next delta, first relayed by node 2 (refused), then from node 1.
+    let since = a.export_delta(Sequence::START).unwrap().last();
+    a.ban(ip("198.51.100.78")).unwrap();
+    let d = a.export_delta(since).unwrap();
+    let relayed = c.import(&d, Actor::Channel(2)).unwrap();
+    assert_eq!(relayed.applied, 0);
+    let direct = c.import(&d, Actor::Channel(1)).unwrap();
+    assert!(direct.applied >= 1, "{direct:?}");
+    assert!(c.door(ip("198.51.100.78")).is_err());
+}
+
+#[test]
+fn test_no_channel_bans_a_whole_address_family() {
+    // A ban of 0.0.0.0/0 travels only through the administration channel.
+    let clock = Arc::new(ManualClock::new());
+    let a = node(1, &clock);
+    let b = node(2, &clock);
+    a.ban("0.0.0.0/0".parse::<Cidr>().unwrap()).unwrap();
+    let d = a.export_delta(Sequence::START).unwrap();
+    let report = b.import(&d, Actor::Channel(1)).unwrap();
+    assert!(report.rejected >= 1, "{report:?}");
+    assert!(b.door(ip("192.0.2.1")).is_ok());
+    let report = b.import(&d, Actor::Admin(1)).unwrap();
+    assert!(report.applied >= 1, "{report:?}");
+    assert!(b.door(ip("192.0.2.1")).is_err());
 }

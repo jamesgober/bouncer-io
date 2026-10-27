@@ -18,7 +18,7 @@
 
 The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every item lists its tier, its grade, the version that brings it, and what it costs. The rustdoc on [docs.rs](https://docs.rs/bouncer-io) becomes the exhaustive reference as each item lands; until then this file is the contract.
 
-> **Status: `0.5.0` (feature complete).** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. Items marked with a later version (the net-io feature at 0.8) are the agreed shape; their examples become doctests when they land.
+> **Status: `0.7.0` (hardening).** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. Items marked with a later version (the net-io feature at 0.8) are the agreed shape; their examples become doctests when they land.
 
 **Reading the item headers.** *Tier 1* is the simple surface (one-line constructors, no builder), *Tier 2* is configuration, *Tier 3* is the full surface for integrations and other libraries. *P0* is required for the crate's job, *P1* is what users of the best existing tools expect, *P2* is high value for serious deployments, *P3* comes after 1.0. Costs are targets, marked `[est.]` until they are measured at 0.6.
 
@@ -358,7 +358,7 @@ pub fn lift(&self, spec: impl Into<LiftSpec>) -> Result<Lifted, BouncerError>;
 
 Tier 1 · P0 · 0.3 · 200-500 ns [est.]
 
-Removes every ban on exactly this key and records a tombstone, so a ban that arrives later from another node with an older stamp does not bring it back. A prefix ban that covers the key is not lifted: `explain` shows it. The lift is an event with actor and reason.
+Removes the bans on exactly this key and records the lift, so a ban that arrives later from another node with an older stamp does not bring it back. On a node that shares, an administrator's or the application's lift removes every node's ban on the key here, and an automated actor's lift only this node's own (see [Merge rules](#merge-rules) for how it reaches other nodes). A prefix ban that covers the key is not lifted: `explain` shows it. The lift is an event with actor and reason.
 
 **Errors:** `NotFound` (nothing was banned under this key), `InvalidPrefix`.
 
@@ -687,7 +687,7 @@ Tier 3 · P2 · 0.5 · cold path
 
 Sharing across nodes: bouncer provides the data, the caller provides the transport (a node link, the back-channel, or a replicated log). A delta carries bans, lifts, offender records, and revocations since a sequence number; `export_snapshot` carries everything for a node that is joining. Imports merge deterministically (see [Merge rules](#merge-rules)), so any order and any repetition of delivery converges. A revocation imported from another node reaches the requests already running here, so logging out on one node stops the session's requests on every node.
 
-**Errors:** `NodeIdUnset` (export needs [`BouncerBuilder::node`](#bouncerbuilder-1)), `Import(Corrupt | TooLarge | UnsupportedFormat | RateLimited | AllowListTouched | ClockSkew)`.
+**Errors:** `NodeIdUnset` (export and import need [`BouncerBuilder::node`](#bouncerbuilder-1)), `Import(Corrupt | TooLarge | UnsupportedFormat | RateLimited | AllowListTouched | ClockSkew)`. Deltas are format 2 since 0.7 (lifts carry their scope); format 1 deltas from 0.5 and 0.6 are read, and 0.5 and 0.6 refuse format 2 with `UnsupportedFormat`.
 
 ```rust
 use bouncer_io::{Actor, Bouncer, NodeId, Sequence};
@@ -2307,15 +2307,17 @@ Tier 3 · P2 · 0.5
 ### Merge rules
 
 - A record is identified by `(origin node, origin sequence)`; importing it twice changes nothing.
-- For one key, the effective ban is the one with the latest end; permanent wins.
-- A lift is a tombstone stamped with its clock: it removes bans of that key stamped before it, and a ban stamped after it wins.
+- Each node's ban on a key is kept apart. Of one node's bans on a key, the one with the latest stamp wins; the key is banned while any node's ban on it is in force, and the stored ban is their merge: the latest end, permanent above all.
+- A lift is stamped with its node's clock and covers bans stamped at or before it: only its own node's bans, or every node's when an administrator (`Actor::Admin` or `Actor::App`) lifted the key. An automated actor's lift covers only its own node's ban, so the key can stay banned by another node's.
+- A node channel (`import(.., Actor::Channel(n))`) carries only node `n`'s own records: another node's record on it is refused (`ForeignOrigin`, `ForeignLift`) and not remembered as seen, so a node cannot shorten, erase, or lift another node's bans, nor shadow its records (T-17). Records are not passed on: every node exports only its own, so nodes exchange deltas with every other node (or through the administration channel). A lift reaches only node `n`'s own bans; an administrator's lift reaches every node's bans where an administrator delivers it (`import(.., Actor::Admin(..))`).
+- A channel's ban is held to what its actor could set here (automation: no bare fingerprint, no prefix at a length that is not automatic, no permanent ban), and no channel bans a whole address family; such records are refused (`NotAllowed`). One key holds the bans of at most 64 nodes.
+- Sequence numbers and log positions continue past restarts (they start from the node's clock, which is persisted), so a peer neither drops a restarted node's records nor waits on positions it already passed; a peer behind the log gets a snapshot of the node's own records.
 - Revocation records are applied to the running requests here, then kept only as long as they can still match a live ticket.
 - Stamps more than `max_clock_skew` (default 5 minutes) in the future are refused (`ClockSkew`), so a node with a broken clock cannot pin a ban forever or lift everything.
-- Imports from `Actor::Channel` are rate limited (100,000 records per second) and can never touch the allow list; a channel can lift only bans that originated on that channel's node.
-- A ban is compared with a lift by its issue time, at one-second resolution; a merged ban keeps the later issue time.
+- Imports from `Actor::Channel` are rate limited (100,000 records per second) and can never touch the allow list.
 - A refused record (allow list, clock skew, foreign lift) counts in `ImportReport::rejected` and is reported; a refused delta (corrupt, too large, newer format, rate limited) is an error.
 
-The result is a last-writer-wins map per key with "latest end" for concurrent bans: any order and any repetition of delivery gives the same table on every node.
+Each rule is commutative, associative, and idempotent, so any order and any repetition of delivery gives the same bans on every node (`tests/cluster.rs`: three nodes, partitions, a clock 30 seconds ahead, reordering, duplication, 5,000 seeds). A node that shares keeps every node's bans in a ledger beside the ban table, 151 bytes per ban held (measured with 100,000 bans; a key banned by several nodes holds one entry per node, and remembered lifts add theirs); [`capacity`](#capacity) counts it in `total_bytes`. Lifts are remembered for the 65,536 most recently lifted keys.
 
 ---
 
@@ -2371,7 +2373,7 @@ pub struct Capacity { pub tickets: u32, pub bans: u32, pub revocations: u32, pub
 
 Tier 2 · P1 · 0.5 (`Capacity` 0.3)
 
-`is_ok` is `false` when any table is above 90% load, the maintainer stopped, or the last persistence write failed.
+`is_ok` is `false` when any table is above 90% load, the maintainer stopped, or the last persistence write failed. `budget_load` counts the slots holding a key that has not recovered: recovered keys are reclaimed on demand, so a budget table full of them is not full. Near 1, newcomers past a full table are charged together to one global cell at the prefix rate (they are never unlimited).
 
 ---
 
@@ -2529,7 +2531,7 @@ pub const MAX_DENIAL_BYTES: usize = 1024;
 pub const MAX_EVIDENCE_BYTES: usize = 256;
 pub const MAX_PROBE: u32 = 32;
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"BNCR";
-pub const SNAPSHOT_FORMAT: u16 = 1;
+pub const SNAPSHOT_FORMAT: u16 = 2;
 pub const GENERATOR: u16 = 2;
 ```
 

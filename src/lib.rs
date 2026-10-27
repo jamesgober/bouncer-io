@@ -62,6 +62,7 @@ mod events;
 mod format;
 mod hash;
 mod keys;
+mod ledger;
 #[cfg(all(test, bouncer_loom))]
 mod loom_models;
 mod maintain;

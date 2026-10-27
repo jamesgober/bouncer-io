@@ -144,6 +144,10 @@ pub enum StrikeOutcome {
     /// A threshold was reached on a source flagged as shared: throttled
     /// instead of banned (arrives with shared-address detection).
     Throttled,
+    /// A threshold was reached in enforce mode, but the ban table is full of
+    /// bans it may not evict: nothing was banned (`ban.table_full` was
+    /// reported), and the ticket is revoked all the same (edge case 48).
+    RevokedNotBanned,
     /// Not counted.
     Ignored(IgnoredBecause),
 }
@@ -603,7 +607,10 @@ pub(crate) fn strike(
                 let spec = BanSpec::key(key)
                     .by(Actor::Local)
                     .because(Reason::STRIKE_THRESHOLD);
-                banned |= shared.ban(&spec, policy).is_ok();
+                match shared.ban(&spec, policy) {
+                    Ok(_) | Err(crate::error::BouncerError::BanTableFull { .. }) => banned = true,
+                    Err(_) => {}
+                }
             }
             if banned {
                 revoke_ticket();
@@ -619,7 +626,12 @@ pub(crate) fn strike(
             revoke_ticket();
             StrikeOutcome::Banned(id)
         }
-        // Allow-listed, a proxy, or a full table: nothing to ban.
+        // The decision stands though the table cannot record it.
+        Err(crate::error::BouncerError::BanTableFull { .. }) => {
+            revoke_ticket();
+            StrikeOutcome::RevokedNotBanned
+        }
+        // Allow-listed or a proxy: nothing to ban, nothing to revoke.
         Err(_) => StrikeOutcome::Counted,
     }
 }

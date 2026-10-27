@@ -33,12 +33,12 @@ impl Claims {
         self.keys.len()
     }
 
-    /// Claimed slots, 0 to 1 of the table (a full scan).
-    pub(crate) fn load(&self) -> f32 {
-        let used = self
-            .keys
-            .iter()
-            .filter(|k| k.load(Ordering::Relaxed) != 0)
+    /// Claimed slots for which `active` holds (a key that has not
+    /// recovered), 0 to 1 of the table (a full scan). Recovered keys are
+    /// reclaimed on demand, so they do not count toward a full table.
+    pub(crate) fn active_load(&self, active: impl Fn(usize) -> bool) -> f32 {
+        let used = (0..self.keys.len())
+            .filter(|&i| self.keys[i].load(Ordering::Relaxed) != 0 && active(i))
             .count();
         used as f32 / self.keys.len() as f32
     }

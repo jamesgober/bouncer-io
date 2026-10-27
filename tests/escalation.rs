@@ -1,5 +1,5 @@
 //! Escalation, offender memory, shared addresses, datagrams (0.5).
-//! Threats T-2, T-3, T-4, T-5, T-25; edge cases 47 to 49, 51, 52, 54.
+//! Threats T-2, T-3, T-4, T-5, T-20, T-25; edge cases 49 to 51, 53, 54, 56.
 
 use std::{
     net::IpAddr,
@@ -82,7 +82,7 @@ fn test_escalation_ipv4_eight_hosts_bans_24() {
 
 #[test]
 fn test_escalation_four_64s_bans_56_then_48() {
-    // T-2 and edge case 49 (stops at the widest prefix).
+    // T-2 and edge case 51 (stops at the widest prefix).
     let b = Bouncer::new();
     for s in 0..4u16 {
         for h in 0..4u16 {
@@ -114,7 +114,7 @@ fn test_escalation_four_64s_bans_56_then_48() {
 
 #[test]
 fn test_escalation_blocked_by_allow_list_and_proxy_and_shared() {
-    // Edge case 48, T-25.
+    // Edge case 50, T-25.
     let sink = Arc::new(Sink::default());
     let b = Bouncer::builder()
         .allow(AllowList::new().immune(c("198.51.100.250/32"), "partner"))
@@ -141,7 +141,7 @@ fn test_escalation_blocked_by_allow_list_and_proxy_and_shared() {
 
 #[test]
 fn test_escalation_per_parent_quota_forces_escalation() {
-    // Edge case 47.
+    // Edge case 49.
     let b = Bouncer::builder()
         .escalation(
             EscalationPolicy::default()
@@ -160,7 +160,7 @@ fn test_escalation_per_parent_quota_forces_escalation() {
 
 #[test]
 fn test_lift_of_parent_does_not_resurrect_children() {
-    // Edge case 51.
+    // Edge case 53.
     let b = Bouncer::new();
     for i in 1..=8u8 {
         b.ban(local(IpAddr::from([198, 51, 100, i]))).unwrap();
@@ -218,7 +218,7 @@ fn test_escalation_flood_keeps_table_bounded() {
 
 #[test]
 fn test_offender_memory_lengthens_and_decays() {
-    // Edge case 52: durations follow the decayed offences.
+    // Edge case 54: durations follow the decayed offences.
     let clock = Arc::new(ManualClock::new());
     let b = Bouncer::builder()
         .clock(clock.clone())
@@ -341,6 +341,61 @@ fn test_datagram_bans_and_budgets() {
     assert_eq!(
         b.datagram(ip("203.0.113.9"), true, b.now()),
         DatagramVerdict::Accept
+    );
+}
+
+#[test]
+fn test_datagram_unverified_never_banned() {
+    // Threat T-20: a forged UDP source is never struck, banned, or escalated,
+    // however much of it arrives, under the strictest enforcement.
+    let sink = Arc::new(Sink::default());
+    let b = Bouncer::builder()
+        .enforcement(Enforcement::enforce_all())
+        .event_sink(sink.clone())
+        .budgets(Budgets::off().door_rate(Rate::per_second(2), Rate::per_second(5)))
+        .try_build()
+        .unwrap();
+    let victim = ip("192.0.2.80");
+    let dropped = (0..100_000)
+        .filter(|_| b.datagram(victim, false, b.now()) == DatagramVerdict::Drop)
+        .count();
+    assert!(dropped > 99_000, "the flood is dropped at the budget");
+    let _ = b.maintain(b.now());
+    let seen = b.explain(victim);
+    assert!(seen.bans.is_empty(), "{seen:?}");
+    assert!(seen.admitted);
+    assert!(b.explain(c("192.0.2.0/24")).bans.is_empty());
+    assert!(
+        b.door(victim).is_ok(),
+        "the victim's own connections still pass"
+    );
+    assert_eq!(sink.count(signals::BAN_ADDED.id, Mode::Enforce), 0);
+    assert_eq!(sink.count(signals::BAN_ADDED.id, Mode::Observe), 0);
+}
+
+#[test]
+fn test_datagram_forged_flood_does_not_starve_verified_sources() {
+    // Threat T-20 (budget part): forged datagrams naming a victim's prefix
+    // drain only the unverified budget; the victim's verified datagrams
+    // keep their own client and prefix budgets.
+    let b = Bouncer::builder()
+        .budgets(Budgets::off().door_rate(Rate::per_second(2), Rate::per_second(5)))
+        .try_build()
+        .unwrap();
+    for i in 0..1_000u32 {
+        let forged = IpAddr::from([192, 0, 2, (i % 250) as u8 + 1]);
+        let _ = b.datagram(forged, false, b.now());
+    }
+    let victim = ip("192.0.2.80");
+    assert_eq!(
+        b.datagram(victim, true, b.now()),
+        DatagramVerdict::Accept,
+        "a verified source is not starved by forged traffic from its prefix"
+    );
+    // Unverified traffic from the prefix stays capped.
+    assert_eq!(
+        b.datagram(ip("192.0.2.81"), false, b.now()),
+        DatagramVerdict::Drop
     );
 }
 

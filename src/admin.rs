@@ -377,7 +377,11 @@ pub struct Health {
     pub ban_load: f32,
     /// Revocation table load, 0 to 1.
     pub revocation_load: f32,
-    /// The fullest budget table's load, 0 to 1.
+    /// The fullest budget table's load, 0 to 1: the share of its slots
+    /// holding a key that has not recovered. Recovered keys are reclaimed on
+    /// demand, so a table of them is not full; near 1, newcomers are charged
+    /// to the shared global cell. Computed by a scan of the tables (about
+    /// 0.85 ms at the default sizes, measured with 100,000 keys).
     pub budget_load: f32,
     /// Persistence records queued and not yet written.
     pub journal_backlog: u32,
@@ -681,7 +685,10 @@ impl Bouncer {
             tickets_detached: detached,
             ban_load: load(bans, shared.bans.capacity()),
             revocation_load: load(shared.revocations.live(), shared.revocations.capacity()),
-            budget_load: shared.budgets.load().max(shared.identity.load()),
+            budget_load: shared
+                .budgets
+                .load(shared.now())
+                .max(shared.identity.load(shared.now())),
             journal_backlog: shared.journal_backlog(),
             last_persist_error: shared.last_persist_error(),
             maintainer: shared.maintenance.state(),

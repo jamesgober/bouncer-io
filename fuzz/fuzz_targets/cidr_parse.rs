@@ -7,7 +7,9 @@ use bouncer_io::Cidr;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let Ok(text) = core::str::from_utf8(data) else { return };
+    let Ok(text) = core::str::from_utf8(data) else {
+        return;
+    };
     let loose = Cidr::parse(text);
     let strict = Cidr::parse_strict(text);
     if let Ok(c) = strict {
@@ -16,6 +18,10 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(c) = loose {
         assert!(text.len() <= 64, "accepted {} bytes", text.len());
         let printed = c.to_string();
-        assert_eq!(Cidr::parse_strict(&printed), Ok(c), "round trip of {text:?} via {printed:?}");
+        assert_eq!(
+            Cidr::parse_strict(&printed),
+            Ok(c),
+            "round trip of {text:?} via {printed:?}"
+        );
     }
 });
