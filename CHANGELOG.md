@@ -11,6 +11,8 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-27
+
 ### Fixed
 
 - Forged datagrams no longer spend a real source's budget. Unverified datagrams were charged at their prefix under the same key as the prefix's connections and verified datagrams, so a flood of forged UDP naming a victim's /24 or /48 could get the victim's TCP connections refused. They now have a prefix key of their own.
@@ -296,7 +298,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/bouncer-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/bouncer-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/bouncer-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/bouncer-io/compare/v0.3.0...v0.4.0
