@@ -647,7 +647,7 @@ Where the door's time goes (`door_parts`): ticket issue and release about 78 ns;
 
 ### 11.3 Measured at the end of 0.6
 
-Pinned to one logical core (D-088); `docs/PERFORMANCE.md` has every table, the method, and the 0.5.0 comparison. Against the same-job composition (NFR-10): admitted 113.4 against 109.3 ns, random peers 151.2 against 118.1 ns; the target (20% faster: about 87 and 94 ns) is not met; the plan is in `dev/ROADMAP.md`. Against the lookup-only composition: 46.6 and 66.6 ns. Every other PLAN 11 target is met except the door's p99 (not met), ticket issue and release at 32 threads (not measured), and memory per ban (56 B, within the 64 B limit).
+Pinned to one logical core (D-088); `docs/PERFORMANCE.md` has every table, the method, and the 0.5.0 comparison. Against the same-job composition (NFR-10): admitted 113.4 against 109.3 ns, random peers 151.2 against 118.1 ns; the target (20% faster: about 87 and 94 ns) is not met; the plan is in `dev/ROADMAP.md`. Against the lookup-only composition: 46.6 and 66.6 ns. Every other PLAN 11 target is met except the door's p99 (not met), ticket issue and release at 32 threads (not measured), and memory per ban (56 B, within the 64 B limit). At 0.8 (0.7.0 against the branch, alternating on one core): `door_at` admitted 92.1 against 110.7 ns, random peers 133.3 against 115.9 ns; memory per ban 37.7 B (NFR-6 met, D-105). NFR-10 is met by neither case yet; the remaining steps are in `dev/ROADMAP.md`.
 
 NFR-10 is judged on `door_1m` and `budget_check`. Numbers are published in `docs/PERFORMANCE.md` with host, OS, CPU, Rust version, and profile; p99 and p99.9 from a harness over 10^7 operations; baselines committed; a regression over 5% blocks the change.
 

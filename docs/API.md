@@ -2585,7 +2585,7 @@ A pipeline that skips steps 6 to 8 still cannot send a byte for a revoked connec
 | `ban` | under 500 ns | median 457 ns while the table fills |
 | eject-now sweep over 65,536 tickets | under 1 ms | 317 µs |
 | wipe | 30-60 ns per KiB of capacity | not measured at 0.6 |
-| memory per ban | 45-48 bytes, hard limit 64 | 56 bytes |
+| memory per ban | 45-48 bytes, hard limit 64 | 37.7 bytes (since 0.8) |
 | idle CPU | zero wake-ups with nothing pending | none |
 
 No allocation on the door, checkpoint, before-commit, egress, bind, or strike paths, proven with a counting allocator. Readers (door, checkpoints, egress) never wait on writers (ban, revoke, lift, import).

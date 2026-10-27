@@ -11,6 +11,13 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The ban table hashes with a keyed multiply mix instead of SipHash-1-3 and is rebuilt under a fresh key when an insert reaches the probe bound (`table.reseeded`); the door budgets hash under a key of their own.
+- An address's ban keys from its family's shortest automatic length (/24, /48 by default) share one probe sequence, so the door reads one group for all of an address's lengths; a prefix with many banned hosts spills to its own sequence.
+- Ban table slots are 32 bytes: memory per ban falls from 56 to 37.7 bytes. Keys that fit one word are stored exactly; longer ones as keyed 64-bit fingerprints, with the originals kept beside the table for listings, persistence, and sharing.
+- `door_at` is 18% faster admitted, 11% faster for random peers, and 19% faster for banned peers than in 0.7.0; account revocation is 25% faster; ban insert is about 5% slower.
+
 ## [0.7.0] - 2026-10-27
 
 ### Fixed

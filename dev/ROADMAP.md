@@ -111,7 +111,7 @@ Exit:
 - [ ] A streamed response cut by revocation leaks at most one chunk (loopback capture).
 - [ ] NFR-10: the door 20% faster than the same-job composition, admitted and random peers (PLAN D-081).
 
-NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core on a loaded machine; final numbers on a quiet one in `docs/PERFORMANCE.md`):
+NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core; the totals, 0.7.0 against this branch, are in `docs/PERFORMANCE.md`):
 
 | Step | Result |
 |---|---|
@@ -126,6 +126,15 @@ NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core on a loaded mac
 | budgets reusing the lookup's prefix hash | dropped: no gain measured |
 | the budget cells loaded before the ban lookup, so their misses overlap | dropped: random peers +26%, banned peers +92% (a banned peer now pays for cells it never needed) |
 | a fast clock for `door` | not in clock-lib: its directives put timers out of scope and forbid `unsafe` (no timestamp counter); `door_at` with the transport's accept time is the fast path |
+
+Where it stands (0.7.0 against this branch, 10 alternating rounds): `door_at` admitted 112.7 -> 92.1 ns against the composition's 110.7 (17% faster; the target is 20%, about 89 ns); random peers 150.3 -> 133.3 against 115.9 (1.15 times slower; the target is about 93 ns); banned 68.8 -> 55.5. For random peers the parts are: ticket 43 ns, judgement with 1,000,000 bans 34 ns, the two rate checks about 36 ns (the client's and the prefix's slots, in two tables, both missing the cache).
+
+Next steps (estimates until built and measured):
+
+| Step | Expected | Cost and risk |
+|---|---|---|
+| a client's budget slot in its prefix's probe sequence (the D-104 anchor applied to the budget tables), so one cache miss serves both rate checks | random peers -15 to -20 ns [est.] | reclaiming idle slots must not let a prefix's clients push out the prefix's own slot; the per-prefix fairness of T-4 must hold; loom again for the claim path |
+| the ticket cell and its connection id written in one cache line on issue | admitted -3 to -5 ns [est.] | a cell layout change; loom L-5 and L-7 again |
 
 ## v0.9.0 - Beta and release candidates
 Items: used end to end by the web stack and one non-HTTP service (a database network layer or the back-channel); API review against the simple-API rule; `cargo-semver-checks` in CI; release candidates `0.9.x`.
