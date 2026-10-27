@@ -1349,7 +1349,7 @@ mod tests {
         TableKey {
             kind: KIND_SESSION,
             len: 0,
-            k0: n | 1 << 63,
+            k0: n | (1 << 63),
             k1: n.wrapping_mul(0x9e37_79b9_7f4a_7c15),
         }
     }
