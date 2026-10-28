@@ -22,7 +22,7 @@
 
 ### Changed
 
-- Door and lane rate budgets keep only a GCRA arrival time per key, beside the key in its slot, under rate parameters shared by the tier; concurrency counts sit beside their keys too. A rate key costs 16 bytes instead of 88, and an unknown peer misses the cache once per tier instead of twice.
+- Door and lane rate budgets keep only a GCRA arrival time per key, beside the key in its slot, under rate parameters shared by the tier (rate-net 2.1's `GcraParams`; rate-net is now required at 2.1); concurrency counts sit beside their keys too. A rate key costs 16 bytes instead of 88, and an unknown peer misses the cache once per tier instead of twice.
 
 - The ban table hashes with a keyed multiply mix instead of SipHash-1-3 and is rebuilt under a fresh key when an insert reaches the probe bound (`table.reseeded`); the door budgets hash under a key of their own.
 - An address's ban keys from its family's shortest automatic length (/24, /48 by default) share one probe sequence, so the door reads one group for all of an address's lengths; a prefix with many banned hosts spills to its own sequence.

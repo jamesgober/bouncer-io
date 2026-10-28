@@ -59,9 +59,10 @@ net-io = ["dep:net-io"]
 [dependencies]
 # Monotonic and wall time, mockable in tests (first-party).
 clock-lib = "1.1"
-# GCRA rate math for door budgets (first-party). Default features off: its
-# `std` feature pulls ahash and hashbrown.
-rate-net = { version = "2.0", default-features = false }
+# GCRA rate math for door and lane budgets (first-party; 2.1 for `GcraParams`,
+# the parameters shared by a tier). Default features off: its `std` feature
+# pulls ahash and hashbrown.
+rate-net = { version = "2.1", default-features = false }
 # Token buckets for tenant budgets (first-party). Default features off: no
 # clock, no error crate; bouncer passes its own time.
 better-bucket = { version = "1.1", default-features = false }

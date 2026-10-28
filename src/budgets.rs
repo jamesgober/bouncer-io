@@ -4,9 +4,8 @@
 //! The rate math is rate-net's GCRA and better-bucket's token bucket (both
 //! without default features, so neither brings a third-party crate). Keyed
 //! rates keep only a GCRA's arrival time per key, in the key's own slot of
-//! bouncer's bounded table, under parameters shared by the tier ([`Pace`],
-//! rate-net's integer math, tested against it); the token buckets keep a
-//! parallel array.
+//! bouncer's bounded table, under rate-net's `GcraParams` shared by the
+//! tier; the token buckets keep a parallel array.
 //! Eviction never resets a limit: a cell is taken over only once it has
 //! fully recovered and holds no connections.
 
@@ -14,7 +13,11 @@ use core::time::Duration;
 use std::net::IpAddr;
 
 use better_bucket::{BucketConfig, BucketCore};
-use rate_net::Quota;
+// A rate key's arrival time is a plain atomic word: rate-net's `GcraParams`
+// takes one, and no loom model reaches the budgets.
+use core::sync::atomic::AtomicU64 as Tat;
+
+use rate_net::{Decision, GcraParams, Quota};
 
 use crate::{
     claims::Claims,
@@ -300,115 +303,11 @@ impl Budgets {
     }
 }
 
-/// GCRA parameters shared by every key of a rate tier; a key's state is
-/// one word, its theoretical arrival time in emission intervals, kept in its
-/// claim slot. The integer math is rate-net's `Gcra` (exact intervals, a
-/// late reading only ever stricter, a fresh word full), split so that a key
-/// costs 8 bytes beside its key word instead of a whole limiter.
-struct Pace {
-    limit: u64,
-    period_ns: u64,
-    /// `limit * 2^64 / period_ns`.
-    per_ns: u128,
-    /// `burst - 1`, in intervals.
-    tolerance: u64,
-    deny_all: bool,
-}
-
-impl Pace {
-    fn new(q: Quota) -> Pace {
-        let period_ns = u64::try_from(q.period().as_nanos()).unwrap_or(u64::MAX);
-        let limit = u64::from(q.limit()).min(period_ns);
-        let deny_all = limit == 0 || q.burst() == 0;
-        let per_ns = if deny_all {
-            0
-        } else {
-            (u128::from(limit) << 64) / u128::from(period_ns)
-        };
-        Pace {
-            limit,
-            period_ns,
-            per_ns,
-            tolerance: u64::from(q.burst().saturating_sub(1)),
-            deny_all,
-        }
-    }
-
-    /// Whole intervals begun by `now_ns`: `floor(now_ns * limit / period)`.
-    #[inline]
-    fn intervals_at(&self, now_ns: u64) -> u64 {
-        let wide = u128::from(now_ns);
-        let estimate = ((wide * self.per_ns) >> 64) as u64;
-        let next = u128::from(estimate) + 1;
-        if next * u128::from(self.period_ns) <= wide * u128::from(self.limit) {
-            estimate + 1
-        } else {
-            estimate
-        }
-    }
-
-    /// The first nanosecond of interval `interval`.
-    fn nanos_at(&self, interval: u64) -> u64 {
-        let scaled = u128::from(interval) * u128::from(self.period_ns);
-        u64::try_from(scaled.div_ceil(u128::from(self.limit))).unwrap_or(u64::MAX)
-    }
-
-    /// Takes `n` units from the key whose arrival time is `tat`; on refusal,
-    /// how long until they conform.
-    #[inline]
-    fn check_n_at(&self, tat: &AtomicU64, n: u32, now: Duration) -> Result<(), Duration> {
-        if n == 0 {
-            return Ok(());
-        }
-        let span = u64::from(n - 1);
-        if self.deny_all || span > self.tolerance {
-            return Err(Duration::MAX);
-        }
-        let now_ns = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX);
-        let now_iv = self.intervals_at(now_ns);
-        let ceiling = now_iv.saturating_add(self.tolerance);
-        let mut cur = tat.load(Ordering::Acquire);
-        loop {
-            let effective = cur.max(now_iv);
-            if effective.saturating_add(span) > ceiling {
-                let ready = self.nanos_at(effective.saturating_add(span) - self.tolerance);
-                return Err(Duration::from_nanos(ready.saturating_sub(now_ns).max(1)));
-            }
-            match tat.compare_exchange_weak(
-                cur,
-                effective.saturating_add(u64::from(n)),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(actual) => cur = actual,
-            }
-        }
-    }
-
-    /// Units that would conform now, and the wait until the key is full.
-    fn peek(&self, tat: &AtomicU64, now: Duration) -> (u32, Duration) {
-        if self.deny_all {
-            return (0, Duration::MAX);
-        }
-        let now_ns = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX);
-        let now_iv = self.intervals_at(now_ns);
-        let t = tat.load(Ordering::Acquire).max(now_iv);
-        let remaining = now_iv.saturating_add(self.tolerance + 1).saturating_sub(t);
-        let full_after = if t == now_iv {
-            Duration::ZERO
-        } else {
-            Duration::from_nanos(self.nanos_at(t).saturating_sub(now_ns))
-        };
-        (u32::try_from(remaining).unwrap_or(u32::MAX), full_after)
-    }
-}
-
 /// One tier of rate cells (address or prefix): each slot holds its key's
 /// arrival time.
 struct RateTier {
-    claims: Claims<AtomicU64>,
-    pace: Pace,
+    claims: Claims<Tat>,
+    pace: GcraParams,
     burst: u32,
 }
 
@@ -490,7 +389,7 @@ pub(crate) struct DoorBudgets {
     /// The global cell, at the prefix rate: charged for every admission
     /// whose prefix found no slot in a full table (PLAN 7.9), so newcomers
     /// past a full table are limited together instead of not at all.
-    overflow: Option<(Pace, AtomicU64)>,
+    overflow: Option<(GcraParams, Tat)>,
     concurrency: Option<[ConcurrencyTier; 2]>,
     throttles: Throttles,
 }
@@ -512,7 +411,7 @@ impl DoorBudgets {
                 let q = r.quota("budgets").ok()?;
                 Some(RateTier {
                     claims: Claims::new(cap),
-                    pace: Pace::new(q),
+                    pace: GcraParams::new(q),
                     burst: r.burst,
                 })
             };
@@ -520,7 +419,7 @@ impl DoorBudgets {
         });
         let overflow = rate.as_ref().and_then(|_| {
             let (_, prefix) = cfg.door_rate?;
-            Some((Pace::new(prefix.quota("budgets").ok()?), AtomicU64::new(0)))
+            Some((GcraParams::new(prefix.quota("budgets").ok()?), Tat::new(0)))
         });
         let concurrency = cfg
             .door_concurrency
@@ -740,8 +639,8 @@ impl DoorBudgets {
         let claims = &tier.claims;
         let (pace, tat) = match claims.find_or_claim(
             key,
-            |slot| tier.pace.peek(claims.val(slot), now).0 >= tier.burst,
-            |slot| claims.val(slot).store(0, Ordering::Release),
+            |slot| tier.pace.peek_at(claims.val(slot), now).remaining() >= tier.burst,
+            |slot| tier.pace.reset(claims.val(slot)),
         ) {
             Some((slot, _)) => (&tier.pace, claims.val(slot)),
             None => match (&self.overflow, last) {
@@ -749,7 +648,10 @@ impl DoorBudgets {
                 _ => return Ok(()),
             },
         };
-        pace.check_n_at(tat, n, now).map_err(OverBudget)
+        match pace.check_n_at(tat, n, now) {
+            Decision::Deny { retry_after } => Err(OverBudget(retry_after)),
+            _ => Ok(()),
+        }
     }
 
     /// Returns a connection's concurrency slots.
@@ -778,7 +680,7 @@ impl DoorBudgets {
         let now_d = Duration::from_nanos(now.as_nanos());
         let rate = self.rate.iter().flatten().map(|t| {
             t.claims
-                .active_load(|i| t.pace.peek(t.claims.val(i), now_d).0 < t.burst)
+                .active_load(|i| t.pace.peek_at(t.claims.val(i), now_d).remaining() < t.burst)
         });
         let conc = self.concurrency.iter().flatten().map(|t| {
             t.claims
@@ -822,8 +724,9 @@ impl DoorBudgets {
             for ((tier, key), (rate, _, bk)) in tiers.iter().zip(keys).zip(names) {
                 let (remaining, retry) = match tier.claims.find(key) {
                     Some(slot) => {
-                        let (r, full_after) = tier.pace.peek(tier.claims.val(slot), now_d);
-                        (r, (r == 0).then_some(full_after))
+                        let s = tier.pace.peek_at(tier.claims.val(slot), now_d);
+                        let r = s.remaining();
+                        (r, (r == 0).then(|| s.reset_after()))
                     }
                     None => (tier.burst, None),
                 };
@@ -932,7 +835,7 @@ impl IdentityBudgets {
             let q = r.quota("budgets").ok()?;
             Some(RateTier {
                 claims: Claims::new(cap),
-                pace: Pace::new(q),
+                pace: GcraParams::new(q),
                 burst: r.burst,
             })
         });
@@ -1042,12 +945,14 @@ impl IdentityBudgets {
         // budgets still hold. Nothing that has not recovered is ever reset.
         if let Some((slot, _)) = claims.find_or_claim(
             key,
-            |slot| tier.pace.peek(claims.val(slot), now_d).0 >= tier.burst,
-            |slot| claims.val(slot).store(0, Ordering::Release),
+            |slot| tier.pace.peek_at(claims.val(slot), now_d).remaining() >= tier.burst,
+            |slot| tier.pace.reset(claims.val(slot)),
         ) {
-            tier.pace
-                .check_n_at(claims.val(slot), factor.max(1), now_d)
-                .map_err(OverBudget)?;
+            if let Decision::Deny { retry_after } =
+                tier.pace.check_n_at(claims.val(slot), factor.max(1), now_d)
+            {
+                return Err(OverBudget(retry_after));
+            }
         }
         Ok(())
     }
@@ -1137,7 +1042,7 @@ impl IdentityBudgets {
         let now_d = Duration::from_nanos(now.as_nanos());
         let lanes = self.lanes.iter().flatten().map(|t| {
             t.claims
-                .active_load(|i| t.pace.peek(t.claims.val(i), now_d).0 < t.burst)
+                .active_load(|i| t.pace.peek_at(t.claims.val(i), now_d).remaining() < t.burst)
         });
         let tenant = self.tenant.iter().map(|t| {
             t.claims
@@ -1177,57 +1082,6 @@ mod tests {
     fn budgets(cfg: Budgets) -> DoorBudgets {
         cfg.validate().unwrap();
         DoorBudgets::new(&cfg, HashKey::new(1, 2), 1024)
-    }
-
-    #[test]
-    fn test_pace_decides_as_rate_net_gcra() {
-        use rate_net::{Decision, Gcra};
-        let quotas = [
-            Quota::per_second(10).with_burst(3),
-            Quota::per_second(1000),
-            Quota::rate(7, Duration::from_millis(1300))
-                .unwrap()
-                .with_burst(5),
-            Quota::rate(1, Duration::from_secs(3600)).unwrap(),
-            Quota::per_second(0),
-            Quota::per_second(1).with_burst(0),
-        ];
-        let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        let mut rnd = move || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
-        for q in quotas {
-            let gcra = Gcra::new(q);
-            let pace = Pace::new(q);
-            let tat = AtomicU64::new(0);
-            let mut now = Duration::from_millis(rnd() % 10_000);
-            for _ in 0..20_000 {
-                // Steps forward and, now and then, a late reading behind.
-                now = match rnd() % 8 {
-                    0 => now.saturating_sub(Duration::from_nanos(rnd() % 50_000_000)),
-                    _ => now + Duration::from_nanos(rnd() % 400_000_000),
-                };
-                let n = (rnd() % 7) as u32;
-                let want = match gcra.check_n_at(n, now) {
-                    Decision::Deny { retry_after } => Err(retry_after),
-                    _ => Ok(()),
-                };
-                assert_eq!(
-                    pace.check_n_at(&tat, n, now),
-                    want,
-                    "{q:?} n {n} at {now:?}"
-                );
-                let snap = gcra.peek_at(now);
-                let (remaining, full_after) = pace.peek(&tat, now);
-                assert_eq!(remaining, snap.remaining(), "{q:?} at {now:?}");
-                if q.burst() > 0 && q.limit() > 0 {
-                    assert_eq!(full_after, snap.reset_after(), "{q:?} at {now:?}");
-                }
-            }
-        }
     }
 
     #[test]
