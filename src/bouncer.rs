@@ -588,9 +588,12 @@ impl Bouncer {
                 }
             };
         if charge {
-            if let Err(over) = shared
-                .budgets
-                .admit_hashed(&mut hashes, now, shared.door_divisor())
+            if let Err(over) =
+                shared
+                    .budgets
+                    .admit_hashed(&mut hashes, now, shared.door_divisor(), || {
+                        shared.sources.is_shared(peer, now.secs())
+                    })
             {
                 let r = Refusal::OverBudget {
                     retry_after: over.0,

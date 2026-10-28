@@ -1689,6 +1689,8 @@ Tier 2 · P1 · 0.5
 
 When enough distinct children of one parent prefix are banned within the window, the parent is banned (for the longest remaining child duration times `factor`, capped by the duration policy's `max`) and the children are folded into it, which also frees table space. Escalation never crosses an allow-list entry, a trusted proxy, or an address flagged as shared (likely carrier-grade NAT), and never goes wider than the configured widest prefix. Escalations started by local heuristics follow the enforcement mode (observe by default). The per-parent quota means an attacker in one allocation cannot fill the table to push out other bans: past the quota, inserting forces escalation.
 
+Strikes count at the widest escalation prefix too (IPv4 /24, IPv6 /48 by default), against the strikes escalation would need to reach it from one source (the kind's threshold times each level's fan-in: 40 for an IPv4 /24 and 80 for an IPv6 /48 by default). An attacker that moves to a new address or /64 before any reaches its threshold is banned at the prefix all the same, under the same rules as escalation (since 0.8, PLAN D-108).
+
 ### `AllowList` and `AllowKind`
 
 ```rust
@@ -1913,7 +1915,7 @@ pub enum IgnoredBecause { TrustedProxy, AllowListed, UnverifiedSource, PendingCl
 
 Tier 1 · P0 · 0.4
 
-`Throttled` is what an enforced threshold does to a source flagged as shared (likely NAT): bouncer throttles the address and bans the identity keys instead of punishing everyone behind it.
+`Throttled` is what an enforced threshold does to a source flagged as shared (likely NAT): bouncer throttles the address and bans the identity keys instead of punishing everyone behind it. At the door a shared address is held to its prefix's budget, not one client's, throttled or not, so the people behind it are not refused as one client (since 0.8, PLAN D-109).
 
 ### `StrikeRules`
 

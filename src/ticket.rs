@@ -613,7 +613,9 @@ impl Ticket {
         if charge
             && shared
                 .budgets
-                .admit(addr, now, shared.door_divisor())
+                .admit(addr, now, shared.door_divisor(), || {
+                    shared.sources.is_shared(addr, now.secs())
+                })
                 .is_err()
         {
             return self.deny(DenialCode::TooManyRequests);

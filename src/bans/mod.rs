@@ -626,6 +626,14 @@ impl BanMemory {
         self.lock().table.live()
     }
 
+    /// The prefix strikes against `source` (an IPv4 address or IPv6 /64)
+    /// also count at, and the multiple of a kind's threshold it takes there
+    /// (see [`EscalationPolicy::strike_prefix`]).
+    pub(crate) fn strike_prefix(&self, source: &Cidr) -> Option<(Cidr, u32)> {
+        self.escalation
+            .strike_prefix(source, |l| self.is_auto(source.family(), l))
+    }
+
     fn is_auto(&self, family: Family, len: u8) -> bool {
         match family {
             Family::V4 => len <= 32 && self.auto_v4 & (1u64 << len) != 0,

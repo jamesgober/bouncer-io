@@ -105,10 +105,22 @@ The 24-hour fuzz and soak runs ran on the final 0.7 code (2026-10-26 to 2026-10-
 ## v0.8.0 - Alpha
 Needs a published net-io 0.3 or later.
 Items: feature `net-io` (`Gate` for `Bouncer`, `ConnectionGate`, conversions, `NetIoEjector`); serve-net running with bouncer on Windows and WSL; the replay harness (scanner, slowloris, credential stuffing from a /48, CGNAT population).
+
+Status: the `net-io` feature is built and tested over loopback (`tests/net_io.rs`, D-107). The replay harness is built (`tests/replay.rs`) and found two defects, both fixed test-first: credential stuffing that moves to a new /64 per attempt was never banned (D-108), and a CGNAT population was refused as one client by the default door budgets (D-109). Results, attacker against innocents:
+
+| Trace | Attacker | Innocents |
+|---|---|---|
+| scanner: one IPv4 address, 20 malformed connections a second for a minute; 50 neighbours in its /24 | 5 admitted, banned at 250 ms | 3,000 admitted, none refused |
+| slowloris: one address, a connection every 10 ms held 30 s until the transport kills it | at most 64 held, banned at 30 s | 4,800 admitted, none refused |
+| credential stuffing from a /48, a new /64 per attempt | 80 attempts, then the /48 banned (8 s) | 600 admitted from the next /48, none refused |
+| CGNAT: 2,000 users behind one address, 100 connections a second; one of them guesses passwords | 5 requests served, then session and account banned | 12,000 admitted, none refused |
+
+serve-net running with bouncer, and the same traces through it, wait for serve-net's first release: it is not on crates.io, and a path dependency is not allowed (each repository builds alone in CI).
 Exit:
 - [x] A browser on localhost banned by an admin call is refused at the door (`tests/net_io.rs`, a net-io server on loopback; the browser itself is checked with serve-net).
 - [x] A logged-in browser whose session is revoked mid-request gets the generic denial and its connection is closed (`tests/net_io.rs`: the session's denial and nothing of the body, then a reset).
 - [x] A streamed response cut by revocation leaks at most one chunk (loopback capture: nothing after the revocation reaches the client).
+- [ ] serve-net running with bouncer on Windows and WSL (waits for serve-net's first release).
 - [ ] NFR-10: the door 20% faster than the same-job composition, admitted and random peers (PLAN D-081).
 
 NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core; the totals, 0.7.0 against this branch, are in `docs/PERFORMANCE.md`):

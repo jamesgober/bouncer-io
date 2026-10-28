@@ -618,9 +618,25 @@ impl DoorBudgets {
     /// tier until [`release_connection`](Self::release_connection).
     /// `divisor` is 1, or the strict posture's divisor: each admission costs
     /// that many tokens and the concurrency limits shrink by it.
+    ///
+    /// `shared_source` says whether the address is flagged as shared (likely
+    /// a NAT); it is asked only when the address tier would refuse. A shared
+    /// address is held to its prefix tier only, so the people behind one
+    /// carrier-grade NAT address are not refused as one client (D-109).
     #[inline]
-    pub(crate) fn admit(&self, addr: IpAddr, now: Now, divisor: u32) -> Result<(), OverBudget> {
-        self.admit_hashed(&mut crate::bans::AddrHashes::new(addr), now, divisor)
+    pub(crate) fn admit(
+        &self,
+        addr: IpAddr,
+        now: Now,
+        divisor: u32,
+        shared_source: impl Fn() -> bool,
+    ) -> Result<(), OverBudget> {
+        self.admit_hashed(
+            &mut crate::bans::AddrHashes::new(addr),
+            now,
+            divisor,
+            shared_source,
+        )
     }
 
     /// As [`admit`](Self::admit), through the door's hash cache. Nothing is
@@ -631,6 +647,7 @@ impl DoorBudgets {
         hashes: &mut crate::bans::AddrHashes,
         now: Now,
         divisor: u32,
+        shared_source: impl Fn() -> bool,
     ) -> Result<(), OverBudget> {
         if self.rate.is_none() && self.concurrency.is_none() {
             return Ok(());
@@ -638,6 +655,10 @@ impl DoorBudgets {
         let keys = self.keys_hashed(hashes);
         let now_d = Duration::from_nanos(now.as_nanos());
         let now_secs = now.secs();
+        // The address tier gives way for a shared address, throttled or not:
+        // otherwise one person behind a NAT could get everyone behind it
+        // refused with a handful of strikes. The prefix tier still holds.
+        let gives_way = &shared_source;
         if let Some(tiers) = &self.rate {
             for (i, (tier, &key)) in tiers.iter().zip(keys.iter()).enumerate() {
                 let n = self.factor(key, now_secs).saturating_mul(divisor);
@@ -645,7 +666,10 @@ impl DoorBudgets {
                 // fallback), and past the prefix tier the global cell: a
                 // flood of new keys cannot reset anyone's limit, and is
                 // never unlimited.
-                self.charge(tier, i + 1 == tiers.len(), key, n, now_d)?;
+                match self.charge(tier, i + 1 == tiers.len(), key, n, now_d) {
+                    Err(_) if i == 0 && gives_way() => {}
+                    r => r?,
+                }
             }
         }
         if let Some(tiers) = &self.concurrency {
@@ -656,7 +680,10 @@ impl DoorBudgets {
                 if let Some((slot, _)) = claims.find_or_claim(key, idle, |_| {}) {
                     let count = claims.val(slot);
                     let before = count.fetch_add(1, Ordering::AcqRel);
-                    if before >= (tier.limit / divisor.max(1)).max(1) {
+                    // Over the address limit, a shared address keeps the
+                    // slot it took (returned on release as usual) and is held
+                    // to the prefix limit.
+                    if before >= (tier.limit / divisor.max(1)).max(1) && !(i == 0 && gives_way()) {
                         count.fetch_sub(1, Ordering::AcqRel);
                         for (j, s) in taken.iter().enumerate().take(i) {
                             if let Some(s) = s {
@@ -1210,17 +1237,17 @@ mod tests {
         );
         let t0 = Now::from_nanos(1_000_000_000);
         for _ in 0..3 {
-            assert!(b.admit(ip("192.0.2.1"), t0, 1).is_ok());
+            assert!(b.admit(ip("192.0.2.1"), t0, 1, || false).is_ok());
         }
         assert!(
-            matches!(b.admit(ip("192.0.2.1"), t0, 1), Err(OverBudget(d)) if d > Duration::ZERO)
+            matches!(b.admit(ip("192.0.2.1"), t0, 1, || false), Err(OverBudget(d)) if d > Duration::ZERO)
         );
         assert!(
-            b.admit(ip("192.0.2.2"), t0, 1).is_ok(),
+            b.admit(ip("192.0.2.2"), t0, 1, || false).is_ok(),
             "another address has its own budget"
         );
         assert!(
-            b.admit(ip("192.0.2.1"), Now::from_nanos(2_000_000_000), 1)
+            b.admit(ip("192.0.2.1"), Now::from_nanos(2_000_000_000), 1, || false)
                 .is_ok()
         );
     }
@@ -1231,13 +1258,21 @@ mod tests {
             budgets(Budgets::off().door_rate(Rate::per_second(100), Rate::per_second(5).burst(5)));
         let now = Now::from_nanos(1_000_000_000);
         let ok = (0..20u8)
-            .filter(|i| b.admit(IpAddr::from([198, 51, 100, *i]), now, 1).is_ok())
+            .filter(|i| {
+                b.admit(IpAddr::from([198, 51, 100, *i]), now, 1, || false)
+                    .is_ok()
+            })
             .count();
         assert_eq!(ok, 5, "rotating inside one /24 shares the prefix budget");
         let ok6 = (0..20u16)
             .filter(|i| {
-                b.admit(IpAddr::from([0x2001, 0xdb8, 1, *i, 0, 0, 0, 1]), now, 1)
-                    .is_ok()
+                b.admit(
+                    IpAddr::from([0x2001, 0xdb8, 1, *i, 0, 0, 0, 1]),
+                    now,
+                    1,
+                    || false,
+                )
+                .is_ok()
             })
             .count();
         assert_eq!(
@@ -1251,21 +1286,24 @@ mod tests {
         let b =
             budgets(Budgets::off().door_rate(Rate::per_second(2).burst(2), Rate::per_second(1000)));
         let now = Now::from_nanos(1_000_000_000);
-        assert!(b.admit(ip("2001:db8::1"), now, 1).is_ok());
-        assert!(b.admit(ip("2001:db8::ffff"), now, 1).is_ok());
-        assert!(b.admit(ip("2001:db8::abcd"), now, 1).is_err(), "same /64");
+        assert!(b.admit(ip("2001:db8::1"), now, 1, || false).is_ok());
+        assert!(b.admit(ip("2001:db8::ffff"), now, 1, || false).is_ok());
+        assert!(
+            b.admit(ip("2001:db8::abcd"), now, 1, || false).is_err(),
+            "same /64"
+        );
     }
 
     #[test]
     fn test_concurrency_limit_and_release() {
         let b = budgets(Budgets::off().door_concurrency(2, 100));
         let now = Now::default();
-        assert!(b.admit(ip("192.0.2.1"), now, 1).is_ok());
-        assert!(b.admit(ip("192.0.2.1"), now, 1).is_ok());
-        assert!(b.admit(ip("192.0.2.1"), now, 1).is_err());
+        assert!(b.admit(ip("192.0.2.1"), now, 1, || false).is_ok());
+        assert!(b.admit(ip("192.0.2.1"), now, 1, || false).is_ok());
+        assert!(b.admit(ip("192.0.2.1"), now, 1, || false).is_err());
         assert_eq!(b.concurrent(ip("192.0.2.1")), 2);
         b.release_connection(Some(ip("192.0.2.1")), now);
-        assert!(b.admit(ip("192.0.2.1"), now, 1).is_ok());
+        assert!(b.admit(ip("192.0.2.1"), now, 1, || false).is_ok());
         // Releases never go below zero.
         for _ in 0..5 {
             b.release_connection(Some(ip("192.0.2.1")), now);
@@ -1277,8 +1315,8 @@ mod tests {
     fn test_prefix_concurrency_refusal_returns_address_slot() {
         let b = budgets(Budgets::off().door_concurrency(10, 1));
         let now = Now::default();
-        assert!(b.admit(ip("192.0.2.1"), now, 1).is_ok());
-        assert!(b.admit(ip("192.0.2.2"), now, 1).is_err());
+        assert!(b.admit(ip("192.0.2.1"), now, 1, || false).is_ok());
+        assert!(b.admit(ip("192.0.2.2"), now, 1, || false).is_err());
         assert_eq!(
             b.concurrent(ip("192.0.2.2")),
             0,
@@ -1293,7 +1331,7 @@ mod tests {
         let now = Now::from_nanos(1_000_000_000);
         assert!(b.throttle(&Cidr::host(ip("192.0.2.7")), 4, 100, 1));
         let ok = (0..8)
-            .filter(|_| b.admit(ip("192.0.2.7"), now, 1).is_ok())
+            .filter(|_| b.admit(ip("192.0.2.7"), now, 1, || false).is_ok())
             .count();
         assert_eq!(ok, 2, "factor 4 leaves a quarter");
     }

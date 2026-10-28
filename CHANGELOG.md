@@ -15,6 +15,11 @@
 
 - Feature `net-io`: bouncer as net-io's `Gate` (the door at accept, the client a trusted PROXY header names, the egress check before every write, strikes for slow-peer, PROXY, and TLS failures at close), `ConnectionGate`, the id, tag, and prefix conversions, and `NetIoEjector`, attached to a server after both are built.
 
+### Fixed
+
+- Credential stuffing that moves to a new IPv6 /64 (or IPv4 address) for every attempt is banned at its /48 (or /24). Strikes also count at the widest escalation prefix, against the strikes escalation would need to get there (80 for an IPv6 /48 and 40 for an IPv4 /24 at the default threshold). Before, every source's counter stayed at one and nothing was banned.
+- The people behind one carrier-grade NAT address are no longer refused as one client: an address flagged as shared is held to its prefix's door budget instead of one client's, throttled or not, so one person behind a NAT cannot get everyone behind it refused.
+
 ### Changed
 
 - Door and lane rate budgets keep only a GCRA arrival time per key, beside the key in its slot, under rate parameters shared by the tier; concurrency counts sit beside their keys too. A rate key costs 16 bytes instead of 88, and an unknown peer misses the cache once per tier instead of twice.
