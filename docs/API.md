@@ -18,7 +18,7 @@
 
 The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every item lists its tier, its grade, the version that brings it, and what it costs. The rustdoc on [docs.rs](https://docs.rs/bouncer-io) becomes the exhaustive reference as each item lands; until then this file is the contract.
 
-> **Status: `0.7.0` (hardening).** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. Items marked with a later version (the net-io feature at 0.8) are the agreed shape; their examples become doctests when they land.
+> **Status: `0.7.0` (hardening); 0.8 in progress.** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. The net-io feature is built on the 0.8 branch and not yet released.
 
 **Reading the item headers.** *Tier 1* is the simple surface (one-line constructors, no builder), *Tier 2* is configuration, *Tier 3* is the full surface for integrations and other libraries. *P0* is required for the crate's job, *P1* is what users of the best existing tools expect, *P2* is high value for serious deployments, *P3* comes after 1.0. Costs are targets, marked `[est.]` until they are measured at 0.6.
 
@@ -126,7 +126,7 @@ bouncer-io = "0.2"
 | Feature | Default | Enables | Grade | Ver |
 |---|---|---|---|---|
 | `metrics` | no | per-shard counters and [`Bouncer::metrics`](#metrics); without it the counters do not exist | P1 | 0.5 |
-| `net-io` | no | implementations of net-io's `Admission` and `Egress` hooks and the id conversions ([net-io integration](#net-io-integration)) | P0 | 0.8 |
+| `net-io` | no | bouncer as net-io's `Gate`, the id and tag conversions, and `NetIoEjector` ([net-io integration](#net-io-integration)) | P0 | 0.8 |
 
 Persistence, sharing across nodes, and administration are always compiled in: distributed operation is the default, not an option, and none of it adds a dependency. The crate needs `std` (threads for the optional maintainer, files for persistence); `no_std` is not offered.
 
@@ -2398,29 +2398,49 @@ Tier 2 · P1 · 0.5 · counters are per shard, relaxed, on the shard's own cache
 
 ## net-io integration
 
-Feature `net-io`, version 0.8 (needs a published net-io 0.3 or later). net-io defines the `Gate` trait and calls it; bouncer implements it; net-io never depends on bouncer. The shape below is agreed with net-io's 0.2 design lock (decision D-015).
+Feature `net-io`, version 0.8 (net-io 0.3 or later). net-io defines the `Gate` trait and calls it; bouncer implements it; net-io never depends on bouncer. The shape follows net-io's 0.2 design lock (decision D-015), with the changes of PLAN D-107.
 
 ```rust
 #[cfg(feature = "net-io")] impl net_io::Gate for Bouncer { type Ticket = ConnectionGate; }
-#[cfg(feature = "net-io")] pub struct ConnectionGate { /* the connection Ticket, with its last-seen epoch */ }
-#[cfg(feature = "net-io")] impl ConnectionGate { pub fn ticket(&mut self) -> &mut Ticket; }
+#[cfg(feature = "net-io")] pub struct ConnectionGate { /* the connection Ticket and its tag */ }
+#[cfg(feature = "net-io")] impl ConnectionGate { pub fn ticket(&mut self) -> &mut Ticket; pub fn tag(&self) -> TicketTag; }
 #[cfg(feature = "net-io")] impl From<net_io::ConnectionId> for ConnId;
 #[cfg(feature = "net-io")] impl From<TicketTag> for net_io::GateTag;
 #[cfg(feature = "net-io")] impl From<net_io::GateTag> for TicketTag;
 #[cfg(feature = "net-io")] impl From<net_io::Cidr> for Cidr;
-#[cfg(feature = "net-io")] pub struct NetIoEjector { /* holds a net_io::ServerHandle */ }
+#[cfg(feature = "net-io")] pub struct NetIoEjector { /* a net_io::ServerHandle, attached after build */ }
+#[cfg(feature = "net-io")] impl NetIoEjector { pub fn new() -> NetIoEjector; pub fn attach(&self, server: net_io::ServerHandle) -> bool; }
 #[cfg(feature = "net-io")] impl Ejector for NetIoEjector;
+#[cfg(feature = "net-io")] pub const REFUSED: u16;            // the one refusal code, for every reason
+#[cfg(feature = "net-io")] pub const EJECTED: net_io::KillReason;
+#[cfg(feature = "net-io")] pub const LOCAL_PEER: IpAddr;     // 127.0.0.1: Unix-socket and pipe peers
+```
+
+```rust
+use std::sync::Arc;
+use bouncer_io::{Bouncer, NetIoEjector};
+use net_io::{ListenerSpec, ServerBuilder};
+
+let ejector = Arc::new(NetIoEjector::new());
+let bouncer = Bouncer::builder().ejector(ejector.clone()).try_build()?;
+let server = ServerBuilder::new()
+    .listener(ListenerSpec::tcp("127.0.0.1:8080"))
+    .handler(|conn: &mut net_io::TcpConnection| { /* ... */ Ok(()) })
+    .gate(bouncer.clone())
+    .build()?;
+ejector.attach(server.handle());     // eject-now sweeps can now close connections
+server.open_door()?;
 ```
 
 Tier 3 · P0 · 0.8
 
 | net-io calls | bouncer does |
 |---|---|
-| `Gate::admit(info, Accept)` | `door_at` with net-io's id and accept time; `Ok(Admitted { lane: info.lane, ticket, tag })`, where `ticket` is the connection's `ConnectionGate` and `tag` its `TicketTag`; or `Err(Refusal::Reset { .. })`, silent and identical for every reason |
+| `Gate::admit(info, stage)` | `door_at` with net-io's id and accept time (converted through the bouncer's clock base, so use the system clock); `Ok(Admitted { lane: info.lane, ticket, tag })`, where `ticket` is the connection's `ConnectionGate` and `tag` its `TicketTag`; or `Err(Refusal::Reset { code: REFUSED })`, silent and identical for every reason. A peer with no IP address (Unix socket, named pipe) enters as `LOCAL_PEER` with `Provenance::Local` |
 | `Gate::readmit(ticket, info)` after a trusted PROXY header | `bind_client` on the connection ticket with `Provenance::ProxyProtocol` |
-| `Gate::check(ticket, write)` before every write | the egress check with the ticket in hand: one atomic load while nothing is revoked (the last-seen epoch lives in the ticket). When the session set a response tag (`write.response`), that request is judged; otherwise the connection and its latest request. `Err(Denial { code })` carries the `DenialCode` as a number (1 `Unavailable`, 2 `NotFound`, 3 `TooManyRequests`, 4 `Unauthorized`, 5 `Forbidden`); net-io wipes its pending output, has the session format the denial only if nothing of the response has left, and closes with `SO_LINGER` 0 |
+| `Gate::check(ticket, write)` before every write | the egress check by tag (1.3 ns while nothing is revoked): when the session set a response tag (`write.response`), that request is judged; otherwise the connection and its latest request. `Err(Denial { code })` carries the `DenialCode` as a number (1 `Unavailable`, 2 `NotFound`, 3 `TooManyRequests`, 4 `Unauthorized`, 5 `Forbidden`); net-io wipes its pending output, has the session format the denial only if nothing of the response has left, and closes with `SO_LINGER` 0 |
 | `Gate::closed(ticket, info, reason)`, exactly once | releases the connection ticket (its live requests are revoked with `CONNECTION_CLOSED`, its concurrency slot returned); close reasons that mean misbehaviour (`SlowPeer`, `ProxyInvalid`, `ProxyUntrusted`, `TlsFailed`, `HelloRefused`) become strikes |
-| `ServerHandle::kill(id, reason)` | used by `NetIoEjector`, so eject-now sweeps and idle checks can close connections bouncer holds only by id |
+| `ServerHandle::kill(id, EJECTED)` | used by `NetIoEjector`, so eject-now sweeps and idle checks can close connections bouncer holds only by id; a close after a flush is an abort too |
 
 The protocol engine reads the connection's tag from `ConnectionInfo` and opens request tickets with [`Bouncer::request`](#request); it passes a request's [`tag`](#tickettag-and-into_tag) to `Output::begin_tagged_response` so the egress check judges that request, which matters on multiplexed connections (HTTP/2, or a trusted proxy pooling many clients over one connection).
 

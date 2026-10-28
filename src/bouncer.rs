@@ -100,6 +100,15 @@ impl Shared {
         Now::from_duration(self.clock.now().saturating_duration_since(self.start))
     }
 
+    /// The bouncer time of a moment a transport read from the system's
+    /// monotonic clock (net-io's accept time). Meaningful only when the
+    /// bouncer's own clock is the system clock.
+    #[cfg(feature = "net-io")]
+    #[inline]
+    pub(crate) fn now_at(&self, at: std::time::Instant) -> Now {
+        Now::from_duration(Monotonic::from(at).saturating_duration_since(self.start))
+    }
+
     /// Notes a time the door saw (cheap: one load, a store once a second).
     #[inline]
     pub(crate) fn saw(&self, now: Now) {
@@ -1281,6 +1290,12 @@ impl Bouncer {
     #[must_use]
     pub fn now(&self) -> Now {
         self.inner.shared.now()
+    }
+
+    #[cfg(feature = "net-io")]
+    #[inline]
+    pub(crate) fn now_at(&self, at: std::time::Instant) -> Now {
+        self.inner.shared.now_at(at)
     }
 
     /// Does a bounded amount of every pending job: eject-now sweeps, checks

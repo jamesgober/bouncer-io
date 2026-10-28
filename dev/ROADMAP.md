@@ -106,9 +106,9 @@ The 24-hour fuzz and soak runs ran on the final 0.7 code (2026-10-26 to 2026-10-
 Needs a published net-io 0.3 or later.
 Items: feature `net-io` (`Gate` for `Bouncer`, `ConnectionGate`, conversions, `NetIoEjector`); serve-net running with bouncer on Windows and WSL; the replay harness (scanner, slowloris, credential stuffing from a /48, CGNAT population).
 Exit:
-- [ ] A browser on localhost banned by an admin call is refused at the door.
-- [ ] A logged-in browser whose session is revoked mid-request gets the generic denial and its connection is closed.
-- [ ] A streamed response cut by revocation leaks at most one chunk (loopback capture).
+- [x] A browser on localhost banned by an admin call is refused at the door (`tests/net_io.rs`, a net-io server on loopback; the browser itself is checked with serve-net).
+- [x] A logged-in browser whose session is revoked mid-request gets the generic denial and its connection is closed (`tests/net_io.rs`: the session's denial and nothing of the body, then a reset).
+- [x] A streamed response cut by revocation leaks at most one chunk (loopback capture: nothing after the revocation reaches the client).
 - [ ] NFR-10: the door 20% faster than the same-job composition, admitted and random peers (PLAN D-081).
 
 NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core; the totals, 0.7.0 against this branch, are in `docs/PERFORMANCE.md`):
@@ -125,6 +125,7 @@ NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core; the totals, 0.
 | the ticket owner releasing with a load and a store | dropped: loom L-5 rejects it |
 | budgets reusing the lookup's prefix hash | dropped: no gain measured |
 | the budget cells loaded before the ban lookup, so their misses overlap | dropped: random peers +26%, banned peers +92% (a banned peer now pays for cells it never needed) |
+| budget slots carrying their payload: a rate key's arrival time and a concurrency count beside the key, GCRA parameters shared by the tier (D-106) | `door_at` random peers -13%, `door` random peers -18%, admitted -13% (machine under full load; relative only); a rate key 88 -> 16 B |
 | a fast clock for `door` | not in clock-lib: its directives put timers out of scope and forbid `unsafe` (no timestamp counter); `door_at` with the transport's accept time is the fast path |
 
 Where it stands (0.7.0 against this branch, 10 alternating rounds): `door_at` admitted 112.7 -> 92.1 ns against the composition's 110.7 (17% faster; the target is 20%, about 89 ns); random peers 150.3 -> 133.3 against 115.9 (1.15 times slower; the target is about 93 ns); banned 68.8 -> 55.5. For random peers the parts are: ticket 43 ns, judgement with 1,000,000 bans 34 ns, the two rate checks about 36 ns (the client's and the prefix's slots, in two tables, both missing the cache).
@@ -133,7 +134,7 @@ Next steps (estimates until built and measured):
 
 | Step | Expected | Cost and risk |
 |---|---|---|
-| a client's budget slot in its prefix's probe sequence (the D-104 anchor applied to the budget tables), so one cache miss serves both rate checks | random peers -15 to -20 ns [est.] | reclaiming idle slots must not let a prefix's clients push out the prefix's own slot; the per-prefix fairness of T-4 must hold; loom again for the claim path |
+| a client's budget slot in its prefix's probe sequence (the D-104 anchor applied to the budget tables), so one cache miss serves both rate checks; after D-106 each tier misses once, so this saves one more | random peers -8 to -12 ns [est.] | reclaiming idle slots must not let a prefix's clients push out the prefix's own slot; the per-prefix fairness of T-4 must hold; loom again for the claim path |
 | the ticket cell and its connection id written in one cache line on issue | admitted -3 to -5 ns [est.] | a cell layout change; loom L-5 and L-7 again |
 
 ## v0.9.0 - Beta and release candidates
