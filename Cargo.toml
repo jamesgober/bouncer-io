@@ -50,6 +50,8 @@ path = "src/lib.rs"
 default = []
 # Per-shard counters and `Bouncer::metrics`; without it the counters do not exist.
 metrics = []
+# bouncer as net-io's `Gate`, the id and tag conversions, and `NetIoEjector`.
+net-io = ["dep:net-io"]
 
 
 # DEPENDENCIES
@@ -57,15 +59,19 @@ metrics = []
 [dependencies]
 # Monotonic and wall time, mockable in tests (first-party).
 clock-lib = "1.1"
-# GCRA rate math for door budgets (first-party). Default features off: its
-# `std` feature pulls ahash and hashbrown.
-rate-net = { version = "2.0", default-features = false }
+# GCRA rate math for door and lane budgets (first-party; 2.1 for `GcraParams`,
+# the parameters shared by a tier). Default features off: its `std` feature
+# pulls ahash and hashbrown.
+rate-net = { version = "2.1", default-features = false }
 # Token buckets for tenant budgets (first-party). Default features off: no
 # clock, no error crate; bouncer passes its own time.
 better-bucket = { version = "1.1", default-features = false }
 # Guaranteed (volatile) wipe of response buffers: the audited-cryptography
 # exception. Only the features bouncer uses.
 crypt-io = { version = "1.2", default-features = false, features = ["zeroize", "mac-blake3"] }
+# The transport the `net-io` feature plugs into (first-party, no dependencies
+# of its own). Optional: bouncer works with any transport.
+net-io = { version = "0.3", optional = true }
 
 
 # DEV DEPENDENCIES

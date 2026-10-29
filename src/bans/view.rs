@@ -98,14 +98,18 @@ impl BanMemory {
         let live = w.counts_ident[usize::from(table::KIND_FINGERPRINT_IN & 15)] as usize;
         if w.compound.len() > 2 * live + 64 {
             let table = &self.table;
+            let tw = &w.table;
             w.compound.retain(|&(len, k0, k1), _| {
                 table
-                    .get_owned(&TableKey {
-                        kind: table::KIND_FINGERPRINT_IN,
-                        len,
-                        k0,
-                        k1,
-                    })
+                    .get_owned(
+                        tw,
+                        &TableKey {
+                            kind: table::KIND_FINGERPRINT_IN,
+                            len,
+                            k0,
+                            k1,
+                        },
+                    )
                     .is_some()
             });
         }
@@ -115,7 +119,7 @@ impl BanMemory {
     pub(crate) fn held_all(&self, now_secs: u64) -> Vec<Held> {
         let w = self.lock();
         let mut out = Vec::new();
-        self.table.for_each(|e| {
+        self.table.for_each(&w.table, |e| {
             if !e.expired(now_secs) {
                 if let Some(key) = self.key_of(&w, &e.key) {
                     out.push(Held::from_entry(key, e));
@@ -139,7 +143,7 @@ impl BanMemory {
         let w = self.lock();
         let mut out = Vec::new();
         let take = |tkey: TableKey, out: &mut Vec<Held>| {
-            if let Some(e) = self.table.get_owned(&tkey) {
+            if let Some(e) = self.table.get_owned(&w.table, &tkey) {
                 if !e.expired(now_secs) {
                     if let Some(k) = self.key_of(&w, &e.key) {
                         out.push(Held::from_entry(k, &e));

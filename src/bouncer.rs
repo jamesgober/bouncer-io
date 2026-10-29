@@ -100,6 +100,15 @@ impl Shared {
         Now::from_duration(self.clock.now().saturating_duration_since(self.start))
     }
 
+    /// The bouncer time of a moment a transport read from the system's
+    /// monotonic clock (net-io's accept time). Meaningful only when the
+    /// bouncer's own clock is the system clock.
+    #[cfg(feature = "net-io")]
+    #[inline]
+    pub(crate) fn now_at(&self, at: std::time::Instant) -> Now {
+        Now::from_duration(Monotonic::from(at).saturating_duration_since(self.start))
+    }
+
     /// Notes a time the door saw (cheap: one load, a store once a second).
     #[inline]
     pub(crate) fn saw(&self, now: Now) {
@@ -177,6 +186,18 @@ impl Shared {
         .send(self);
     }
 
+    /// Reports a rebuild of the ban table under a fresh hash key (T-9).
+    pub(crate) fn report_reseeds(&self) {
+        let n = self.bans.take_reseeds();
+        if n > 0 {
+            Emit {
+                count: u32::try_from(n).unwrap_or(u32::MAX),
+                ..Emit::new(events::signals::TABLE_RESEEDED)
+            }
+            .send(self);
+        }
+    }
+
     /// Bookkeeping after bans were lifted outside `lift` (persistence).
     pub(crate) fn after_lift(&self, lifted: &[crate::bans::view::Held]) {
         let keys: Vec<BanKey> = lifted.iter().map(|h| h.key).collect();
@@ -226,6 +247,7 @@ impl Shared {
         let (result, plan) = match planned {
             Ok((id, plan, gone, own)) => {
                 self.report_gone(gone);
+                self.report_reseeds();
                 meter!(self.meters, bans_added);
                 self.record_ban(&spec.key, id, own.as_ref());
                 (Ok(id), plan)
@@ -553,7 +575,7 @@ impl Bouncer {
         let shared = &self.inner.shared;
         let peer = normalize(peer);
         shared.saw(now);
-        let mut hashes = crate::bans::AddrHashes::new(shared.bans.hasher(), peer);
+        let mut hashes = crate::bans::AddrHashes::new(peer);
         let (mut flags, source, charge) =
             match shared.judge_hashed(peer, provenance, now, &mut hashes) {
                 Judgement::Admit { immune, exempt } => {
@@ -566,9 +588,12 @@ impl Bouncer {
                 }
             };
         if charge {
-            if let Err(over) = shared
-                .budgets
-                .admit_hashed(&mut hashes, now, shared.door_divisor())
+            if let Err(over) =
+                shared
+                    .budgets
+                    .admit_hashed(&mut hashes, now, shared.door_divisor(), || {
+                        shared.sources.is_shared(peer, now.secs())
+                    })
             {
                 let r = Refusal::OverBudget {
                     retry_after: over.0,
@@ -1270,6 +1295,12 @@ impl Bouncer {
         self.inner.shared.now()
     }
 
+    #[cfg(feature = "net-io")]
+    #[inline]
+    pub(crate) fn now_at(&self, at: std::time::Instant) -> Now {
+        self.inner.shared.now_at(at)
+    }
+
     /// Does a bounded amount of every pending job: eject-now sweeps, checks
     /// on tickets that have not crossed a checkpoint for `max_unchecked`
     /// (checked on their behalf; matching ones are ejected and reported as
@@ -1808,9 +1839,9 @@ impl BouncerBuilder {
             .unwrap_or_else(|| Arc::new(RevocationEpoch::new()));
         let mut rng = crate::hash::Rng::from_seed(seeds.rng ^ 0x0b0b);
         let derived = |rng: &mut crate::hash::Rng| HashKey::new(rng.next_u64(), rng.next_u64());
-        // The table's key: one keyed hash of a prefix serves the ban lookup
-        // and the door budgets.
-        let budgets = DoorBudgets::new(&self.budgets, seeds.tables, self.tickets);
+        // The budgets' own key: a reseed of the ban table must not reset
+        // anyone's budget.
+        let budgets = DoorBudgets::new(&self.budgets, derived(&mut rng), self.tickets);
         let identity = IdentityBudgets::new(&self.budgets, derived(&mut rng), Now::default());
         let revocation_rate =
             rate_net::Quota::rate(self.revocation_rate_limit, Duration::from_secs(1))

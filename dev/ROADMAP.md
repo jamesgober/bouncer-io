@@ -105,20 +105,79 @@ The 24-hour fuzz and soak runs ran on the final 0.7 code (2026-10-26 to 2026-10-
 ## v0.8.0 - Alpha
 Needs a published net-io 0.3 or later.
 Items: feature `net-io` (`Gate` for `Bouncer`, `ConnectionGate`, conversions, `NetIoEjector`); serve-net running with bouncer on Windows and WSL; the replay harness (scanner, slowloris, credential stuffing from a /48, CGNAT population).
-Exit:
-- [ ] A browser on localhost banned by an admin call is refused at the door.
-- [ ] A logged-in browser whose session is revoked mid-request gets the generic denial and its connection is closed.
-- [ ] A streamed response cut by revocation leaks at most one chunk (loopback capture).
 
-## v0.9.0 - Beta and release candidates
-Items: used end to end by the web stack and one non-HTTP service (a database network layer or the back-channel); API review against the simple-API rule; `cargo-semver-checks` in CI; release candidates `0.9.x`.
+Status: the `net-io` feature is built and tested over loopback (`tests/net_io.rs`, D-107). The replay harness is built (`tests/replay.rs`) and found two defects, both fixed test-first: credential stuffing that moves to a new /64 per attempt was never banned (D-108), and a CGNAT population was refused as one client by the default door budgets (D-109). Results, attacker against innocents:
+
+| Trace | Attacker | Innocents |
+|---|---|---|
+| scanner: one IPv4 address, 20 malformed connections a second for a minute; 50 neighbours in its /24 | 5 admitted, banned at 250 ms | 3,000 admitted, none refused |
+| slowloris: one address, a connection every 10 ms held 30 s until the transport kills it | at most 64 held, banned at 30 s | 4,800 admitted, none refused |
+| credential stuffing from a /48, a new /64 per attempt | 80 attempts, then the /48 banned (8 s) | 600 admitted from the next /48, none refused |
+| CGNAT: 2,000 users behind one address, 100 connections a second; one of them guesses passwords | 5 requests served, then session and account banned | 12,000 admitted, none refused |
+
+serve-net running with bouncer, and the same traces through it, wait for serve-net's first release: it is not on crates.io, and a path dependency is not allowed (each repository builds alone in CI).
+Exit:
+- [x] A browser on localhost banned by an admin call is refused at the door (`tests/net_io.rs`, a net-io server on loopback; the browser itself is checked with serve-net).
+- [x] A logged-in browser whose session is revoked mid-request gets the generic denial and its connection is closed (`tests/net_io.rs`: the session's denial and nothing of the body, then a reset).
+- [x] A streamed response cut by revocation leaks at most one chunk (loopback capture: nothing after the revocation reaches the client).
+- [ ] serve-net running with bouncer on Windows and WSL (waits for serve-net's first release).
+- [ ] NFR-10: the door 20% faster than the same-job composition, admitted and random peers (PLAN D-081).
+
+NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core; the totals, 0.7.0 against this branch, are in `docs/PERFORMANCE.md`):
+
+| Step | Result |
+|---|---|
+| keyed multiply mix, reseed at the probe bound (D-102) | judgement with 1,000,000 bans -27%, `door_at` admitted -11% |
+| addresses anchored at their family's shortest automatic length, one group per lookup (D-104) | `door_at` random peers -15% |
+| first table and allow list read without a thread-local access | judgement -10% more |
+| each length's key built once, unkeyed tags past the anchor, direct masks | judgement 55 -> 33 ns in all |
+| 32-byte slots, one-word keys, long keys as keyed fingerprints (D-105) | memory per ban 56.0 -> 37.7 B (NFR-6 met); door within noise; account revocation -20% |
+| connection release without the link swap | dropped: loom L-7 fails without it (D-103) |
+| a per-thread stash of free cells | dropped: no gain measured (the thread-local access costs what the two compare-and-swaps did) |
+| the ticket owner releasing with a load and a store | dropped: loom L-5 rejects it |
+| budgets reusing the lookup's prefix hash | dropped: no gain measured |
+| the budget cells loaded before the ban lookup, so their misses overlap | dropped: random peers +26%, banned peers +92% (a banned peer now pays for cells it never needed) |
+| budget slots carrying their payload: a rate key's arrival time and a concurrency count beside the key, GCRA parameters shared by the tier (D-106) | `door_at` random peers -13%, `door` random peers -18%, admitted -13% (machine under full load; relative only); a rate key 88 -> 16 B |
+| a fast clock for `door` | not in clock-lib: its directives put timers out of scope and forbid `unsafe` (no timestamp counter); `door_at` with the transport's accept time is the fast path |
+
+Where it stands (0.7.0 against this branch, 10 alternating rounds): `door_at` admitted 112.7 -> 92.1 ns against the composition's 110.7 (17% faster; the target is 20%, about 89 ns); random peers 150.3 -> 133.3 against 115.9 (1.15 times slower; the target is about 93 ns); banned 68.8 -> 55.5. For random peers the parts are: ticket 43 ns, judgement with 1,000,000 bans 34 ns, the two rate checks about 36 ns (the client's and the prefix's slots, in two tables, both missing the cache).
+
+Next steps (estimates until built and measured):
+
+| Step | Expected | Cost and risk |
+|---|---|---|
+| a client's budget slot in its prefix's probe sequence (the D-104 anchor applied to the budget tables), so one cache miss serves both rate checks; after D-106 each tier misses once, so this saves one more | random peers -8 to -12 ns [est.] | reclaiming idle slots must not let a prefix's clients push out the prefix's own slot; the per-prefix fairness of T-4 must hold; loom again for the claim path |
+| the ticket cell and its connection id written in one cache line on issue | admitted -3 to -5 ns [est.] | a cell layout change; loom L-5 and L-7 again |
+
+## v0.9.0 - Pre-1.0 polish
+James's standing rule (2026-10-29): go back and fix every issue and tune performance before the release gets close. Nothing accepted mid-series becomes final without being looked at again here. This milestone comes before the beta and before any release candidate.
+Items:
+- Revisit every accepted gap, deferred item, known issue, and missed target; for each, fix it, or record why it stays and what it costs (each goes into the 1.0 readiness note). As of 0.8:
+  - NFR-10 (PLAN D-081), if 0.8 has not met it: the door 20% faster than the same-job composition, admitted and random peers.
+  - The door's 100 ns p99, measured per call (needs a nanosecond timer; measured so far as the fastest and median rounds only).
+  - Ticket issue and release at 32 threads (PLAN 11; measured at one thread only).
+  - Ban insert about 5% slower since D-105 (the fingerprint and the originals beside the table).
+  - Edge case 47's loopback half (the transport aborting a slow reader after the flush deadline; `NetIoEjector` closes after-flush ejections as aborts).
+  - T-8's network-level check (the same abortive close after every refusal decision, D-093).
+  - `readmit` through a real server once net-io parses PROXY headers (tested by a direct call at 0.8).
+  - serve-net running with bouncer, and the replay traces through it, if 0.8 could not (serve-net unreleased).
+  - The limits recorded with D-105 (19-bit slot version, long-key fingerprints), D-106 (slot alignment), D-108 (prefix strike bans of many people's strikes), D-109 (a shared address gets its prefix's door budget), and persistence rollback (not covered, `docs/SECURITY.md`).
+- A fresh performance pass on a quiet machine: every PLAN 11 target and both compositions re-measured, profiles of the door, ticket, bind, and insert paths, and every idea the profiles suggest tried by pinned A/B (kept or dropped with the numbers recorded).
+- The security and edge-case review run again in full: every threat of PLAN 8 and every edge case of PLAN 13 against the code as it is then, an adversarial review of everything changed since 0.7, and the fuzz targets and the soak for 24 hours on the final code.
+Exit:
+- [ ] Every item above fixed, or kept with its reason and cost in the 1.0 readiness note.
+- [ ] The performance pass and the review recorded (findings fixed test-first; numbers in `docs/PERFORMANCE.md`).
+- [ ] `docs/READINESS-1.0.md` written for James: what is done, what is still open and why, what each open item costs, and a recommendation.
+
+## v0.9.x - Beta and release candidates
+Items: used end to end by the web stack and one non-HTTP service (a database network layer or the back-channel); API review against the simple-API rule; `cargo-semver-checks` in CI; release candidates `0.9.x`, only after the pre-1.0 polish exits.
 Exit:
 - [ ] No API change needed by either consumer for two release candidates.
 
 ## v1.0.0 - Stable
 Items: the full audit (API, docs, tests, benchmarks, security) recorded in `docs/STABILITY-1.0.md`.
 Exit:
-- [ ] Audit passed; API frozen until 2.0. James gives the go before the tag.
+- [ ] Audit passed; API frozen until 2.0. James gives the go before the tag, with the 1.0 readiness note in hand.
 
 ## After 1.0
 - Challenge verdict and proof-of-work verifier; kernel-drop export; tarpit mode; ASN keys once a data source is chosen.
