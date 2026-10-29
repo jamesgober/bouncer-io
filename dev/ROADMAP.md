@@ -149,15 +149,35 @@ Next steps (estimates until built and measured):
 | a client's budget slot in its prefix's probe sequence (the D-104 anchor applied to the budget tables), so one cache miss serves both rate checks; after D-106 each tier misses once, so this saves one more | random peers -8 to -12 ns [est.] | reclaiming idle slots must not let a prefix's clients push out the prefix's own slot; the per-prefix fairness of T-4 must hold; loom again for the claim path |
 | the ticket cell and its connection id written in one cache line on issue | admitted -3 to -5 ns [est.] | a cell layout change; loom L-5 and L-7 again |
 
-## v0.9.0 - Beta and release candidates
-Items: used end to end by the web stack and one non-HTTP service (a database network layer or the back-channel); API review against the simple-API rule; `cargo-semver-checks` in CI; release candidates `0.9.x`.
+## v0.9.0 - Pre-1.0 polish
+James's standing rule (2026-10-29): go back and fix every issue and tune performance before the release gets close. Nothing accepted mid-series becomes final without being looked at again here. This milestone comes before the beta and before any release candidate.
+Items:
+- Revisit every accepted gap, deferred item, known issue, and missed target; for each, fix it, or record why it stays and what it costs (each goes into the 1.0 readiness note). As of 0.8:
+  - NFR-10 (PLAN D-081), if 0.8 has not met it: the door 20% faster than the same-job composition, admitted and random peers.
+  - The door's 100 ns p99, measured per call (needs a nanosecond timer; measured so far as the fastest and median rounds only).
+  - Ticket issue and release at 32 threads (PLAN 11; measured at one thread only).
+  - Ban insert about 5% slower since D-105 (the fingerprint and the originals beside the table).
+  - Edge case 47's loopback half (the transport aborting a slow reader after the flush deadline; `NetIoEjector` closes after-flush ejections as aborts).
+  - T-8's network-level check (the same abortive close after every refusal decision, D-093).
+  - `readmit` through a real server once net-io parses PROXY headers (tested by a direct call at 0.8).
+  - serve-net running with bouncer, and the replay traces through it, if 0.8 could not (serve-net unreleased).
+  - The limits recorded with D-105 (19-bit slot version, long-key fingerprints), D-106 (slot alignment), D-108 (prefix strike bans of many people's strikes), D-109 (a shared address gets its prefix's door budget), and persistence rollback (not covered, `docs/SECURITY.md`).
+- A fresh performance pass on a quiet machine: every PLAN 11 target and both compositions re-measured, profiles of the door, ticket, bind, and insert paths, and every idea the profiles suggest tried by pinned A/B (kept or dropped with the numbers recorded).
+- The security and edge-case review run again in full: every threat of PLAN 8 and every edge case of PLAN 13 against the code as it is then, an adversarial review of everything changed since 0.7, and the fuzz targets and the soak for 24 hours on the final code.
+Exit:
+- [ ] Every item above fixed, or kept with its reason and cost in the 1.0 readiness note.
+- [ ] The performance pass and the review recorded (findings fixed test-first; numbers in `docs/PERFORMANCE.md`).
+- [ ] `docs/READINESS-1.0.md` written for James: what is done, what is still open and why, what each open item costs, and a recommendation.
+
+## v0.9.x - Beta and release candidates
+Items: used end to end by the web stack and one non-HTTP service (a database network layer or the back-channel); API review against the simple-API rule; `cargo-semver-checks` in CI; release candidates `0.9.x`, only after the pre-1.0 polish exits.
 Exit:
 - [ ] No API change needed by either consumer for two release candidates.
 
 ## v1.0.0 - Stable
 Items: the full audit (API, docs, tests, benchmarks, security) recorded in `docs/STABILITY-1.0.md`.
 Exit:
-- [ ] Audit passed; API frozen until 2.0. James gives the go before the tag.
+- [ ] Audit passed; API frozen until 2.0. James gives the go before the tag, with the 1.0 readiness note in hand.
 
 ## After 1.0
 - Challenge verdict and proof-of-work verifier; kernel-drop export; tarpit mode; ASN keys once a data source is chosen.
