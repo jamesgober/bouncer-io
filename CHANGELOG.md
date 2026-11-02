@@ -11,6 +11,8 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-02
+
 ### Added
 
 - `examples/guarded_http.rs`: a small site behind bouncer on serve-net, with an administrator's port.
@@ -29,7 +31,7 @@
 - The ban table hashes with a keyed multiply mix instead of SipHash-1-3 and is rebuilt under a fresh key when an insert reaches the probe bound (`table.reseeded`); the door budgets hash under a key of their own.
 - An address's ban keys from its family's shortest automatic length (/24, /48 by default) share one probe sequence, so the door reads one group for all of an address's lengths; a prefix with many banned hosts spills to its own sequence.
 - Ban table slots are 32 bytes: memory per ban falls from 56 to 37.7 bytes. Keys that fit one word are stored exactly; longer ones as keyed 64-bit fingerprints, with the originals kept beside the table for listings, persistence, and sharing.
-- `door_at` is 18% faster admitted, 11% faster for random peers, and 19% faster for banned peers than in 0.7.0; account revocation is 25% faster; ban insert is about 5% slower.
+- `door_at` is 19% faster admitted, 12% faster for random peers, and 10% faster for banned peers than in 0.7.0, and `door` is 40% faster for random peers; account revocation is 20% faster; ban insert is about 5% slower.
 
 ## [0.7.0] - 2026-10-27
 
@@ -318,7 +320,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/bouncer-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/bouncer-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/bouncer-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/bouncer-io/compare/v0.4.0...v0.5.0

@@ -49,27 +49,27 @@ Equal conditions: both sides give the same verdict on every probe (checked befor
 
 | Case | `door_at` | `door` | Same-job composition | Lookup-only composition |
 |---|---|---|---|---|
-| admitted | 92.1 | 120.4 | 110.7 | 47.0 |
-| random peers | 133.3 | 161.2 | 115.9 | 66.0 |
-| banned | 55.5 | 80.5 | 15.8 | 10.7 |
+| admitted | 101.6 | 131.6 | 119.8 | 51.0 |
+| random peers | 130.8 | 170.0 | 126.6 | 73.9 |
+| banned | 67.0 | 93.0 | 17.0 | 11.8 |
 
-Fastest of 10 rounds, ns per operation, at 0.8 (taken while other work used about a fifth of the machine; the composition rows match the 0.6 runs within 2%). Admitted: bouncer is 17% faster than the same-job composition. Random peers: bouncer is 1.15 times slower (the ban table's group and the two budget tables' slots miss the cache one after the other). Banned: the composition finds a banned host in its `HashSet` and stops; bouncer reads the address's anchor group and checks every length in use.
+Fastest of 10 rounds, ns per operation, at 0.8. The machine was under full load from other work when these were taken, so every row is about 8 to 10% above a quiet run (the composition rows were 110 to 116 ns on a quieter one); compare rows with each other, not with the 0.6 figures. Admitted: bouncer is 15% faster than the same-job composition. Random peers: bouncer is within 3% of it (the ban table's group and the two budget tiers miss the cache one after the other). Banned: the composition finds a banned host in its `HashSet` and stops; bouncer reads the address's anchor group and checks every length in use.
 
 ## Where the door's time goes
 
 | Part | ns |
 |---|---|
-| ticket issue and release (empty bouncer, judgement included) | 43.0 |
-| request ticket cycle | 41.0 |
-| one `Arc` allocation per request (for comparison) | 25.3 |
-| judgement, nothing configured | 8.2 |
-| judgement, allow list and proxies | 10.0 |
-| judgement, 1,000,000 bans | 33.9 |
-| judgement, 1,000,000 bans and the administrator set | 39.3 |
-| `door_at` without the rate budget, admitted / random peers | 74.9 / 97.7 |
-| `Bouncer::now` | 24.4 |
+| ticket issue and release (empty bouncer, judgement included) | 50.1 |
+| request ticket cycle | 45.4 |
+| one `Arc` allocation per request (for comparison) | 27.8 |
+| judgement, nothing configured | 8.7 |
+| judgement, allow list and proxies | 10.3 |
+| judgement, 1,000,000 bans | 36.5 |
+| judgement, 1,000,000 bans and the administrator set | 41.8 |
+| `door_at` without the rate budget, admitted / random peers | 89.6 / 123.6 |
+| `Bouncer::now` | 26.0 |
 
-The ticket is cheaper than the composition's revocable handle (about 47 ns of `Arc` and `DashMap`). The ban lookup with 1,000,000 bans costs about 26 ns over an empty bouncer: one group read for all of an address's lengths, hashed with a keyed multiply mix. For random peers the two rate checks cost about 36 ns, more than the ban lookup: the client's slot and the prefix's slot sit in two tables and both miss the cache.
+The same loaded run as the table above. The ticket is cheaper than the composition's revocable handle (about 47 ns of `Arc` and `DashMap`). The ban lookup with 1,000,000 bans costs about 28 ns over an empty bouncer: one group read for all of an address's lengths, hashed with a keyed multiply mix. The two rate checks cost 7 to 18 ns for random peers across runs now that each key's state sits beside it in one slot (about 36 ns before D-106). What is left for random peers over admitted ones is mostly the ban table's cache miss, about 34 ns without a rate budget.
 
 ## Checkpoints and revocation storms
 
@@ -93,7 +93,7 @@ A checkpoint is as cheap as reading a flag (PLAN 11: within 10% of an `AtomicBoo
 | checkpoint slow path under 150 ns with 7 keys | p50 64.4 ns, p99 96.2 ns | met |
 | before commit under 5 ns | 0.2 ns | met |
 | transport egress under 3 ns | 1.3 ns | met |
-| door, 1,000,000 bans and 10,000 administrator prefixes: under 100 ns p99 | 92.1 ns per call (fastest round, admitted), median round 99.9; per-call p99 needs a nanosecond timer (`Instant` on Windows resolves 100 ns) | open |
+| door, 1,000,000 bans and 10,000 administrator prefixes: under 100 ns p99 | 92.1 ns per call on a lightly loaded machine (fastest round, admitted), median round 99.9; per-call p99 needs a nanosecond timer (`Instant` on Windows resolves 100 ns) | open, 0.9.0 |
 | ticket issue and release under 40 ns median, 32 threads | 41.0 ns, one thread; 32 threads not measured | open |
 | bind under 30 ns each | about 27 ns (request and session bind 68.0, request alone 41.0) | met |
 | revoke under 1 µs | 83.4 ns (account) | met |
@@ -123,27 +123,29 @@ Tried and reverted, because pinned measurement showed them slower: a two-pass pr
 
 ## What 0.8 changed
 
-The 0.7.0 and 0.8 binaries run alternately on the same core, ten rounds each, fastest round kept:
+The 0.7.0 and 0.8 binaries run alternately on the same core, ten rounds each, fastest round kept, with the machine under full load from other work (both sides saw the same load; the composition rows moved under 1%):
 
 | Case | 0.7.0 | 0.8 | Change |
 |---|---|---|---|
-| `door_at`, admitted | 112.7 | 92.1 | -18% |
-| `door`, admitted | 139.1 | 120.4 | -13% |
-| `door_at`, random peers | 150.3 | 133.3 | -11% |
-| `door_at`, banned | 68.8 | 55.5 | -19% |
-| judgement, 1,000,000 bans and the administrator set | 58.9 | 39.3 | -33% |
-| ticket issue and release | 45.7 | 43.0 | -6% |
-| revoke (account) | 111.5 | 83.4 | -25% |
-| ban insert, fastest round while the table fills | 313.8 | 330.7 | +5% |
+| `door_at`, admitted | 126.0 | 101.6 | -19% |
+| `door`, admitted | 155.8 | 131.6 | -16% |
+| `door_at`, random peers | 149.2 | 130.8 | -12% |
+| `door`, random peers | 284.1 | 170.0 | -40% |
+| `door_at`, banned | 74.8 | 67.0 | -10% |
+| judgement, 1,000,000 bans and the administrator set | 63.3 | 41.8 | -34% |
+| ticket issue and release | 49.5 | 50.1 | +1% |
+| revoke (account) | 185.8 | 149.5 | -20% |
+| ban insert, fastest round while the table fills | 450.6 | 500.2 | +11% (+5% on a lightly loaded machine) |
 | memory per ban | 56.0 B | 37.7 B | -33% |
+| memory per key of a rate budget | 88 B | 16 B | -82% |
 
-What did it: the ban table hashes with a keyed multiply mix instead of SipHash and is rebuilt under a fresh key if an insert reaches the probe bound (PLAN D-102); an address's keys from its family's shortest automatic length on share one probe sequence, so a lookup reads one group for all of them (D-104); each length's key is built once, keys past the anchor are tagged by an unkeyed multiply, and the first table and the allow list are read without a thread-local access; slots are 32 bytes, with keys that fit one word stored exactly and longer keys as keyed fingerprints (D-105). Ban insert pays about 5% for the fingerprint and the originals kept beside the table.
+What did it: the ban table hashes with a keyed multiply mix instead of SipHash and is rebuilt under a fresh key if an insert reaches the probe bound (PLAN D-102); an address's keys from its family's shortest automatic length on share one probe sequence, so a lookup reads one group for all of them (D-104); each length's key is built once, keys past the anchor are tagged by an unkeyed multiply, and the first table and the allow list are read without a thread-local access; slots are 32 bytes, with keys that fit one word stored exactly and longer keys as keyed fingerprints (D-105); a budget key's state sits beside it in one slot, under rate-net's `GcraParams` shared by the tier (D-106, D-110). Ban insert pays about 5% for the fingerprint and the originals kept beside the table.
 
-Tried and dropped: connection release without its link swap (loom model L-7 fails without it, D-103); a per-thread stash of free connection cells, and budgets reusing the lookup's prefix hash (no gain measured); the ticket owner releasing with a plain load and store (loom model L-5 rejects it); loading the budget slots before the ban lookup, again on the new table (random peers +26%, banned peers +92%).
+Tried and dropped: connection release without its link swap (loom model L-7 fails without it, D-103); a per-thread stash of free connection cells, and budgets reusing the lookup's prefix hash (no gain measured); the ticket owner releasing with a plain load and store (loom model L-5 rejects it); loading the budget slots before the ban lookup, again on the new table (random peers +26%, banned peers +92%); touching the prefix tier's slot after the ban lookup, before the client tier's locked update (no gain measured).
 
 ## The NFR-10 target
 
-NFR-10 (PLAN D-081, decided by James): the door at least 20% faster than the same-job composition, which means about 89 ns admitted and about 93 ns for random peers on this host. At 0.8 the door is at 92.1 and 133.3: 17% faster than the composition admitted, 1.15 times slower for random peers. The target is not met. For random peers the largest remaining cost is the two rate checks (about 36 ns, two cache misses); what is left, and what each step is expected to give, is in `dev/ROADMAP.md`.
+NFR-10 (PLAN D-081, decided by James): the door at least 20% faster than the same-job composition, At 0.8 `door_at` is 15% faster than the composition admitted and within 3% of it for random peers (101.6 against 119.8 ns, and 130.8 against 126.6 ns, in the same loaded run). The target is not met; the 0.9.0 polish milestone takes it up on a quiet machine, and what is left, with what each step is expected to give, is in `dev/ROADMAP.md`.
 
 ## The regression gate
 

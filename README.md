@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: <code>0.7.0</code> (hardening).</strong> Feature complete since <code>0.5.0</code>; 0.6 made the door 24% faster, tickets 47% faster, and binds 70% faster (measurements in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>). 0.7 tested every threat and edge case of the plan, fuzzed and soaked for 24 hours with no findings, and made sharing across nodes converge; threats and defences are in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>. The net-io integration comes next. See <a href="./docs/API.md"><code>docs/API.md</code></a>, <a href="./docs/INTEGRATION.md"><code>docs/INTEGRATION.md</code></a>, <a href="./docs/ARCHITECTURE.md"><code>docs/ARCHITECTURE.md</code></a>, and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: <code>0.8.0</code> (alpha).</strong> Works behind a real server: the <code>net-io</code> feature makes bouncer net-io's gate, and <a href="./examples/guarded_http.rs"><code>examples/guarded_http.rs</code></a> runs it on serve-net. 0.8 redesigned the ban table (a third less memory per ban, the door 19% faster) and replayed hostile traffic against it (measurements in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>, threats and defences in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>). A pre-1.0 polish pass comes next. See <a href="./docs/API.md"><code>docs/API.md</code></a>, <a href="./docs/INTEGRATION.md"><code>docs/INTEGRATION.md</code></a>, <a href="./docs/ARCHITECTURE.md"><code>docs/ARCHITECTURE.md</code></a>, and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -40,7 +40,7 @@
 
 ```toml
 [dependencies]
-bouncer-io = "0.7"
+bouncer-io = "0.8"
 ```
 
 <hr>

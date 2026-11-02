@@ -123,7 +123,7 @@ Exit:
 - [x] A logged-in browser whose session is revoked mid-request gets the generic denial and its connection is closed (`tests/net_io.rs`, `tests/serve_net.rs`: the generic denial and nothing of the body, then the connection closes; a real browser, 2026-11-02).
 - [x] A streamed response cut by revocation leaks at most one chunk (loopback capture: nothing after the revocation reaches the client).
 - [x] serve-net running with bouncer on Windows and WSL (serve-net 0.3).
-- [ ] NFR-10: the door 20% faster than the same-job composition, admitted and random peers (PLAN D-081).
+- [ ] NFR-10: the door 20% faster than the same-job composition, admitted and random peers (PLAN D-081). Not met at 0.8; moved to 0.9.0 (see Moves recorded).
 
 NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core; the totals, 0.7.0 against this branch, are in `docs/PERFORMANCE.md`):
 
@@ -140,15 +140,17 @@ NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core; the totals, 0.
 | budgets reusing the lookup's prefix hash | dropped: no gain measured |
 | the budget cells loaded before the ban lookup, so their misses overlap | dropped: random peers +26%, banned peers +92% (a banned peer now pays for cells it never needed) |
 | budget slots carrying their payload: a rate key's arrival time and a concurrency count beside the key, GCRA parameters shared by the tier (D-106) | `door_at` random peers -13%, `door` random peers -18%, admitted -13% (machine under full load; relative only); a rate key 88 -> 16 B |
+| the prefix tier's slot touched before the client tier's locked update, so the two misses overlap | dropped: `door_at` random peers +12.5%, `door` random peers -2.2%, the rest within noise (machine under full load) |
 | a fast clock for `door` | not in clock-lib: its directives put timers out of scope and forbid `unsafe` (no timestamp counter); `door_at` with the transport's accept time is the fast path |
 
-Where it stands (0.7.0 against this branch, 10 alternating rounds): `door_at` admitted 112.7 -> 92.1 ns against the composition's 110.7 (17% faster; the target is 20%, about 89 ns); random peers 150.3 -> 133.3 against 115.9 (1.15 times slower; the target is about 93 ns); banned 68.8 -> 55.5. For random peers the parts are: ticket 43 ns, judgement with 1,000,000 bans 34 ns, the two rate checks about 36 ns (the client's and the prefix's slots, in two tables, both missing the cache).
+Where it stands (0.7.0 against 0.8, 10 alternating rounds under full load from other work): `door_at` admitted 126.0 -> 101.6 ns against the composition's 119.8 (15% faster; the target is 20%); random peers 149.2 -> 130.8 against 126.6 (within 3%; the target is 20% faster); banned 74.8 -> 67.0. For random peers the parts are: ticket about 50 ns, judgement with 1,000,000 bans about 37 ns, the two rate checks 7 to 18 ns across runs (about 36 before D-106). Over admitted peers, a random peer pays about 34 ns without any rate budget: mostly the ban table's cache miss.
 
 Next steps (estimates until built and measured):
 
 | Step | Expected | Cost and risk |
 |---|---|---|
-| a client's budget slot in its prefix's probe sequence (the D-104 anchor applied to the budget tables), so one cache miss serves both rate checks; after D-106 each tier misses once, so this saves one more | random peers -8 to -12 ns [est.] | reclaiming idle slots must not let a prefix's clients push out the prefix's own slot; the per-prefix fairness of T-4 must hold; loom again for the claim path |
+| a smaller ban table index, or the first group's tag word kept with less to miss, so a random peer's lookup costs less than one full miss (the ban table is now the largest part of what random peers pay over admitted ones) | random peers -10 to -20 ns [est.] | a table layout change; loom and fuzz again |
+| a client's budget slot in its prefix's probe sequence (the D-104 anchor applied to the budget tables), so one cache miss serves both rate checks | random peers -3 to -8 ns [est.]; the rate checks cost 7 to 18 ns in all since D-106 | reclaiming idle slots must not let a prefix's clients push out the prefix's own slot; the per-prefix fairness of T-4 must hold; loom again for the claim path |
 | the ticket cell and its connection id written in one cache line on issue | admitted -3 to -5 ns [est.] | a cell layout change; loom L-5 and L-7 again |
 
 ## v0.9.0 - Pre-1.0 polish
@@ -185,6 +187,7 @@ Exit:
 - Challenge verdict and proof-of-work verifier; kernel-drop export; tarpit mode; ASN keys once a data source is chosen.
 
 ## Moves recorded
+- 2026-11-02: NFR-10 moves from the 0.8 exit to the 0.9.0 polish milestone, which James set to revisit it (D-111). Reason: what is left needs a change of table layout, mostly the ban table's cache miss for an unknown peer, and measurement on a quiet machine (the machine has been under full load from other work since D-106, so a step of a few nanoseconds cannot be told from noise); the cheap steps have been tried and measured, and every other 0.8 exit is met.
 - 2026-10-23: T-12 (checkpoint p99 under a revocation storm) moves from 0.4 to 0.6. Reason: it is a latency benchmark, and 0.6 is where the benchmarks run on a quiet machine; the storm's correctness (every revocation applies, the excess is reported) is tested at 0.4.
 - 2026-10-23: identity throttles (session, account) move from 0.4 to 0.5 with lane and tenant budgets, and `set_posture` with its budget halving to 0.5. Reason: each acts on budgets that land at 0.5. `Throttle` on a source works at 0.4.
 - 2026-10-23: the door's 100 ns p99 target moves from the 0.3 exit to 0.6, where it already stands as an exit. Reason: measured at 0.3 on a shared machine (PLAN 11.1), the door costs 230-360 ns per call with 1,000,000 bans and random peers. The cost is ticket issue and release (about 70 ns), hashing (about 30 ns per probe), and TLB and cache misses into a 60 MiB table. The fixes are optimisation work: 8-byte keys and 32-byte slots, the O-8 hash decision, fewer atomic operations per ticket, and measurement on a quiet machine.
