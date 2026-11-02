@@ -121,6 +121,20 @@ fn client(addr: SocketAddr) -> TcpStream {
     c
 }
 
+/// Everything a refused client sees. The reset can reach it before `connect`
+/// returns, and then the connect is what reports it.
+fn refused(addr: SocketAddr, sent: &[u8]) -> (Vec<u8>, Result<(), std::io::ErrorKind>) {
+    let mut c = match TcpStream::connect(addr) {
+        Ok(c) => c,
+        Err(e) => return (Vec::new(), Err(e.kind())),
+    };
+    c.set_read_timeout(Some(WAIT)).expect("timeout");
+    let _ = c.write_all(sent);
+    let mut got = Vec::new();
+    let r = c.read_to_end(&mut got);
+    (got, r.map(|_| ()).map_err(|e| e.kind()))
+}
+
 fn eventually(mut f: impl FnMut() -> bool) -> bool {
     let until = Instant::now() + WAIT;
     while Instant::now() < until {
@@ -148,10 +162,7 @@ fn test_net_io_banned_client_is_refused_at_the_door() {
         .ban("127.0.0.1".parse::<IpAddr>().unwrap())
         .expect("ban");
     let refused_before = server.stats().refused;
-    let mut c = client(addr);
-    let _ = c.write_all(b"chunk\n");
-    let mut got = Vec::new();
-    let _ = c.read_to_end(&mut got);
+    let (got, _) = refused(addr, b"chunk\n");
     assert!(got.is_empty(), "a refused client reads nothing: {got:?}");
     assert!(eventually(|| server.stats().refused > refused_before));
 }
@@ -321,16 +332,13 @@ fn test_net_io_every_refusal_is_the_same_close() {
     let mut got = [0u8; CHUNK];
     held.read_exact(&mut got).expect("read");
 
-    let refused = |c: &mut TcpStream| {
-        let mut buf = Vec::new();
-        let r = c.read_to_end(&mut buf);
-        (buf, r.map(|_| ()).map_err(|e| e.kind()))
-    };
-    let over_budget = refused(&mut client(addr));
+    // Nothing is sent: a write can take the reset, leaving the read a plain
+    // end of stream.
+    let over_budget = refused(addr, b"");
     bouncer
         .ban("127.0.0.1".parse::<IpAddr>().unwrap())
         .expect("ban");
-    let banned = refused(&mut client(addr));
+    let banned = refused(addr, b"");
     assert_eq!(over_budget, banned, "one close for every reason");
     assert!(banned.0.is_empty(), "a refused client reads nothing");
     assert!(eventually(|| server.stats().refused == 2));

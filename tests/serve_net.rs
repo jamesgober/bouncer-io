@@ -194,6 +194,19 @@ fn response(c: &mut TcpStream) -> String {
     String::from_utf8_lossy(&got).into_owned()
 }
 
+/// What a refused browser reads. The reset can reach it before `connect`
+/// returns, and then the connect is what reports it.
+fn refused(addr: SocketAddr, sent: &[u8]) -> String {
+    let mut c = match TcpStream::connect(addr) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return String::new(),
+        Err(e) => panic!("connect: {e}"),
+    };
+    c.set_read_timeout(Some(WAIT)).expect("timeout");
+    let _ = c.write_all(sent);
+    response(&mut c)
+}
+
 #[test]
 fn test_serve_net_banned_browser_is_refused_at_the_door() {
     let bouncer = Bouncer::new();
@@ -208,9 +221,7 @@ fn test_serve_net_banned_browser_is_refused_at_the_door() {
     bouncer
         .ban("127.0.0.1".parse::<IpAddr>().unwrap())
         .expect("ban");
-    let mut c = client(addr);
-    let _ = c.write_all(&get(1));
-    let page = response(&mut c);
+    let page = refused(addr, &get(1));
     assert!(page.is_empty(), "a banned browser reads nothing: {page}");
     drop(running);
 }
