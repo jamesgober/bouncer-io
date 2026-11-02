@@ -381,7 +381,7 @@ pub fn revoke(&self, target: impl Into<Target>, reason: Reason) -> Result<Revoca
 
 Tier 1 · P0 · 0.4 · under 1 µs [est.]; visible to every core within the hardware coherence time (tens of nanoseconds)
 
-Stops what is running now. Every ticket that carries the target key is denied at its next checkpoint; a checkpoint that begins after `revoke` has returned on any thread cannot miss it. The target converts from a [`ConnId`](#connid-requestid-accountkey-tenantkey), `RequestId`, `SessionKey`, `AccountKey`, `TenantKey`, `FingerprintKey`, `Cidr`, or address. The actor is [`Actor::App`](#actor), the mode is `AtCheckpoint`, a revoked request takes its connection with it, and no ban is added. For any other choice use [`apply`](#apply).
+Stops what is running now. Every ticket that carries the target key is denied at its next checkpoint; a checkpoint that begins after `revoke` has returned on any thread cannot miss it. A revocation is not a ban: a connection admitted after it is not reached (a key bound after it is refused by the bind), so use [`Directive::revoke_and_ban`](#directive) to keep a source out. The target converts from a [`ConnId`](#connid-requestid-accountkey-tenantkey), `RequestId`, `SessionKey`, `AccountKey`, `TenantKey`, `FingerprintKey`, `Cidr`, or address. The actor is [`Actor::App`](#actor), the mode is `AtCheckpoint`, a revoked request takes its connection with it, and no ban is added. For any other choice use [`apply`](#apply).
 
 A revocation is not a ban: it ends running work. A connection that comes back is judged at the door as usual unless a ban was also set.
 

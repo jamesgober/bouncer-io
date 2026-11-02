@@ -79,6 +79,8 @@ net-io = { version = "0.3", optional = true }
 [dev-dependencies]
 criterion = { version = "0.7", default-features = false }
 proptest = { version = "1", default-features = false, features = ["std"] }
+# A real HTTP server for the net-io tests and the guarded_http example.
+serve-net = "0.3"
 # Comparison benchmarks only (benches/comparison.rs): never in the library.
 dashmap = "6"
 governor = "0.10"
@@ -86,6 +88,13 @@ prefix-trie = { version = "0.10", default-features = false }
 
 [target.'cfg(bouncer_loom)'.dev-dependencies]
 loom = "0.7"
+
+
+# EXAMPLES
+# #################################
+[[example]]
+name              = "guarded_http"
+required-features = ["net-io"]
 
 
 # BENCHMARKS

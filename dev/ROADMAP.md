@@ -115,12 +115,14 @@ Status: the `net-io` feature is built and tested over loopback (`tests/net_io.rs
 | credential stuffing from a /48, a new /64 per attempt | 80 attempts, then the /48 banned (8 s) | 600 admitted from the next /48, none refused |
 | CGNAT: 2,000 users behind one address, 100 connections a second; one of them guesses passwords | 5 requests served, then session and account banned | 12,000 admitted, none refused |
 
-serve-net running with bouncer, and the same traces through it, wait for serve-net's first release: it is not on crates.io, and a path dependency is not allowed (each repository builds alone in CI).
+serve-net 0.3 runs with bouncer on Windows and WSL (`tests/serve_net.rs`, `examples/guarded_http.rs`): bouncer as its gate, and a checkpoint before each reply. Checked in a real browser on 2026-11-02: a logged-in page loads; after a revocation the same page is the generic 403; after `revoke_and_ban` the browser's load fails with no response, its keep-alive connection included; after a lift it loads again. That check found a defect, fixed test-first: a revocation kept catching connections admitted after it, so a revoked address stayed locked out and a lift could not clear it (D-112). The replay traces stay at the door and ticket level: a whole /48 or a CGNAT population cannot be sourced from one machine's loopback without PROXY headers, which net-io parses from 0.4.
+
+The two items moved here from 0.7 are closed: edge case 47's loopback half (`test_net_io_slow_reader_is_aborted_without_waiting_for_it`) and T-8's network-level check (`test_net_io_every_refusal_is_the_same_close`).
 Exit:
-- [x] A browser on localhost banned by an admin call is refused at the door (`tests/net_io.rs`, a net-io server on loopback; the browser itself is checked with serve-net).
-- [x] A logged-in browser whose session is revoked mid-request gets the generic denial and its connection is closed (`tests/net_io.rs`: the session's denial and nothing of the body, then a reset).
+- [x] A browser on localhost banned by an admin call is refused at the door (`tests/net_io.rs`, `tests/serve_net.rs`; a real browser, 2026-11-02).
+- [x] A logged-in browser whose session is revoked mid-request gets the generic denial and its connection is closed (`tests/net_io.rs`, `tests/serve_net.rs`: the generic denial and nothing of the body, then the connection closes; a real browser, 2026-11-02).
 - [x] A streamed response cut by revocation leaks at most one chunk (loopback capture: nothing after the revocation reaches the client).
-- [ ] serve-net running with bouncer on Windows and WSL (waits for serve-net's first release).
+- [x] serve-net running with bouncer on Windows and WSL (serve-net 0.3).
 - [ ] NFR-10: the door 20% faster than the same-job composition, admitted and random peers (PLAN D-081).
 
 NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core; the totals, 0.7.0 against this branch, are in `docs/PERFORMANCE.md`):
@@ -157,10 +159,10 @@ Items:
   - The door's 100 ns p99, measured per call (needs a nanosecond timer; measured so far as the fastest and median rounds only).
   - Ticket issue and release at 32 threads (PLAN 11; measured at one thread only).
   - Ban insert about 5% slower since D-105 (the fingerprint and the originals beside the table).
-  - Edge case 47's loopback half (the transport aborting a slow reader after the flush deadline; `NetIoEjector` closes after-flush ejections as aborts).
-  - T-8's network-level check (the same abortive close after every refusal decision, D-093).
-  - `readmit` through a real server once net-io parses PROXY headers (tested by a direct call at 0.8).
-  - serve-net running with bouncer, and the replay traces through it, if 0.8 could not (serve-net unreleased).
+  - net-io 0.4 and later: move the feature once serve-net has, then `readmit` through a real server with PROXY headers (tested by a direct call at 0.8), and the replay traces through serve-net with PROXY-named sources.
+  - `NetIoEjector` closes after-flush ejections as aborts (net-io has no flush-then-close by id), so a denial on an ejected connection is not delivered.
+  - serve-net's envelope carries the connection id and not the gate's tag: an integration keeps its own map from one to the other (`examples/guarded_http.rs`). Ask serve-net for the tag.
+  - serve-net answers a gate denial with 403 unless the code is an HTTP status, so bouncer's `Unavailable` and `TooManyRequests` denials reach an HTTP client as 403.
   - The limits recorded with D-105 (19-bit slot version, long-key fingerprints), D-106 (slot alignment), D-108 (prefix strike bans of many people's strikes), D-109 (a shared address gets its prefix's door budget), and persistence rollback (not covered, `docs/SECURITY.md`).
 - A fresh performance pass on a quiet machine: every PLAN 11 target and both compositions re-measured, profiles of the door, ticket, bind, and insert paths, and every idea the profiles suggest tried by pinned A/B (kept or dropped with the numbers recorded).
 - The security and edge-case review run again in full: every threat of PLAN 8 and every edge case of PLAN 13 against the code as it is then, an adversarial review of everything changed since 0.7, and the fuzz targets and the soak for 24 hours on the final code.

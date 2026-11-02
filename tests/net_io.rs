@@ -3,7 +3,8 @@
 //! A banned client is refused at the door; a request whose session is
 //! revoked before its response starts gets the generic denial and its
 //! connection is closed; a streamed response cut by revocation leaks at most
-//! the chunk in flight.
+//! the chunk in flight; every refusal is the same close on the wire (T-8); a
+//! slow reader is aborted without waiting for it (edge case 47).
 
 #![cfg(feature = "net-io")]
 
@@ -26,12 +27,14 @@ fn session_key() -> SessionKey {
 }
 
 /// A line protocol: `open` starts a request bound to the session (nothing
-/// is written), `chunk` writes one chunk of its response, `end` ends it.
+/// is written), `chunk` writes one chunk of its response, `end` ends it,
+/// `flood` writes for as long as the client takes it.
 struct Paced {
     bouncer: Bouncer,
     conn: TicketTag,
     request: Option<Ticket>,
     next: u128,
+    flood: bool,
     opened: mpsc::Sender<()>,
 }
 
@@ -66,10 +69,23 @@ impl Session for Paced {
                     cx.output().end_response();
                     self.request = None;
                 }
+                b"flood" => {
+                    self.flood = true;
+                    let _ = cx.output().push(&[b'f'; CHUNK]);
+                    write = true;
+                }
                 _ => return Step::Abort,
             }
         }
         if write { Step::Write } else { Step::Read }
+    }
+
+    fn on_writable(&mut self, cx: &mut SessionContext<'_>) -> Step {
+        if !self.flood {
+            return Step::Read;
+        }
+        while cx.output().push(&[b'f'; CHUNK]).is_ok() {}
+        Step::Write
     }
 
     fn on_denied(&mut self, code: u16, output: &mut Output) {
@@ -88,6 +104,7 @@ fn server(bouncer: &Bouncer) -> (Server, SocketAddr, mpsc::Receiver<()>) {
             conn: TicketTag::from(info.gate),
             request: None,
             next: 0,
+            flood: false,
             opened: tx.clone(),
         })
         .gate(bouncer.clone())
@@ -288,4 +305,70 @@ fn test_net_io_misbehaviour_close_is_a_strike() {
         "a slow peer close counts as a strike: {ex:?}"
     );
     assert_eq!(bouncer.health().tickets_live, 0);
+}
+
+#[test]
+fn test_net_io_every_refusal_is_the_same_close() {
+    // T-8 on the wire: a peer cannot tell a ban from a spent budget.
+    use bouncer_io::Budgets;
+    let bouncer = Bouncer::builder()
+        .budgets(Budgets::off().door_concurrency(1, 1))
+        .try_build()
+        .expect("bouncer");
+    let (server, addr, _rx) = server(&bouncer);
+    let mut held = client(addr);
+    held.write_all(b"chunk\n").expect("write");
+    let mut got = [0u8; CHUNK];
+    held.read_exact(&mut got).expect("read");
+
+    let refused = |c: &mut TcpStream| {
+        let mut buf = Vec::new();
+        let r = c.read_to_end(&mut buf);
+        (buf, r.map(|_| ()).map_err(|e| e.kind()))
+    };
+    let over_budget = refused(&mut client(addr));
+    bouncer
+        .ban("127.0.0.1".parse::<IpAddr>().unwrap())
+        .expect("ban");
+    let banned = refused(&mut client(addr));
+    assert_eq!(over_budget, banned, "one close for every reason");
+    assert!(banned.0.is_empty(), "a refused client reads nothing");
+    assert!(eventually(|| server.stats().refused == 2));
+}
+
+#[test]
+fn test_net_io_slow_reader_is_aborted_without_waiting_for_it() {
+    // Edge case 47: a client that stopped reading with output pending holds
+    // no write for the gate to deny; an ejection closes it all the same,
+    // and the client is not waited for.
+    let ejector = std::sync::Arc::new(bouncer_io::NetIoEjector::new());
+    let bouncer = Bouncer::builder()
+        .ejector(ejector.clone())
+        .try_build()
+        .expect("bouncer");
+    let (server, addr, _rx) = server(&bouncer);
+    assert!(ejector.attach(server.handle()));
+    let mut c = client(addr);
+    c.write_all(b"flood\n").expect("write");
+    let mut first = [0u8; CHUNK];
+    c.read_exact(&mut first).expect("read");
+    // Stop reading until the server's socket buffers fill: sent stops moving.
+    let mut sent = server.stats().bytes_out;
+    let mut still = 0;
+    while still < 40 {
+        std::thread::sleep(Duration::from_millis(5));
+        let now = server.stats().bytes_out;
+        still = if now == sent { still + 1 } else { 0 };
+        sent = now;
+    }
+
+    let start = Instant::now();
+    bouncer
+        .apply(bouncer_io::Directive::revoke("127.0.0.1".parse::<IpAddr>().unwrap()).eject_now())
+        .expect("apply");
+    assert!(eventually(|| server
+        .stats()
+        .closed_for(CloseReason::Killed(bouncer_io::EJECTED))
+        == 1));
+    assert!(start.elapsed() < WAIT, "closed without the client reading");
 }

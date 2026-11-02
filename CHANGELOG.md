@@ -13,10 +13,12 @@
 
 ### Added
 
+- `examples/guarded_http.rs`: a small site behind bouncer on serve-net, with an administrator's port.
 - Feature `net-io`: bouncer as net-io's `Gate` (the door at accept, the client a trusted PROXY header names, the egress check before every write, strikes for slow-peer, PROXY, and TLS failures at close), `ConnectionGate`, the id, tag, and prefix conversions, and `NetIoEjector`, attached to a server after both are built.
 
 ### Fixed
 
+- A revocation no longer catches connections admitted after it. An address that was revoked stayed locked out until maintenance removed the entry, forever on a bouncer with no maintainer, and a lift could not clear it. A revocation stops what is running; `Directive::revoke_and_ban` keeps a source out.
 - Credential stuffing that moves to a new IPv6 /64 (or IPv4 address) for every attempt is banned at its /48 (or /24). Strikes also count at the widest escalation prefix, against the strikes escalation would need to get there (80 for an IPv6 /48 and 40 for an IPv4 /24 at the default threshold). Before, every source's counter stayed at one and nothing was banned.
 - The people behind one carrier-grade NAT address are no longer refused as one client: an address flagged as shared is held to its prefix's door budget instead of one client's, throttled or not, so one person behind a NAT cannot get everyone behind it refused.
 
