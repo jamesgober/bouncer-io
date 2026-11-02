@@ -122,6 +122,15 @@ fn main() {
     let conn = f.bouncer.door(f.admitted[0]).unwrap();
     let mut req = conn.request(RequestId(1)).unwrap();
     let flag = Arc::new(AtomicBool::new(false));
+    row(
+        "datagram with both rate tiers, admitted",
+        measure(|i| {
+            let _ = black_box(
+                f.bouncer
+                    .datagram(black_box(f.admitted[i & 4095]), true, now),
+            );
+        }),
+    );
     let no_rate = fixture::build(Budgets::off(), 10_000);
     row(
         "door_at, no rate budget, admitted",
@@ -129,6 +138,18 @@ fn main() {
             let t = no_rate.bouncer.door_at(
                 ConnId(i as u64),
                 black_box(no_rate.admitted[i & 4095]),
+                Provenance::Socket,
+                now,
+            );
+            black_box(t.is_ok());
+        }),
+    );
+    row(
+        "door_at, no rate budget, random",
+        measure(|i| {
+            let t = no_rate.bouncer.door_at(
+                ConnId(i as u64),
+                black_box(random[i & 0xffff]),
                 Provenance::Socket,
                 now,
             );
@@ -153,6 +174,18 @@ fn main() {
             let t = no_admin.bouncer.door_at(
                 ConnId(i as u64),
                 black_box(no_admin.admitted[i & 4095]),
+                Provenance::Socket,
+                now,
+            );
+            black_box(t.is_ok());
+        }),
+    );
+    row(
+        "door_at, no rate, no admin set, random",
+        measure(|i| {
+            let t = no_admin.bouncer.door_at(
+                ConnId(i as u64),
+                black_box(random[i & 0xffff]),
                 Provenance::Socket,
                 now,
             );

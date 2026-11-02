@@ -173,7 +173,7 @@ impl Shared {
     /// the socket peer), allow list, ban memory.
     #[inline]
     pub(crate) fn judge(&self, peer: IpAddr, provenance: Provenance, now: Now) -> Judgement {
-        let mut hashes = crate::bans::AddrHashes::new(self.bans.hasher(), peer);
+        let mut hashes = crate::bans::AddrHashes::new(peer);
         self.judge_hashed(peer, provenance, now, &mut hashes)
     }
 

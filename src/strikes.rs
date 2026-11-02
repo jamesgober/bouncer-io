@@ -371,11 +371,12 @@ impl Counters {
 
     /// The counter key of a source: its IPv4 address or IPv6 /64.
     pub(crate) fn source_key(&self, kind: StrikeKind, addr: IpAddr) -> u64 {
-        let host = Cidr::host(addr);
-        let p = match host.family() {
-            Family::V4 => host,
-            Family::V6 => host.parent(64).unwrap_or(host),
-        };
+        self.prefix_key(kind, &source_of(addr))
+    }
+
+    /// The counter key of a prefix (a source, or the prefix a source's
+    /// strikes also count at).
+    pub(crate) fn prefix_key(&self, kind: StrikeKind, p: &Cidr) -> u64 {
         Claims::key(self.key.hash3(
             (kind.code() << 8) | u64::from(p.len()),
             (p.bits() >> 64) as u64,
@@ -416,7 +417,20 @@ impl Counters {
         key: u64,
         now_secs: u64,
     ) -> Counted {
+        self.add_times(rules, kind, key, now_secs, 1)
+    }
+
+    /// As [`add`](Self::add), against `times` the rule's threshold.
+    pub(crate) fn add_times(
+        &self,
+        rules: &StrikeRules,
+        kind: StrikeKind,
+        key: u64,
+        now_secs: u64,
+        times: u32,
+    ) -> Counted {
         let rule = rules.rules[kind.index()];
+        let threshold = u64::from(rule.threshold).saturating_mul(u64::from(times.max(1)));
         let window = rule.window.as_secs().max(1);
         let cells = &self.cells;
         let idle = |slot: usize| {
@@ -441,7 +455,7 @@ impl Counters {
             let next = count
                 .saturating_add(u64::from(rule.weight))
                 .min(0xffff_ffff);
-            reached = count < u64::from(rule.threshold) && next >= u64::from(rule.threshold);
+            reached = count < threshold && next >= threshold;
             Some((start << 32) | next)
         });
         if reached {
@@ -449,6 +463,15 @@ impl Counters {
         } else {
             Counted::Below
         }
+    }
+}
+
+/// The source a strike counts against: an IPv4 address, an IPv6 /64.
+fn source_of(addr: IpAddr) -> Cidr {
+    let host = Cidr::host(addr);
+    match host.family() {
+        Family::V4 => host,
+        Family::V6 => host.parent(64).unwrap_or(host),
     }
 }
 
@@ -559,6 +582,38 @@ pub(crate) fn strike(
             counters.identity_key(kind, 2, (a.0 >> 64) as u64, a.0 as u64),
             BanKey::Account(a),
         );
+    }
+    // A source's strikes also count at its widest escalation prefix,
+    // against the strikes escalation would need to get there, so an
+    // attacker that moves to a new /64 (or address) before any reaches its
+    // threshold is caught at the prefix all the same (D-108).
+    let mut prefix_due: Option<Cidr> = None;
+    if let Some(src) = subject.source {
+        if let Some((prefix, times)) = shared.bans.strike_prefix(&source_of(src)) {
+            let key = counters.prefix_key(kind, &prefix);
+            match counters.add_times(&shared.strikes, kind, key, now, times) {
+                Counted::Reached => prefix_due = Some(prefix),
+                Counted::Full => full = true,
+                Counted::Below => {}
+            }
+        }
+    }
+    // A prefix is banned only where escalation could ban it: never over an
+    // address flagged as shared (allow-list entries and trusted proxies are
+    // refused by the ban itself).
+    let prefix_due = prefix_due.filter(|p| !shared.sources.any_within(p, now));
+    let extra_prefix = match reached {
+        None => {
+            reached = prefix_due.map(BanKey::Prefix);
+            None
+        }
+        Some(_) => prefix_due,
+    };
+    if let (Some(prefix), Mode::Enforce) = (extra_prefix, mode) {
+        let spec = BanSpec::prefix(prefix)
+            .by(Actor::Local)
+            .because(Reason::STRIKE_THRESHOLD);
+        let _ = shared.ban(&spec, policy);
     }
     let Some(would_ban) = reached else {
         return if full {

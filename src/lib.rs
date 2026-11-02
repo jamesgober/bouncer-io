@@ -67,6 +67,8 @@ mod ledger;
 mod loom_models;
 mod maintain;
 mod metrics;
+#[cfg(feature = "net-io")]
+mod net_io;
 mod persist;
 mod published;
 mod registry;
@@ -82,6 +84,8 @@ mod verdict;
 
 #[cfg(feature = "metrics")]
 pub use crate::metrics::MetricsSnapshot;
+#[cfg(feature = "net-io")]
+pub use crate::net_io::{ConnectionGate, EJECTED, LOCAL_PEER, NetIoEjector, REFUSED};
 pub use crate::{
     admin::{
         BanRecord, BudgetState, Explanation, Filter, Health, Listing, MaintainerState,

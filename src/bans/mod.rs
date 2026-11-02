@@ -24,7 +24,7 @@ use self::{
     compiled::PrefixSet,
     escalate::{EscalationPolicy, Plan, Tracker},
     offenders::{Offence, Offenders},
-    table::{Entry, FLAG_EVICTABLE, Inserted, Probe, Table, TableKey, TableWriter},
+    table::{Entry, FLAG_EVICTABLE, Inserted, Probe, Table, TableKey, TableWriter, Tables},
 };
 use crate::{
     directive::{Actor, ActorKind, Evidence, Reason},
@@ -476,7 +476,9 @@ pub(crate) struct Own {
 
 /// The ban memory of one bouncer.
 pub(crate) struct BanMemory {
-    table: Table,
+    table: Tables,
+    /// Reseeds already reported.
+    reseeds_seen: std::sync::atomic::AtomicU64,
     present_v4: AtomicU64,
     present_v6: [AtomicU64; 3],
     present_ident: AtomicU64,
@@ -496,46 +498,22 @@ pub(crate) struct BanMemory {
     evicted: std::sync::atomic::AtomicU64,
 }
 
-/// The keyed hashes of one address's prefixes, each computed at most once
-/// per door check and shared by the ban lookup and the door budgets.
+/// One normalized address on its way through the door: the ban lookup and
+/// the door budgets read it.
 pub(crate) struct AddrHashes {
     host: Cidr,
-    key: HashKey,
-    lens: [u8; 8],
-    vals: [u64; 8],
-    n: usize,
 }
 
 impl AddrHashes {
     #[inline]
-    pub(crate) fn new(key: HashKey, addr: IpAddr) -> AddrHashes {
+    pub(crate) fn new(addr: IpAddr) -> AddrHashes {
         AddrHashes {
             host: Cidr::host(addr),
-            key,
-            lens: [0; 8],
-            vals: [0; 8],
-            n: 0,
         }
     }
 
     pub(crate) fn host(&self) -> &Cidr {
         &self.host
-    }
-
-    /// The table hash of the address's prefix of length `len`.
-    #[inline]
-    pub(crate) fn get(&mut self, len: u8) -> u64 {
-        if let Some(i) = self.lens[..self.n].iter().position(|&l| l == len) {
-            return self.vals[i];
-        }
-        let p = self.host.parent(len).unwrap_or(self.host);
-        let h = table::hash_key(&self.key, &BanMemory::prefix_key(&p));
-        if self.n < 8 {
-            self.lens[self.n] = len;
-            self.vals[self.n] = h;
-            self.n += 1;
-        }
-        h
     }
 }
 
@@ -575,7 +553,8 @@ impl BanMemory {
             HashKey::new(rng.next_u64(), rng.next_u64()),
         );
         BanMemory {
-            table: Table::new(capacity, key),
+            table: Tables::new(Table::new(capacity, key)),
+            reseeds_seen: std::sync::atomic::AtomicU64::new(0),
             present_v4: AtomicU64::new(0),
             present_v6: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             present_ident: AtomicU64::new(0),
@@ -584,7 +563,7 @@ impl BanMemory {
             admin: RwLock::new(Arc::new(PrefixSet::empty())),
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             writer: Mutex::new(Writer {
-                table: TableWriter::default(),
+                table: TableWriter::new(rng_seed ^ 0x7ab1_e5ee_d000_0001),
                 counts_v4: [0; 33],
                 counts_v6: [0; 129],
                 counts_ident: [0; 16],
@@ -630,9 +609,10 @@ impl BanMemory {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Bytes reserved by the dynamic table.
+    /// Bytes reserved by the dynamic table and the originals of its
+    /// fingerprinted keys.
     pub(crate) fn table_bytes(&self) -> u64 {
-        self.table.bytes()
+        self.table.bytes() + self.lock().table.bytes()
     }
 
     /// Entries the dynamic table holds at most.
@@ -644,6 +624,14 @@ impl BanMemory {
     #[cfg(all(test, not(bouncer_loom)))]
     pub(crate) fn live(&self) -> u32 {
         self.lock().table.live()
+    }
+
+    /// The prefix strikes against `source` (an IPv4 address or IPv6 /64)
+    /// also count at, and the multiple of a kind's threshold it takes there
+    /// (see [`EscalationPolicy::strike_prefix`]).
+    pub(crate) fn strike_prefix(&self, source: &Cidr) -> Option<(Cidr, u32)> {
+        self.escalation
+            .strike_prefix(source, |l| self.is_auto(source.family(), l))
     }
 
     fn is_auto(&self, family: Family, len: u8) -> bool {
@@ -841,7 +829,7 @@ impl BanMemory {
                 // expired, offender memory (with its decay) decides.
                 let held = self
                     .table
-                    .get_owned(k)
+                    .get_owned(&w.table, k)
                     .filter(|e| !e.expired(now_secs))
                     .map(|e| e.offences.saturating_add(1));
                 let remembered = w.offenders.offences(k, now_secs);
@@ -867,7 +855,7 @@ impl BanMemory {
         // stores nothing new (the table stays compact under a flood). An
         // explicit ban is stored anyway, so lifting the prefix keeps it.
         if let (Placement::Dynamic(tkey), true) = (&placement, spec.actor.is_automated()) {
-            if let Some(covering) = self.covering_wider(tkey, until, now_secs) {
+            if let Some(covering) = self.covering_wider(&w.table, tkey, until, now_secs) {
                 return Ok((BanId(covering), None, None, None));
             }
         }
@@ -924,7 +912,7 @@ impl BanMemory {
                         }
                         BanId(id)
                     }
-                    Err(()) => {
+                    Err(_) => {
                         return Err(BouncerError::BanTableFull {
                             capacity: self.table.capacity(),
                         });
@@ -969,13 +957,19 @@ impl BanMemory {
 
     /// The id of an unexpired ban at a shorter automatic length that covers
     /// `tkey` and lasts at least until `until` (0 = permanent).
-    fn covering_wider(&self, tkey: &TableKey, until: u32, now_secs: u64) -> Option<u64> {
+    fn covering_wider(
+        &self,
+        tw: &TableWriter,
+        tkey: &TableKey,
+        until: u32,
+        now_secs: u64,
+    ) -> Option<u64> {
         let c = view::cidr_of(tkey)?;
         (0..c.len())
             .rev()
             .filter(|&l| self.is_auto(c.family(), l))
             .filter_map(|l| c.parent(l))
-            .filter_map(|p| self.table.get_owned(&Self::prefix_key(&p)))
+            .filter_map(|p| self.table.get_owned(tw, &Self::prefix_key(&p)))
             .find(|e| !e.expired(now_secs) && (e.until == 0 || (until != 0 && e.until >= until)))
             .map(|e| e.id)
     }
@@ -992,7 +986,7 @@ impl BanMemory {
         let mut keys = Vec::with_capacity(children.len());
         for c in &children {
             let k = Self::prefix_key(c);
-            if let Some(e) = self.table.get_owned(&k) {
+            if let Some(e) = self.table.get_owned(&w.table, &k) {
                 if e.expired(now_secs) {
                     continue;
                 }
@@ -1030,7 +1024,7 @@ impl BanMemory {
         let writer = &mut *w;
         let mut n = Vec::new();
         for k in children {
-            let Some(e) = self.table.get_owned(k) else {
+            let Some(e) = self.table.get_owned(&writer.table, k) else {
                 continue;
             };
             let outlasts = parent_until != 0 && (e.until == 0 || e.until > parent_until);
@@ -1062,7 +1056,7 @@ impl BanMemory {
         let mut held: Vec<Entry> = plan
             .children
             .iter()
-            .filter_map(|k| self.table.get_owned(k))
+            .filter_map(|k| self.table.get_owned(&writer.table, k))
             .collect();
         if held.len() > quota {
             held.sort_by_key(|e| if e.until == 0 { u32::MAX } else { e.until });
@@ -1220,13 +1214,16 @@ impl BanMemory {
     /// queueing.
     #[inline]
     pub(crate) fn lookup_addr(&self, addr: IpAddr, now_secs: u64) -> Lookup {
-        let mut hashes = AddrHashes::new(self.table.hasher(), addr);
+        let mut hashes = AddrHashes::new(addr);
         self.lookup_hashed(&mut hashes, now_secs)
     }
 
-    /// The table's hash key, for [`AddrHashes`].
-    pub(crate) fn hasher(&self) -> HashKey {
-        self.table.hasher()
+    /// Reseeds since the last call (each is reported once).
+    pub(crate) fn take_reseeds(&self) -> u64 {
+        let now = self.table.reseeds();
+        now - self
+            .reseeds_seen
+            .swap(now, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// As [`lookup_addr`](Self::lookup_addr), through a hash cache the door
@@ -1265,25 +1262,17 @@ impl BanMemory {
                 }
             }
         }
-        let mut starts = [(0usize, 0u8); PROBE_BATCH];
-        for i in 0..count {
-            starts[i] = self.table.locate_hash(hashes.get(lengths[i]));
-        }
-        let mut tags = [0u64; PROBE_BATCH];
-        for i in 0..count {
-            tags[i] = self.table.first_tags(starts[i].0);
-        }
-        for i in 0..count {
-            // The full key is only compared on a tag match.
-            let key = Self::prefix_key(&host.parent(lengths[i]).unwrap_or(host));
-            match self
-                .table
-                .find_at(&key, starts[i].0, starts[i].1, tags[i], now_secs)
-            {
-                Probe::Hit(e) => return Lookup::Banned(e.id),
-                Probe::Busy => busy = true,
-                Probe::Miss => {}
-            }
+        // Nothing banned at any automatic length: no table to read.
+        let hit = (count > 0)
+            .then(|| {
+                self.table
+                    .with(|table| Self::probe_lengths(table, &host, &lengths[..count], now_secs))
+            })
+            .flatten();
+        match hit {
+            Some(Lookup::Busy) => busy = true,
+            Some(found) => return found,
+            None => {}
         }
         if overflow {
             // More automatic lengths in use than one batch: probe the rest
@@ -1304,6 +1293,110 @@ impl BanMemory {
             }
         }
         if busy { Lookup::Busy } else { Lookup::Clear }
+    }
+
+    /// Probes the address's prefix at each of `lengths` (ascending). Every
+    /// length at or past the family's anchor lives in the anchor's probe
+    /// sequence, so one group's tag word serves them all; a crowded anchor
+    /// (its overflow bit set) sends the longer ones to their own sequences
+    /// too. Each length's key is built and hashed once.
+    #[inline]
+    fn probe_lengths(table: &Table, host: &Cidr, lengths: &[u8], now_secs: u64) -> Option<Lookup> {
+        let anchor = match host.family() {
+            Family::V4 => table.anchors().0,
+            Family::V6 => table.anchors().1,
+        };
+        let mut keys = [TableKey {
+            kind: 0,
+            len: 0,
+            k0: 0,
+            k1: 0,
+        }; PROBE_BATCH];
+        let mut spots = [(0usize, 0u8); PROBE_BATCH];
+        let mut home = None;
+        for (i, &len) in lengths.iter().enumerate() {
+            keys[i] = Self::key_at(host, len);
+            spots[i] = match anchor {
+                // Past the anchor: the tag is all a key needs of its own.
+                Some(a) if len > a => (usize::MAX, Table::anchored_tag(&keys[i])),
+                _ => table.locate(&keys[i]),
+            };
+            if Some(len) == anchor {
+                home = Some(spots[i].0);
+            }
+        }
+        // No ban at the anchor length itself: its group still anchors the
+        // longer lengths.
+        if home.is_none() {
+            home = anchor.map(|a| table.locate(&Self::key_at(host, a)).0);
+        }
+        let home_tags = home.map(|g| table.first_tags(g));
+        let mut busy = false;
+        for (i, &len) in lengths.iter().enumerate() {
+            let (g, tags) = match (home, home_tags) {
+                (Some(g), Some(t)) if anchor.is_some_and(|a| len >= a) => (g, t),
+                _ => (spots[i].0, table.first_tags(spots[i].0)),
+            };
+            // The full key is only compared on a tag match.
+            match table.find_at(&keys[i], g, spots[i].1, tags, now_secs) {
+                Probe::Hit(e) => return Some(Lookup::Banned(e.id)),
+                Probe::Busy => busy = true,
+                Probe::Miss => {}
+            }
+        }
+        if let (Some(a), Some(g)) = (anchor, home) {
+            if table.overflowed(g) {
+                for (i, &len) in lengths.iter().enumerate() {
+                    if len <= a {
+                        continue;
+                    }
+                    let own = table.locate(&keys[i]).0;
+                    let tag = spots[i].1;
+                    match table.find_at(&keys[i], own, tag, table.first_tags(own), now_secs) {
+                        Probe::Hit(e) => return Some(Lookup::Banned(e.id)),
+                        Probe::Busy => busy = true,
+                        Probe::Miss => {}
+                    }
+                }
+            }
+        }
+        busy.then_some(Lookup::Busy)
+    }
+
+    /// The table key of `host`'s prefix of length `len` (a host address:
+    /// its bits masked directly, IPv4 in 32-bit arithmetic).
+    #[inline]
+    pub(crate) fn key_at(host: &Cidr, len: u8) -> TableKey {
+        match host.family() {
+            Family::V4 => {
+                let a = host.bits() as u32;
+                let m = if len == 0 {
+                    0
+                } else {
+                    a & (u32::MAX << (32 - u32::from(len.min(32))))
+                };
+                TableKey {
+                    kind: table::KIND_V4,
+                    len,
+                    k0: 0,
+                    k1: u64::from(m),
+                }
+            }
+            Family::V6 => {
+                let b = host.bits();
+                let m = if len == 0 {
+                    0
+                } else {
+                    b & (u128::MAX << (128 - u32::from(len.min(128))))
+                };
+                TableKey {
+                    kind: table::KIND_V6,
+                    len,
+                    k0: (m >> 64) as u64,
+                    k1: m as u64,
+                }
+            }
+        }
     }
 
     /// Probes every length in use that is not in `done`.

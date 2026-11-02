@@ -105,25 +105,89 @@ The 24-hour fuzz and soak runs ran on the final 0.7 code (2026-10-26 to 2026-10-
 ## v0.8.0 - Alpha
 Needs a published net-io 0.3 or later.
 Items: feature `net-io` (`Gate` for `Bouncer`, `ConnectionGate`, conversions, `NetIoEjector`); serve-net running with bouncer on Windows and WSL; the replay harness (scanner, slowloris, credential stuffing from a /48, CGNAT population).
-Exit:
-- [ ] A browser on localhost banned by an admin call is refused at the door.
-- [ ] A logged-in browser whose session is revoked mid-request gets the generic denial and its connection is closed.
-- [ ] A streamed response cut by revocation leaks at most one chunk (loopback capture).
 
-## v0.9.0 - Beta and release candidates
-Items: used end to end by the web stack and one non-HTTP service (a database network layer or the back-channel); API review against the simple-API rule; `cargo-semver-checks` in CI; release candidates `0.9.x`.
+Status: the `net-io` feature is built and tested over loopback (`tests/net_io.rs`, D-107). The replay harness is built (`tests/replay.rs`) and found two defects, both fixed test-first: credential stuffing that moves to a new /64 per attempt was never banned (D-108), and a CGNAT population was refused as one client by the default door budgets (D-109). Results, attacker against innocents:
+
+| Trace | Attacker | Innocents |
+|---|---|---|
+| scanner: one IPv4 address, 20 malformed connections a second for a minute; 50 neighbours in its /24 | 5 admitted, banned at 250 ms | 3,000 admitted, none refused |
+| slowloris: one address, a connection every 10 ms held 30 s until the transport kills it | at most 64 held, banned at 30 s | 4,800 admitted, none refused |
+| credential stuffing from a /48, a new /64 per attempt | 80 attempts, then the /48 banned (8 s) | 600 admitted from the next /48, none refused |
+| CGNAT: 2,000 users behind one address, 100 connections a second; one of them guesses passwords | 5 requests served, then session and account banned | 12,000 admitted, none refused |
+
+serve-net 0.3 runs with bouncer on Windows and WSL (`tests/serve_net.rs`, `examples/guarded_http.rs`): bouncer as its gate, and a checkpoint before each reply. Checked in a real browser on 2026-11-02: a logged-in page loads; after a revocation the same page is the generic 403; after `revoke_and_ban` the browser's load fails with no response, its keep-alive connection included; after a lift it loads again. That check found a defect, fixed test-first: a revocation kept catching connections admitted after it, so a revoked address stayed locked out and a lift could not clear it (D-112). The replay traces stay at the door and ticket level: a whole /48 or a CGNAT population cannot be sourced from one machine's loopback without PROXY headers, which net-io parses from 0.4.
+
+The two items moved here from 0.7 are closed: edge case 47's loopback half (`test_net_io_slow_reader_is_aborted_without_waiting_for_it`) and T-8's network-level check (`test_net_io_every_refusal_is_the_same_close`).
+Exit:
+- [x] A browser on localhost banned by an admin call is refused at the door (`tests/net_io.rs`, `tests/serve_net.rs`; a real browser, 2026-11-02).
+- [x] A logged-in browser whose session is revoked mid-request gets the generic denial and its connection is closed (`tests/net_io.rs`, `tests/serve_net.rs`: the generic denial and nothing of the body, then the connection closes; a real browser, 2026-11-02).
+- [x] A streamed response cut by revocation leaks at most one chunk (loopback capture: nothing after the revocation reaches the client).
+- [x] serve-net running with bouncer on Windows and WSL (serve-net 0.3).
+- [ ] NFR-10: the door 20% faster than the same-job composition, admitted and random peers (PLAN D-081). Not met at 0.8; moved to 0.9.0 (see Moves recorded).
+
+NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core; the totals, 0.7.0 against this branch, are in `docs/PERFORMANCE.md`):
+
+| Step | Result |
+|---|---|
+| keyed multiply mix, reseed at the probe bound (D-102) | judgement with 1,000,000 bans -27%, `door_at` admitted -11% |
+| addresses anchored at their family's shortest automatic length, one group per lookup (D-104) | `door_at` random peers -15% |
+| first table and allow list read without a thread-local access | judgement -10% more |
+| each length's key built once, unkeyed tags past the anchor, direct masks | judgement 55 -> 33 ns in all |
+| 32-byte slots, one-word keys, long keys as keyed fingerprints (D-105) | memory per ban 56.0 -> 37.7 B (NFR-6 met); door within noise; account revocation -20% |
+| connection release without the link swap | dropped: loom L-7 fails without it (D-103) |
+| a per-thread stash of free cells | dropped: no gain measured (the thread-local access costs what the two compare-and-swaps did) |
+| the ticket owner releasing with a load and a store | dropped: loom L-5 rejects it |
+| budgets reusing the lookup's prefix hash | dropped: no gain measured |
+| the budget cells loaded before the ban lookup, so their misses overlap | dropped: random peers +26%, banned peers +92% (a banned peer now pays for cells it never needed) |
+| budget slots carrying their payload: a rate key's arrival time and a concurrency count beside the key, GCRA parameters shared by the tier (D-106) | `door_at` random peers -13%, `door` random peers -18%, admitted -13% (machine under full load; relative only); a rate key 88 -> 16 B |
+| the prefix tier's slot touched before the client tier's locked update, so the two misses overlap | dropped: `door_at` random peers +12.5%, `door` random peers -2.2%, the rest within noise (machine under full load) |
+| a fast clock for `door` | not in clock-lib: its directives put timers out of scope and forbid `unsafe` (no timestamp counter); `door_at` with the transport's accept time is the fast path |
+
+Where it stands (0.7.0 against 0.8, 10 alternating rounds under full load from other work): `door_at` admitted 126.0 -> 101.6 ns against the composition's 119.8 (15% faster; the target is 20%); random peers 149.2 -> 130.8 against 126.6 (within 3%; the target is 20% faster); banned 74.8 -> 67.0. For random peers the parts are: ticket about 50 ns, judgement with 1,000,000 bans about 37 ns, the two rate checks 7 to 18 ns across runs (about 36 before D-106). Over admitted peers, a random peer pays about 34 ns without any rate budget: mostly the ban table's cache miss.
+
+Next steps (estimates until built and measured):
+
+| Step | Expected | Cost and risk |
+|---|---|---|
+| a smaller ban table index, or the first group's tag word kept with less to miss, so a random peer's lookup costs less than one full miss (the ban table is now the largest part of what random peers pay over admitted ones) | random peers -10 to -20 ns [est.] | a table layout change; loom and fuzz again |
+| a client's budget slot in its prefix's probe sequence (the D-104 anchor applied to the budget tables), so one cache miss serves both rate checks | random peers -3 to -8 ns [est.]; the rate checks cost 7 to 18 ns in all since D-106 | reclaiming idle slots must not let a prefix's clients push out the prefix's own slot; the per-prefix fairness of T-4 must hold; loom again for the claim path |
+| the ticket cell and its connection id written in one cache line on issue | admitted -3 to -5 ns [est.] | a cell layout change; loom L-5 and L-7 again |
+
+## v0.9.0 - Pre-1.0 polish
+James's standing rule (2026-10-29): go back and fix every issue and tune performance before the release gets close. Nothing accepted mid-series becomes final without being looked at again here. This milestone comes before the beta and before any release candidate.
+Items:
+- Revisit every accepted gap, deferred item, known issue, and missed target; for each, fix it, or record why it stays and what it costs (each goes into the 1.0 readiness note). As of 0.8:
+  - NFR-10 (PLAN D-081), if 0.8 has not met it: the door 20% faster than the same-job composition, admitted and random peers.
+  - The door's 100 ns p99, measured per call (needs a nanosecond timer; measured so far as the fastest and median rounds only).
+  - Ticket issue and release at 32 threads (PLAN 11; measured at one thread only).
+  - Ban insert about 5% slower since D-105 (the fingerprint and the originals beside the table).
+  - net-io 0.4 and later: move the feature once serve-net has, then `readmit` through a real server with PROXY headers (tested by a direct call at 0.8), and the replay traces through serve-net with PROXY-named sources.
+  - `NetIoEjector` closes after-flush ejections as aborts (net-io has no flush-then-close by id), so a denial on an ejected connection is not delivered.
+  - serve-net's envelope carries the connection id and not the gate's tag: an integration keeps its own map from one to the other (`examples/guarded_http.rs`). Ask serve-net for the tag.
+  - serve-net answers a gate denial with 403 unless the code is an HTTP status, so bouncer's `Unavailable` and `TooManyRequests` denials reach an HTTP client as 403.
+  - The limits recorded with D-105 (19-bit slot version, long-key fingerprints), D-106 (slot alignment), D-108 (prefix strike bans of many people's strikes), D-109 (a shared address gets its prefix's door budget), and persistence rollback (not covered, `docs/SECURITY.md`).
+- A fresh performance pass on a quiet machine: every PLAN 11 target and both compositions re-measured, profiles of the door, ticket, bind, and insert paths, and every idea the profiles suggest tried by pinned A/B (kept or dropped with the numbers recorded).
+- The security and edge-case review run again in full: every threat of PLAN 8 and every edge case of PLAN 13 against the code as it is then, an adversarial review of everything changed since 0.7, and the fuzz targets and the soak for 24 hours on the final code.
+Exit:
+- [ ] Every item above fixed, or kept with its reason and cost in the 1.0 readiness note.
+- [ ] The performance pass and the review recorded (findings fixed test-first; numbers in `docs/PERFORMANCE.md`).
+- [ ] `docs/READINESS-1.0.md` written for James: what is done, what is still open and why, what each open item costs, and a recommendation.
+
+## v0.9.x - Beta and release candidates
+Items: used end to end by the web stack and one non-HTTP service (a database network layer or the back-channel); API review against the simple-API rule; `cargo-semver-checks` in CI; release candidates `0.9.x`, only after the pre-1.0 polish exits.
 Exit:
 - [ ] No API change needed by either consumer for two release candidates.
 
 ## v1.0.0 - Stable
 Items: the full audit (API, docs, tests, benchmarks, security) recorded in `docs/STABILITY-1.0.md`.
 Exit:
-- [ ] Audit passed; API frozen until 2.0. James gives the go before the tag.
+- [ ] Audit passed; API frozen until 2.0. James gives the go before the tag, with the 1.0 readiness note in hand.
 
 ## After 1.0
 - Challenge verdict and proof-of-work verifier; kernel-drop export; tarpit mode; ASN keys once a data source is chosen.
 
 ## Moves recorded
+- 2026-11-02: NFR-10 moves from the 0.8 exit to the 0.9.0 polish milestone, which James set to revisit it (D-111). Reason: what is left needs a change of table layout, mostly the ban table's cache miss for an unknown peer, and measurement on a quiet machine (the machine has been under full load from other work since D-106, so a step of a few nanoseconds cannot be told from noise); the cheap steps have been tried and measured, and every other 0.8 exit is met.
 - 2026-10-23: T-12 (checkpoint p99 under a revocation storm) moves from 0.4 to 0.6. Reason: it is a latency benchmark, and 0.6 is where the benchmarks run on a quiet machine; the storm's correctness (every revocation applies, the excess is reported) is tested at 0.4.
 - 2026-10-23: identity throttles (session, account) move from 0.4 to 0.5 with lane and tenant budgets, and `set_posture` with its budget halving to 0.5. Reason: each acts on budgets that land at 0.5. `Throttle` on a source works at 0.4.
 - 2026-10-23: the door's 100 ns p99 target moves from the 0.3 exit to 0.6, where it already stands as an exit. Reason: measured at 0.3 on a shared machine (PLAN 11.1), the door costs 230-360 ns per call with 1,000,000 bans and random peers. The cost is ticket issue and release (about 70 ns), hashing (about 30 ns per probe), and TLB and cache misses into a 60 MiB table. The fixes are optimisation work: 8-byte keys and 32-byte slots, the O-8 hash decision, fewer atomic operations per ticket, and measurement on a quiet machine.

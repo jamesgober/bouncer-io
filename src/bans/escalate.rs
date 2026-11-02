@@ -156,6 +156,33 @@ impl EscalationPolicy {
         usize::from(t.min(self.max_children.saturating_add(1)))
     }
 
+    /// The prefix strikes against `source` also count at, and how many of a
+    /// kind's thresholds it takes there: the widest automatic prefix
+    /// escalation reaches, and the strikes escalation would need to ban it
+    /// from `source` up (each level's fan-in, multiplied). `None` with
+    /// escalation off or no automatic length between `source` and the
+    /// widest.
+    pub(crate) fn strike_prefix(
+        &self,
+        source: &Cidr,
+        is_auto: impl Fn(u8) -> bool,
+    ) -> Option<(Cidr, u32)> {
+        if !self.on {
+            return None;
+        }
+        let widest = self.widest(source.family());
+        let mut levels = 0u32;
+        let mut top = None;
+        for len in (widest..source.len()).rev() {
+            if is_auto(len) {
+                levels += 1;
+                top = Some(len);
+            }
+        }
+        let fan_in = self.threshold(source.family()) as u32;
+        Some((source.parent(top?)?, fan_in.saturating_pow(levels)))
+    }
+
     fn widest(&self, family: Family) -> u8 {
         match family {
             Family::V4 => self.widest_ipv4,

@@ -11,6 +11,28 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-02
+
+### Added
+
+- `examples/guarded_http.rs`: a small site behind bouncer on serve-net, with an administrator's port.
+- Feature `net-io`: bouncer as net-io's `Gate` (the door at accept, the client a trusted PROXY header names, the egress check before every write, strikes for slow-peer, PROXY, and TLS failures at close), `ConnectionGate`, the id, tag, and prefix conversions, and `NetIoEjector`, attached to a server after both are built.
+
+### Fixed
+
+- A revocation no longer catches connections admitted after it. An address that was revoked stayed locked out until maintenance removed the entry, forever on a bouncer with no maintainer, and a lift could not clear it. A revocation stops what is running; `Directive::revoke_and_ban` keeps a source out.
+- Credential stuffing that moves to a new IPv6 /64 (or IPv4 address) for every attempt is banned at its /48 (or /24). Strikes also count at the widest escalation prefix, against the strikes escalation would need to get there (80 for an IPv6 /48 and 40 for an IPv4 /24 at the default threshold). Before, every source's counter stayed at one and nothing was banned.
+- The people behind one carrier-grade NAT address are no longer refused as one client: an address flagged as shared is held to its prefix's door budget instead of one client's, throttled or not, so one person behind a NAT cannot get everyone behind it refused.
+
+### Changed
+
+- Door and lane rate budgets keep only a GCRA arrival time per key, beside the key in its slot, under rate parameters shared by the tier (rate-net 2.1's `GcraParams`; rate-net is now required at 2.1); concurrency counts sit beside their keys too. A rate key costs 16 bytes instead of 88, and an unknown peer misses the cache once per tier instead of twice.
+
+- The ban table hashes with a keyed multiply mix instead of SipHash-1-3 and is rebuilt under a fresh key when an insert reaches the probe bound (`table.reseeded`); the door budgets hash under a key of their own.
+- An address's ban keys from its family's shortest automatic length (/24, /48 by default) share one probe sequence, so the door reads one group for all of an address's lengths; a prefix with many banned hosts spills to its own sequence.
+- Ban table slots are 32 bytes: memory per ban falls from 56 to 37.7 bytes. Keys that fit one word are stored exactly; longer ones as keyed 64-bit fingerprints, with the originals kept beside the table for listings, persistence, and sharing.
+- `door_at` is 19% faster admitted, 12% faster for random peers, and 10% faster for banned peers than in 0.7.0, and `door` is 40% faster for random peers; account revocation is 20% faster; ban insert is about 5% slower.
+
 ## [0.7.0] - 2026-10-27
 
 ### Fixed
@@ -298,7 +320,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/bouncer-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/bouncer-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/bouncer-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/bouncer-io/compare/v0.4.0...v0.5.0

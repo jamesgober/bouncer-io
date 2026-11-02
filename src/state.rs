@@ -244,6 +244,7 @@ impl Shared {
             immune: &allow,
             proxies: &self.proxies,
         };
+        self.report_reseeds();
         // A ban the insert took out leaves the ledger too, so it cannot come
         // back with a later merge or a snapshot.
         if let Some((gone, evicted)) = self.bans.replace(&r, &guards, ctx.now_secs)? {

@@ -246,6 +246,9 @@ pub(crate) struct Issue {
     pub(crate) source: Option<IpAddr>,
     pub(crate) request: Option<RequestId>,
     pub(crate) parent: Option<(u32, u32)>,
+    /// The epoch read before the door judged the source: a revocation that
+    /// lands between the judgement and the issue still reaches the ticket.
+    pub(crate) epoch: Option<u64>,
 }
 
 impl Ticket {
@@ -281,13 +284,13 @@ impl Ticket {
         cell.link.store(link, Ordering::Relaxed);
         cell.present_child
             .store((present << PRESENT_SHIFT) | CHILD_MASK, Ordering::Relaxed);
-        let epoch = shard.epoch.load();
+        let epoch = issue.epoch.unwrap_or_else(|| shard.epoch.load());
         let seen = if issue.flags & F_PENDING_CLIENT != 0 {
             SEEN_ALWAYS_CHECK
         } else {
             epoch
         };
-        cell.seen.store(seen, Ordering::Relaxed);
+        cell.seen.store(epoch, Ordering::Relaxed);
         cell.state.store(
             (u64::from(gen_) << 32) | issue.flags | F_LIVE | kind_bits,
             Ordering::Release,
@@ -613,7 +616,9 @@ impl Ticket {
         if charge
             && shared
                 .budgets
-                .admit(addr, now, shared.door_divisor())
+                .admit(addr, now, shared.door_divisor(), || {
+                    shared.sources.is_shared(addr, now.secs())
+                })
                 .is_err()
         {
             return self.deny(DenialCode::TooManyRequests);
@@ -1292,6 +1297,7 @@ pub(crate) fn issue_request(
             source,
             request: Some(id),
             parent: Some((parent, parent_gen)),
+            epoch: None,
         },
     );
     match issued {
@@ -1534,6 +1540,11 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
     let present_child = cell.present_child.load(Ordering::Acquire);
     match TicketKind::from_state(st) {
         TicketKind::Connection => {
+            // A swap, not a load and a store: the swap orders this release
+            // against a request counting itself (both read-modify-write the
+            // same word), which a load could only match with a sequentially
+            // consistent fence that costs more than the swap (D-103; loom
+            // model L-7 fails without it).
             let old = cell.link.swap(u64::from(next_gen) << 32, Ordering::AcqRel);
             if generation(old) == gen_ && old as u32 > 0 {
                 // Live requests remain: they must see their connection is gone

@@ -1,9 +1,12 @@
 //! Keyed hashing for the tables, and the bouncer's random stream.
 //!
-//! Tables hash fixed-size keys with SipHash-1-3 under a per-bouncer random
-//! key, so an attacker who chooses addresses cannot choose collisions (threat
-//! T-9). Whether a cheaper keyed mix replaces it is decided at 0.6 by
-//! benchmark and the adversarial test (PLAN O-8).
+//! The ban table and the door budgets hash fixed-size keys with a keyed
+//! multiply mix (two folded 64-by-64-bit multiplies) under a per-bouncer
+//! random key: an attacker who does not know the key cannot choose
+//! collisions, and if keys ever do pile up in one probe sequence, the ban
+//! table is rebuilt under a fresh key (threat T-9, D-102). Values that leave
+//! the process or must not be guessed (references, stored digests) use
+//! SipHash-1-3.
 
 use std::{
     collections::hash_map::RandomState,
@@ -28,13 +31,16 @@ impl HashKey {
         self.hash3_rounds::<1, 3>(a, b, c)
     }
 
-    /// SipHash-1-3 over two words.
+    /// A keyed multiply mix of two words: two folded multiplies.
     #[inline]
-    pub(crate) fn hash2(&self, a: u64, b: u64) -> u64 {
-        let mut s = State::new(self.k0, self.k1);
-        s.word::<1>(a);
-        s.word::<1>(b);
-        s.finish::<1, 3>(16)
+    pub(crate) fn mix2(&self, a: u64, b: u64) -> u64 {
+        fold(fold(a ^ self.k0, b ^ self.k1), self.k0 ^ MIX_C)
+    }
+
+    /// A keyed multiply mix of three words.
+    #[inline]
+    pub(crate) fn mix3(&self, a: u64, b: u64, c: u64) -> u64 {
+        fold(fold(a ^ self.k0, b ^ self.k1) ^ c, self.k1 ^ MIX_C)
     }
 
     #[inline]
@@ -45,6 +51,16 @@ impl HashKey {
         s.word::<C>(c);
         s.finish::<C, D>(24)
     }
+}
+
+/// An odd constant (the 64-bit golden ratio) folded into the second key word.
+const MIX_C: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// The high and low words of a 128-bit product, folded together.
+#[inline]
+fn fold(x: u64, y: u64) -> u64 {
+    let p = u128::from(x).wrapping_mul(u128::from(y));
+    (p as u64) ^ ((p >> 64) as u64)
 }
 
 struct State {

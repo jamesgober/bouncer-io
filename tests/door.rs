@@ -847,3 +847,60 @@ fn test_proxy_hop_without_a_client_reported_after_the_deadline() {
     assert_eq!(seen.count(unresolved), 2);
     drop(bound);
 }
+
+#[test]
+fn test_crowded_prefix_every_host_found() {
+    // Every automatic length of an address lives in its /24's (or /48's)
+    // probe sequence; a prefix with more banned hosts than that sequence
+    // holds spills into the hosts' own sequences, and nothing is lost.
+    let b = Bouncer::builder()
+        .ban_capacity(8192)
+        .escalation(bouncer_io::EscalationPolicy::default().off())
+        .budgets(Budgets::off())
+        .try_build()
+        .unwrap();
+    for i in 0..1_000u32 {
+        b.ban(IpAddr::from((0x0b00_0000 + i * 977).to_be_bytes()))
+            .unwrap();
+    }
+    for net in [[198, 51, 100], [203, 0, 113]] {
+        for h in 0..=255u8 {
+            b.ban(IpAddr::from([net[0], net[1], net[2], h])).unwrap();
+        }
+    }
+    for net in [[198, 51, 100], [203, 0, 113]] {
+        for h in 0..=255u8 {
+            assert!(
+                b.door(IpAddr::from([net[0], net[1], net[2], h])).is_err(),
+                "{net:?}.{h}"
+            );
+        }
+    }
+    assert!(admitted(&b, "198.51.101.1"));
+    // Lifts reach the hosts that spilled, and they stay lifted.
+    for h in (0..=255u8).step_by(3) {
+        b.lift(IpAddr::from([198, 51, 100, h])).unwrap();
+    }
+    for h in 0..=255u8 {
+        assert_eq!(
+            b.door(IpAddr::from([198, 51, 100, h])).is_ok(),
+            h % 3 == 0,
+            "198.51.100.{h}"
+        );
+    }
+    // IPv6: one /48 with many /64s.
+    for s in 0..600u16 {
+        b.ban(IpAddr::from([0x2001, 0xdb8, 7, s, 0, 0, 0, 1]))
+            .unwrap();
+    }
+    for s in 0..600u16 {
+        assert!(
+            b.door(IpAddr::from([0x2001, 0xdb8, 7, s, 9, 9, 9, 9]))
+                .is_err()
+        );
+    }
+    assert!(
+        b.door(IpAddr::from([0x2001, 0xdb8, 7, 600, 0, 0, 0, 1]))
+            .is_ok()
+    );
+}
