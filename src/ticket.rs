@@ -246,6 +246,9 @@ pub(crate) struct Issue {
     pub(crate) source: Option<IpAddr>,
     pub(crate) request: Option<RequestId>,
     pub(crate) parent: Option<(u32, u32)>,
+    /// The epoch read before the door judged the source: a revocation that
+    /// lands between the judgement and the issue still reaches the ticket.
+    pub(crate) epoch: Option<u64>,
 }
 
 impl Ticket {
@@ -281,13 +284,13 @@ impl Ticket {
         cell.link.store(link, Ordering::Relaxed);
         cell.present_child
             .store((present << PRESENT_SHIFT) | CHILD_MASK, Ordering::Relaxed);
-        let epoch = shard.epoch.load();
+        let epoch = issue.epoch.unwrap_or_else(|| shard.epoch.load());
         let seen = if issue.flags & F_PENDING_CLIENT != 0 {
             SEEN_ALWAYS_CHECK
         } else {
             epoch
         };
-        cell.seen.store(seen, Ordering::Relaxed);
+        cell.seen.store(epoch, Ordering::Relaxed);
         cell.state.store(
             (u64::from(gen_) << 32) | issue.flags | F_LIVE | kind_bits,
             Ordering::Release,
@@ -1294,6 +1297,7 @@ pub(crate) fn issue_request(
             source,
             request: Some(id),
             parent: Some((parent, parent_gen)),
+            epoch: None,
         },
     );
     match issued {

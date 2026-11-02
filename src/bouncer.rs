@@ -575,6 +575,9 @@ impl Bouncer {
         let shared = &self.inner.shared;
         let peer = normalize(peer);
         shared.saw(now);
+        // Read before the judgement: a `revoke_and_ban` that lands after the
+        // ban lookup is then still ahead of this ticket.
+        let epoch = shared.epoch.load();
         let mut hashes = crate::bans::AddrHashes::new(peer);
         let (mut flags, source, charge) =
             match shared.judge_hashed(peer, provenance, now, &mut hashes) {
@@ -620,6 +623,7 @@ impl Bouncer {
                 source,
                 request: None,
                 parent: None,
+                epoch: Some(epoch),
             },
         );
         match issued {

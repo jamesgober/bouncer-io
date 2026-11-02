@@ -1,7 +1,8 @@
 //! Loom models of the revocation protocol (dev/PLAN.md section 12.4):
 //! L-1 epoch ordering, L-4 bind against revoke, L-5 release against revoke,
 //! L-6 concurrency counters, L-7 a request issued while its connection is
-//! released. Built only under `--cfg bouncer_loom`.
+//! released, L-8 the door against `revoke_and_ban`. Built only under
+//! `--cfg bouncer_loom`.
 
 use loom::{
     sync::{
@@ -99,6 +100,52 @@ fn loom_l4_bind_and_revoke_never_both_miss() {
         let binder_saw = matches!(table.find(&key(), 0), Probe::Hit(_));
         let revoker_saw = revoker.join().unwrap();
         assert!(binder_saw || revoker_saw, "both sides missed the other");
+    });
+}
+
+/// L-8: a connection at the door while its source is revoked and banned is
+/// refused by the ban or reached by the revocation. The door reads the epoch
+/// before the ban lookup and its cell starts from that value; the revoker
+/// bans first. A revocation matches only cells that have not reached its
+/// birth, so reading the epoch after the lookup would let this one escape.
+#[test]
+fn loom_l8_door_never_escapes_revoke_and_ban() {
+    loom::model(|| {
+        let epoch = Arc::new(RevocationEpoch::new());
+        let table = Arc::new(Table::new(2, HashKey::new(1, 2)));
+        let banned = Arc::new(LoomU64::new(0));
+        let (e, t, b) = (Arc::clone(&epoch), Arc::clone(&table), Arc::clone(&banned));
+        let revoker = thread::spawn(move || {
+            b.store(1, LoomOrdering::SeqCst);
+            let mut w = TableWriter::default();
+            let birth = e.next();
+            t.insert(
+                &mut w,
+                Entry {
+                    id: birth,
+                    ..entry()
+                },
+                0,
+                |e| *e,
+            )
+            .unwrap();
+            e.bump();
+        });
+        let seen = epoch.load();
+        if banned.load(LoomOrdering::SeqCst) != 0 {
+            revoker.join().unwrap();
+            return;
+        }
+        // Admitted: the ticket's check at issue, as `Ticket::issue` runs it.
+        fence(Ordering::SeqCst);
+        let mut denied = matches!(table.find(&key(), 0), Probe::Hit(e) if e.id > seen);
+        revoker.join().unwrap();
+        // Its next checkpoint: the epoch has moved past `seen` if it needs to.
+        let now = epoch.load();
+        if now != seen {
+            denied |= matches!(table.find(&key(), 0), Probe::Hit(e) if e.id > seen);
+        }
+        assert!(denied, "the door passed the ban and the revocation missed");
     });
 }
 

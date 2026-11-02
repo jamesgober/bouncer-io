@@ -244,16 +244,13 @@ fn test_revoke_allowlisted_source_refused_for_automation_only() {
 }
 
 #[test]
-fn test_issue_after_revoke_sees_it() {
+fn test_issue_after_revoke_is_not_reached() {
+    // A revocation is not a ban (D-112): what comes later is the door's to
+    // judge. The race with a ticket being issued is loom model L-8.
     let b = plain();
     b.revoke(c("192.0.2.0/24"), Reason::ADMIN).unwrap();
     let mut conn = b.door(ip("192.0.2.5")).unwrap();
-    assert!(
-        conn.checkpoint().is_deny(),
-        "a source revocation reaches tickets issued after it"
-    );
-    let mut other = b.door(ip("192.0.3.5")).unwrap();
-    assert!(other.checkpoint().is_pass());
+    assert!(conn.checkpoint().is_pass());
 }
 
 // ---- Binds ------------------------------------------------------------------------
@@ -966,4 +963,53 @@ fn test_revoked_session_bound_on_one_stream_stops_its_siblings() {
     assert!(b.egress(tag).is_deny());
     drop((sibling, stream));
     b.release(tag);
+}
+
+#[test]
+fn test_revocation_stops_what_runs_and_is_not_a_ban() {
+    // PLAN 7.5: a revocation stops what is running; a ban refuses in future.
+    // Found through a browser at 0.8: without a maintainer, a revoked address
+    // stayed unreachable however long it waited.
+    let b = Bouncer::new();
+    let addr = ip("198.51.100.30");
+    let mut before = b.door(addr).unwrap();
+    b.revoke(addr, Reason::ADMIN).unwrap();
+    assert!(before.checkpoint().is_deny(), "what was running stops");
+
+    let mut after = b.door(addr).unwrap();
+    assert!(
+        after.checkpoint().is_pass(),
+        "a new connection is not revoked"
+    );
+    assert!(b.egress(after.tag()).is_pass());
+    // Later epochs do not bring the old revocation back.
+    b.revoke(ip("198.51.100.31"), Reason::ADMIN).unwrap();
+    assert!(after.checkpoint().is_pass());
+    assert!(b.egress(after.tag()).is_pass());
+}
+
+#[test]
+fn test_lift_after_revoke_and_ban_lets_the_address_back_in() {
+    let b = Bouncer::new();
+    let addr = ip("198.51.100.32");
+    let _running = b.door(addr).unwrap();
+    b.apply(Directive::revoke_and_ban(addr).by(Actor::Admin(1)))
+        .unwrap();
+    assert!(b.door(addr).is_err());
+    b.lift(addr).unwrap();
+    let mut back = b.door(addr).unwrap();
+    assert!(back.checkpoint().is_pass());
+    assert!(b.egress(back.tag()).is_pass());
+}
+
+#[test]
+fn test_new_binds_of_a_revoked_session_are_still_refused() {
+    // Identity keys are bound after the ticket is issued: the bind's own
+    // check refuses them, however new the ticket.
+    let b = Bouncer::new();
+    let session = SessionKey::from_digest([0x5a; 16]);
+    let conn = b.door(ip("198.51.100.33")).unwrap();
+    b.revoke(session, Reason::LOGOUT).unwrap();
+    let mut request = conn.request(RequestId(1)).unwrap();
+    assert!(request.bind_session(session).is_deny());
 }

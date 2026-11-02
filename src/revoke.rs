@@ -500,10 +500,14 @@ impl Revocations {
         kinds & (1u64 << kind) != 0
     }
 
+    /// The revocation of `key` born after `since`. A revocation stops what
+    /// was running when it was made; it is not a ban, so a ticket that had
+    /// already reached an entry's birth owes it nothing.
     #[inline]
-    fn probe(&self, key: &TableKey) -> Option<Hit> {
+    fn probe(&self, key: &TableKey, since: u64) -> Option<Hit> {
         match self.table.find(key, 0) {
-            Probe::Hit(e) => Some(Hit::from_entry(&e)),
+            Probe::Hit(e) if e.id > since => Some(Hit::from_entry(&e)),
+            Probe::Hit(_) => None,
             // A slot rewritten for longer than the spin bound: fail closed.
             Probe::Busy => Some(Hit {
                 code: DenialCode::Unavailable,
@@ -513,22 +517,25 @@ impl Revocations {
         }
     }
 
-    /// The first revocation matching any key bound on `cell`.
+    /// The first revocation matching any key bound on `cell` that the cell
+    /// has not been checked against. A key bound later was checked by its
+    /// bind, against every entry.
     pub(crate) fn matches(&self, cell: &Cell) -> Option<Hit> {
         let kinds = self.kinds.load(Ordering::Acquire);
         if kinds == 0 {
             return None;
         }
+        let since = cell.seen.load(Ordering::Acquire);
         let present = cell.present();
         let word = |i: usize| cell.keys[i].load(Ordering::Relaxed);
         if self.has_kind(kinds, table::KIND_CONNECTION) {
-            if let Some(h) = self.probe(&connection_key(cell.conn.load(Ordering::Relaxed))) {
+            if let Some(h) = self.probe(&connection_key(cell.conn.load(Ordering::Relaxed)), since) {
                 return Some(h);
             }
         }
         if present & P_REQUEST != 0 && self.has_kind(kinds, table::KIND_REQUEST) {
             let r = (u128::from(word(K_REQUEST)) << 64) | u128::from(word(K_REQUEST + 1));
-            if let Some(h) = self.probe(&request_key(r)) {
+            if let Some(h) = self.probe(&request_key(r), since) {
                 return Some(h);
             }
         }
@@ -554,7 +561,7 @@ impl Revocations {
                         k1: word(at),
                     }
                 };
-                if let Some(h) = self.probe(&key) {
+                if let Some(h) = self.probe(&key, since) {
                     return Some(h);
                 }
             }
@@ -569,19 +576,19 @@ impl Revocations {
             } else {
                 IpAddr::from(std::net::Ipv4Addr::from(lo as u32))
             };
-            if let Some(h) = self.matches_source(source) {
+            if let Some(h) = self.matches_source(source, since) {
                 return Some(h);
             }
         }
         None
     }
 
-    /// The first source-prefix revocation covering `addr`.
-    pub(crate) fn matches_source(&self, addr: IpAddr) -> Option<Hit> {
+    /// The first source-prefix revocation covering `addr` born after `since`.
+    fn matches_source(&self, addr: IpAddr, since: u64) -> Option<Hit> {
         let host = Cidr::host(addr);
         let visit = |len: u8| {
             host.parent(len)
-                .and_then(|p| self.probe(&BanMemory::prefix_key(&p)))
+                .and_then(|p| self.probe(&BanMemory::prefix_key(&p), since))
         };
         match host.family() {
             Family::V4 => {
@@ -610,11 +617,11 @@ impl Revocations {
         None
     }
 
-    /// The revocation of one key, for binds.
+    /// The revocation of one key, for binds: every entry, however old.
     pub(crate) fn matches_key(&self, key: &TableKey) -> Option<Hit> {
         if !self.has_kind(self.kinds.load(Ordering::Acquire), key.kind) {
             return None;
         }
-        self.probe(key)
+        self.probe(key, 0)
     }
 }
