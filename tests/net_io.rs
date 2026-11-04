@@ -35,7 +35,9 @@ struct Paced {
     request: Option<Ticket>,
     next: u128,
     flood: bool,
-    opened: mpsc::Sender<()>,
+    /// `None` when a request opens, the code when the session is asked to
+    /// format a denial.
+    opened: mpsc::Sender<Option<u16>>,
 }
 
 impl Session for Paced {
@@ -57,7 +59,7 @@ impl Session for Paced {
                     cx.output()
                         .begin_tagged_response(GateTag::from(request.tag()));
                     self.request = Some(request);
-                    let _ = self.opened.send(());
+                    let _ = self.opened.send(None);
                 }
                 b"chunk" => {
                     if cx.output().push(&[b'c'; CHUNK]).is_err() {
@@ -89,16 +91,17 @@ impl Session for Paced {
     }
 
     fn on_denied(&mut self, code: u16, output: &mut Output) {
+        let _ = self.opened.send(Some(code));
         let _ = output.push(format!("denied {code}\n").as_bytes());
     }
 }
 
-fn server(bouncer: &Bouncer) -> (Server, SocketAddr, mpsc::Receiver<()>) {
+fn server(bouncer: &Bouncer) -> (Server, SocketAddr, mpsc::Receiver<Option<u16>>) {
     server_on(bouncer, ListenerSpec::tcp("127.0.0.1:0"))
 }
 
 /// A listener that requires a PROXY v1 header from loopback, the proxy.
-fn proxied(bouncer: &Bouncer) -> (Server, SocketAddr, mpsc::Receiver<()>) {
+fn proxied(bouncer: &Bouncer) -> (Server, SocketAddr, mpsc::Receiver<Option<u16>>) {
     server_on(
         bouncer,
         ListenerSpec::tcp("127.0.0.1:0")
@@ -109,7 +112,10 @@ fn proxied(bouncer: &Bouncer) -> (Server, SocketAddr, mpsc::Receiver<()>) {
     )
 }
 
-fn server_on(bouncer: &Bouncer, spec: ListenerSpec) -> (Server, SocketAddr, mpsc::Receiver<()>) {
+fn server_on(
+    bouncer: &Bouncer,
+    spec: ListenerSpec,
+) -> (Server, SocketAddr, mpsc::Receiver<Option<u16>>) {
     let (tx, rx) = mpsc::channel();
     let b = bouncer.clone();
     let server = ServerBuilder::new()
@@ -279,9 +285,13 @@ fn test_net_io_revoked_session_gets_the_generic_denial_and_is_closed() {
     c.write_all(b"chunk\n").expect("write");
     let mut got = Vec::new();
     let _ = c.read_to_end(&mut got);
-    assert_eq!(
-        got, b"denied 403\n",
-        "the generic denial and nothing of the body"
+    // The session formats the generic denial; on the wire it arrives, or
+    // the abortive close discards it unsent (Windows, now and then): never
+    // anything of the body.
+    assert_eq!(rx.recv_timeout(WAIT), Ok(Some(403)));
+    assert!(
+        got == b"denied 403\n" || got.is_empty(),
+        "the generic denial and nothing of the body: {got:?}"
     );
     assert!(eventually(|| server
         .stats()
@@ -305,7 +315,12 @@ fn test_net_io_denial_code_is_the_directives_http_status() {
     c.write_all(b"chunk\n").expect("write");
     let mut got = Vec::new();
     let _ = c.read_to_end(&mut got);
-    assert_eq!(got, b"denied 429\n");
+    assert_eq!(
+        rx.recv_timeout(WAIT),
+        Ok(Some(429)),
+        "the directive's status"
+    );
+    assert!(got == b"denied 429\n" || got.is_empty(), "{got:?}");
 }
 
 #[test]
