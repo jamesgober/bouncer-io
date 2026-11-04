@@ -865,10 +865,11 @@ fn test_budget_exempt_and_proxy_hops_not_charged() {
         h1.bind_client(ip("203.0.113.1"), Provenance::ProxyProtocol)
             .is_pass()
     );
+    // Refused with the denial a ban gets: a client cannot tell them apart.
     let mut h2 = b.door(ip("10.0.0.1")).unwrap();
     assert_eq!(
         denied(h2.bind_client(ip("203.0.113.1"), Provenance::ProxyProtocol)),
-        Some(DenialCode::TooManyRequests)
+        Some(DenialCode::Forbidden)
     );
     drop(h1);
     let mut h3 = b.door(ip("10.0.0.1")).unwrap();

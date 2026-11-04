@@ -74,6 +74,10 @@ pub(crate) struct Shared {
     /// (D-096).
     pub(crate) ledger: Option<std::sync::Mutex<crate::ledger::Ledger>>,
     pub(crate) max_clock_skew: Duration,
+    /// The clock is the system's monotonic clock (no clock was given to the
+    /// builder), so a transport's own reading of it can be used.
+    #[cfg_attr(not(feature = "net-io"), allow(dead_code))]
+    pub(crate) system_clock: bool,
     /// 0 normal, 1 strict.
     posture: AtomicU32,
     strict_divisor: u32,
@@ -101,12 +105,17 @@ impl Shared {
     }
 
     /// The bouncer time of a moment a transport read from the system's
-    /// monotonic clock (net-io's accept time). Meaningful only when the
-    /// bouncer's own clock is the system clock.
+    /// monotonic clock (net-io's accept time). With a clock of its own (a
+    /// test clock, a coarse clock), the bouncer reads that instead: the
+    /// transport's reading would be on another time base.
     #[cfg(feature = "net-io")]
     #[inline]
     pub(crate) fn now_at(&self, at: std::time::Instant) -> Now {
-        Now::from_duration(Monotonic::from(at).saturating_duration_since(self.start))
+        if self.system_clock {
+            Now::from_duration(Monotonic::from(at).saturating_duration_since(self.start))
+        } else {
+            self.now()
+        }
     }
 
     /// Notes a time the door saw (cheap: one load, a store once a second).
@@ -1868,6 +1877,7 @@ impl BouncerBuilder {
                 .node
                 .map(|_| std::sync::Mutex::new(crate::ledger::Ledger::new(self.ban_capacity))),
             max_clock_skew: self.max_clock_skew,
+            system_clock: self.clock.is_none(),
             clock,
             bans: BanMemory::new(
                 self.ban_capacity,

@@ -1237,9 +1237,12 @@ impl BanMemory {
     /// Reseeds since the last call (each is reported once).
     pub(crate) fn take_reseeds(&self) -> u64 {
         let now = self.table.reseeds();
-        now - self
-            .reseeds_seen
-            .swap(now, std::sync::atomic::Ordering::Relaxed)
+        // Two callers can read the count in one order and record it in the
+        // other: the larger value wins, and the later caller reports none.
+        now.saturating_sub(
+            self.reseeds_seen
+                .fetch_max(now, std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// As [`lookup_addr`](Self::lookup_addr), through a hash cache the door

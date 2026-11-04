@@ -618,7 +618,9 @@ impl Ticket {
                 shared.sources.is_shared(addr, now.secs())
             }) {
                 Ok(c) => c,
-                Err(_) => return self.deny(DenialCode::TooManyRequests),
+                // The same denial as a ban (T-8): a client must not tell
+                // the two apart.
+                Err(_) => return self.deny(DenialCode::Forbidden),
             }
         } else {
             crate::budgets::Charged::NONE

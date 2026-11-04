@@ -231,6 +231,54 @@ fn test_door_forwarded_header_from_untrusted_peer_not_bound() {
 }
 
 #[test]
+fn test_proxied_client_cannot_tell_a_ban_from_a_spent_budget() {
+    // T-8 at the bind: a client a PROXY header names is refused with the
+    // same denial whether it is banned or over its door budget.
+    let b = Bouncer::builder()
+        .trusted_proxies(&[c("10.0.0.1/32")])
+        .budgets(Budgets::off().door_concurrency(1, 1000))
+        .try_build()
+        .unwrap();
+    b.ban(ip("203.0.113.9")).unwrap();
+    let mut first = b.door(ip("10.0.0.1")).unwrap();
+    assert!(
+        first
+            .bind_client(ip("198.51.100.4"), Provenance::ProxyProtocol)
+            .is_pass()
+    );
+    let code = |client: &str| {
+        let mut hop = b.door(ip("10.0.0.1")).unwrap();
+        match hop.bind_client(ip(client), Provenance::ProxyProtocol) {
+            Verdict::Deny(d) => d.code,
+            _ => panic!("{client} admitted"),
+        }
+    };
+    // Over its concurrency budget (the first connection holds its one).
+    assert_eq!(code("198.51.100.4"), code("203.0.113.9"));
+}
+
+#[test]
+fn test_local_peer_is_a_proxy_hop_when_loopback_is_trusted() {
+    // A Unix-socket or pipe peer enters as LOCAL_PEER with
+    // `Provenance::Local`: with loopback trusted, it is a proxy hop like a
+    // TCP peer from loopback, not a refused "proxy named as client".
+    let b = Bouncer::builder()
+        .trusted_proxies(&[c("127.0.0.1/32")])
+        .try_build()
+        .unwrap();
+    let now = b.now();
+    let local = b
+        .door_at(ConnId(1), ip("127.0.0.1"), Provenance::Local, now)
+        .expect("a local peer is admitted as a proxy hop");
+    let mut req = local.request(RequestId(1)).unwrap();
+    assert!(
+        req.bind_client(ip("192.0.2.30"), Provenance::ForwardedHeader)
+            .is_pass()
+    );
+    assert_eq!(req.source(), Some(ip("192.0.2.30")));
+}
+
+#[test]
 fn test_ban_ipv6_rotation_within_64_refused() {
     // Threat T-2.
     let b = small();

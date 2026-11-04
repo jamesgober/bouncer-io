@@ -237,6 +237,35 @@ fn test_net_io_proxy_header_names_the_client_the_door_judges() {
 }
 
 #[test]
+fn test_net_io_a_bouncer_with_its_own_clock_judges_on_it() {
+    // net-io's accept time is on the system clock; a bouncer with a clock
+    // of its own must not read it against its own start, where a timed ban
+    // could look long expired.
+    use net_io::{AdmitStage, Gate};
+    let clock = std::sync::Arc::new(clock_lib::ManualClock::new());
+    let bouncer = Bouncer::builder()
+        .clock(clock.clone())
+        .try_build()
+        .expect("bouncer");
+    bouncer
+        .ban(
+            bouncer_io::BanSpec::address("203.0.113.9".parse::<IpAddr>().unwrap())
+                .for_duration(Duration::from_secs(3600)),
+        )
+        .expect("ban");
+    let info = ConnectionInfo::for_testing("203.0.113.9:4000".parse().unwrap());
+    assert!(
+        bouncer.admit(&info, AdmitStage::Accept).is_err(),
+        "a peer banned for an hour is refused"
+    );
+    clock.advance(Duration::from_secs(3601));
+    assert!(
+        bouncer.admit(&info, AdmitStage::Accept).is_ok(),
+        "and admitted after it"
+    );
+}
+
+#[test]
 fn test_net_io_revoked_session_gets_the_generic_denial_and_is_closed() {
     let bouncer = Bouncer::new();
     let (server, addr, rx) = server(&bouncer);

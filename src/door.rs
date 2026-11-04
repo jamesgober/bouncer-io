@@ -188,7 +188,10 @@ impl Shared {
         hashes: &mut crate::bans::AddrHashes,
     ) -> Judgement {
         if !self.proxies.is_empty() && self.proxies.contains_addr(peer) {
-            return if provenance == Provenance::Socket {
+            // A local peer (a Unix socket or a named pipe) is the source
+            // `LOCAL_PEER`: a proxy hop when that is a trusted proxy, as a
+            // TCP peer from it is.
+            return if matches!(provenance, Provenance::Socket | Provenance::Local) {
                 Judgement::ProxyHop
             } else {
                 // A trusted proxy named as the client: the adapter picked the
