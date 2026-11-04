@@ -102,7 +102,10 @@ impl Cell {
     }
 }
 
-/// The free list of one shard: a range of global cell indices.
+/// The free list of one shard: a range of global cell indices. Aligned to
+/// two cache lines (the adjacent-line prefetcher pairs them), so shards'
+/// heads, which sit side by side, never share one.
+#[repr(align(128))]
 pub(crate) struct FreeList {
     head: AtomicU64,
     start: u32,
@@ -222,7 +225,10 @@ impl Registry {
 }
 
 /// A shard handle. Tickets hold one through an `Arc`, so reference-count
-/// traffic is spread over shards instead of one shared line.
+/// traffic is spread over shards instead of one shared line. Aligned to two
+/// cache lines: shard allocations are small and the allocator places them
+/// side by side, so unpadded, two shards' reference counts share a line.
+#[repr(align(128))]
 pub(crate) struct Shard {
     pub(crate) epoch: Arc<Epoch>,
     pub(crate) shared: Arc<crate::bouncer::Shared>,
@@ -245,6 +251,13 @@ mod tests {
     fn test_cell_is_two_cache_lines() {
         assert_eq!(core::mem::size_of::<Cell>(), 128);
         assert_eq!(core::mem::align_of::<Cell>(), 64);
+    }
+
+    #[test]
+    fn test_shard_state_never_shares_a_line_pair() {
+        assert_eq!(core::mem::align_of::<FreeList>(), 128);
+        assert_eq!(core::mem::size_of::<FreeList>(), 128);
+        assert_eq!(core::mem::align_of::<Shard>(), 128);
     }
 
     #[test]
