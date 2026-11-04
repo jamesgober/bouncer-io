@@ -190,6 +190,30 @@ fn test_revoke_never_issued_connection_reclaimed() {
 }
 
 #[test]
+fn test_cleanup_keeps_a_revocation_a_pending_request_owes() {
+    // A proxied request running before a source revocation, whose client is
+    // only bound after maintenance has run, is still reached: cleanup must
+    // count it among the tickets that have not checked yet.
+    let b = Bouncer::builder()
+        .trusted_proxies(&[c("198.51.100.1/32")])
+        .budgets(Budgets::off())
+        .try_build()
+        .unwrap();
+    let mut hop = b.door(ip("198.51.100.1")).unwrap();
+    let mut pending = hop.request(RequestId(1)).unwrap();
+    b.apply(Directive::revoke(c("203.0.113.0/24"))).unwrap();
+    // Every other live ticket checks past the revocation.
+    assert!(hop.checkpoint().is_pass());
+    let _ = b.maintain(b.now());
+    assert!(
+        pending
+            .bind_client(ip("203.0.113.5"), Provenance::ForwardedHeader)
+            .is_deny(),
+        "the revocation was cleaned up before the pending request checked"
+    );
+}
+
+#[test]
 fn test_revoke_source_covering_trusted_proxy() {
     // Edge case 38.
     let b = Bouncer::builder()
