@@ -66,14 +66,14 @@ struct Guard(Bouncer);
 
 impl Checkpoint for Guard {
     fn check(&self, env: &Envelope, at: CheckpointAt) -> Verdict {
-        if at == CheckpointAt::BeforeReply
-            && env.user_word() != 0
-            && self
-                .0
-                .egress(TicketTag::from_raw(env.user_word()))
-                .is_deny()
-        {
-            return Verdict::Deny { status: 403 };
+        if at == CheckpointAt::BeforeReply && env.user_word() != 0 {
+            if let bouncer_io::Verdict::Deny(d) =
+                self.0.egress(TicketTag::from_raw(env.user_word()))
+            {
+                return Verdict::Deny {
+                    status: d.code.http_status(),
+                };
+            }
         }
         Verdict::Pass
     }
@@ -242,6 +242,29 @@ fn test_serve_net_session_revoked_mid_request_gets_the_generic_denial() {
     assert!(!page.contains("balance"), "nothing of the page: {page}");
     // The connection is gone: the read above ended, and so did its ticket.
     assert!(eventually(|| bouncer.health().tickets_live == 0));
+    drop(running);
+}
+
+#[test]
+fn test_serve_net_denial_code_reaches_the_browser_as_its_status() {
+    // A revocation that says "too many requests" answers 429, not 403.
+    let bouncer = Bouncer::new();
+    let (running, addr, hold) = serve(&bouncer, true);
+    let (entered, go) = hold.unwrap();
+    let mut c = client(addr);
+    c.write_all(&get(5)).expect("write");
+    entered.recv_timeout(WAIT).expect("the handler is running");
+
+    bouncer
+        .apply(
+            bouncer_io::Directive::revoke(session(5))
+                .deny_with(bouncer_io::DenialCode::TooManyRequests),
+        )
+        .expect("revoke");
+    go.send(()).expect("go");
+    let page = response(&mut c);
+    assert!(page.starts_with("HTTP/1.1 429"), "{page}");
+    assert!(!page.contains("balance"), "nothing of the page: {page}");
     drop(running);
 }
 

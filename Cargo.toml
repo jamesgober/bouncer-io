@@ -71,7 +71,7 @@ better-bucket = { version = "1.1", default-features = false }
 crypt-io = { version = "1.2", default-features = false, features = ["zeroize", "mac-blake3"] }
 # The transport the `net-io` feature plugs into (first-party, no dependencies
 # of its own). Optional: bouncer works with any transport.
-net-io = { version = "0.3", optional = true }
+net-io = { version = "0.5", optional = true }
 
 
 # DEV DEPENDENCIES
@@ -80,7 +80,7 @@ net-io = { version = "0.3", optional = true }
 criterion = { version = "0.7", default-features = false }
 proptest = { version = "1", default-features = false, features = ["std"] }
 # A real HTTP server for the net-io tests and the guarded_http example.
-serve-net = "0.3"
+serve-net = "0.5"
 # Comparison benchmarks only (benches/comparison.rs): never in the library.
 dashmap = "6"
 governor = "0.10"

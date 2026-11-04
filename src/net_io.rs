@@ -114,13 +114,22 @@ impl Gate for Bouncer {
     /// The egress check: the request whose response is being written when
     /// the session tagged it, otherwise the connection and its latest
     /// request. A handful of loads while nothing is revoked.
+    ///
+    /// The denial's code is the HTTP status of the [`DenialCode`]
+    /// ([`DenialCode::http_status`]), which an HTTP server such as serve-net
+    /// answers with; a session of another protocol maps it back with
+    /// [`DenialCode::from_http_status`].
+    ///
+    /// [`DenialCode`]: crate::DenialCode
+    /// [`DenialCode::http_status`]: crate::DenialCode::http_status
+    /// [`DenialCode::from_http_status`]: crate::DenialCode::from_http_status
     #[inline]
     fn check(&self, gate: &mut ConnectionGate, write: &WriteCheck) -> Result<(), Denial> {
         let tag = write.response.map_or(gate.tag, TicketTag::from);
         match self.egress(tag) {
             Verdict::Pass => Ok(()),
             Verdict::Deny(d) => Err(Denial {
-                code: d.code.number(),
+                code: d.code.http_status(),
             }),
         }
     }
