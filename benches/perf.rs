@@ -66,6 +66,17 @@ fn main() {
             }
         })
         .collect();
+    // Random peers inside the space the bans cover (IPv4 with the top bit
+    // set, IPv6 under 2001::/16): a trie cannot stop at its root for these.
+    let near: Vec<IpAddr> = (0..1 << 16)
+        .map(|_| {
+            if m.next() % 2 == 0 {
+                IpAddr::from((m.next() as u32 | 0x8000_0000).to_be_bytes())
+            } else {
+                fixture::v6((u128::from(m.next()) << 64) | (0x2001u128 << 112))
+            }
+        })
+        .collect();
     let now = f.bouncer.now();
     println!(
         "{:<34} {:>8} {:>8}",
@@ -74,6 +85,7 @@ fn main() {
     for (name, probes) in [
         ("admitted", &f.admitted),
         ("random", &random),
+        ("random near bans", &near),
         ("banned", &f.banned),
     ] {
         let n = probes.len();
@@ -131,6 +143,12 @@ fn main() {
             );
         }),
     );
+    row(
+        "datagram with both rate tiers, random",
+        measure(|i| {
+            let _ = black_box(f.bouncer.datagram(black_box(random[i & 0xffff]), true, now));
+        }),
+    );
     let no_rate = fixture::build(Budgets::off(), 10_000);
     row(
         "door_at, no rate budget, admitted",
@@ -164,6 +182,16 @@ fn main() {
                 true,
                 now,
             ));
+        }),
+    );
+    row(
+        "judge only: 1m bans and admin set, random",
+        measure(|i| {
+            let _ = black_box(
+                no_rate
+                    .bouncer
+                    .datagram(black_box(random[i & 0xffff]), true, now),
+            );
         }),
     );
     drop(no_rate);

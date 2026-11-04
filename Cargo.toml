@@ -119,6 +119,10 @@ harness = false
 name    = "gate"
 harness = false
 
+[[bench]]
+name    = "threads"
+harness = false
+
 
 # LINTS
 # #################################
