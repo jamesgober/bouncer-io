@@ -1,7 +1,8 @@
 //! Loom models of the revocation protocol (dev/PLAN.md section 12.4):
 //! L-1 epoch ordering, L-4 bind against revoke, L-5 release against revoke,
 //! L-6 concurrency counters, L-7 a request issued while its connection is
-//! released, L-8 the door against `revoke_and_ban`. Built only under
+//! released, L-8 the door against `revoke_and_ban`, L-9 a revocation against
+//! epoch moves from elsewhere. Built only under
 //! `--cfg bouncer_loom`.
 
 use loom::{
@@ -42,6 +43,17 @@ fn entry() -> Entry {
         until: 0,
         issued: 0,
         id: 1,
+    }
+}
+
+/// Whether a ticket that last checked at `since` is reached by the entry, as
+/// `Revocations::probe` decides: born after `since`, or its slot held by its
+/// writer (fail closed).
+fn reaches(table: &Table, since: u64) -> bool {
+    match table.find(&key(), 0) {
+        Probe::Hit(e) => e.id > since,
+        Probe::Busy => true,
+        Probe::Miss => false,
     }
 }
 
@@ -118,18 +130,19 @@ fn loom_l8_door_never_escapes_revoke_and_ban() {
         let revoker = thread::spawn(move || {
             b.store(1, LoomOrdering::SeqCst);
             let mut w = TableWriter::default();
-            let birth = e.next();
             t.insert(
                 &mut w,
                 Entry {
-                    id: birth,
+                    id: crate::revoke::PENDING_BIRTH,
                     ..entry()
                 },
                 0,
                 |e| *e,
             )
             .unwrap();
-            e.bump();
+            let birth = e.bump();
+            t.insert(&mut w, entry(), 0, |old| Entry { id: birth, ..*old })
+                .unwrap();
         });
         let seen = epoch.load();
         if banned.load(LoomOrdering::SeqCst) != 0 {
@@ -138,12 +151,12 @@ fn loom_l8_door_never_escapes_revoke_and_ban() {
         }
         // Admitted: the ticket's check at issue, as `Ticket::issue` runs it.
         fence(Ordering::SeqCst);
-        let mut denied = matches!(table.find(&key(), 0), Probe::Hit(e) if e.id > seen);
+        let mut denied = reaches(&table, seen);
         revoker.join().unwrap();
         // Its next checkpoint: the epoch has moved past `seen` if it needs to.
         let now = epoch.load();
         if now != seen {
-            denied |= matches!(table.find(&key(), 0), Probe::Hit(e) if e.id > seen);
+            denied |= reaches(&table, seen);
         }
         assert!(denied, "the door passed the ban and the revocation missed");
     });
@@ -285,5 +298,58 @@ fn loom_l7_request_issued_during_release_never_passes() {
                 "a request outlived its connection on the fast path"
             );
         }
+    });
+}
+
+/// L-9: a revocation reaches a ticket that was live before it, while
+/// another thread moves the epoch (a release, another revocation). The
+/// steps are those of `Revocations::insert` and of a checkpoint's slow path:
+/// read the epoch, probe for entries born after the epoch last checked,
+/// record the epoch read.
+#[test]
+fn loom_l9_revocation_reaches_a_live_ticket_despite_other_epoch_moves() {
+    loom::model(|| {
+        let epoch = Arc::new(RevocationEpoch::new());
+        let table = Arc::new(Table::new(2, HashKey::new(1, 2)));
+        let (e, t) = (Arc::clone(&epoch), Arc::clone(&table));
+        let revoker = thread::spawn(move || {
+            let mut w = TableWriter::default();
+            t.insert(
+                &mut w,
+                Entry {
+                    id: crate::revoke::PENDING_BIRTH,
+                    ..entry()
+                },
+                0,
+                |e| *e,
+            )
+            .unwrap();
+            let birth = e.bump();
+            t.insert(&mut w, entry(), 0, |old| Entry { id: birth, ..*old })
+                .unwrap();
+        });
+        let e2 = Arc::clone(&epoch);
+        let mover = thread::spawn(move || {
+            e2.bump();
+        });
+        // The ticket, checked at 0 when it was issued, takes its slow path
+        // once the epoch has moved: it probes for entries born after the
+        // epoch it last checked at, and records the epoch it read.
+        let (e3, t3) = (Arc::clone(&epoch), Arc::clone(&table));
+        let ticket = thread::spawn(move || {
+            let now = e3.load();
+            (now, now != 0 && reaches(&t3, 0))
+        });
+        revoker.join().unwrap();
+        mover.join().unwrap();
+        let (seen, mut denied) = ticket.join().unwrap();
+        // Its next checkpoint after `revoke` returned.
+        if epoch.load() != seen {
+            denied |= reaches(&table, seen);
+        }
+        assert!(
+            denied,
+            "the revocation missed a ticket that was live before it"
+        );
     });
 }

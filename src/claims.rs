@@ -377,3 +377,48 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, bouncer_loom))]
+mod loom_tests {
+    use super::*;
+
+    /// L-10: one key counting in and out of its idle slot while another key
+    /// takes that slot over never strands a count: afterwards every slot is
+    /// back at its count before.
+    #[test]
+    fn loom_counts_takeover_never_strands_a_count() {
+        loom::model(|| {
+            let counts = loom::sync::Arc::new(Counts::new(16));
+            // Two keys whose probes start at the same slot, with different
+            // tags; every other slot held by a busy key.
+            let a = (3u64 << 17) | 1;
+            let b = (3u64 << 17) | (1 << 40) | 1;
+            let start = Counts::start(a) as usize & counts.mask;
+            assert_eq!(start, Counts::start(b) as usize & counts.mask);
+            for i in 0..counts.len() {
+                let w = if i == start {
+                    Counts::tag(a) << COUNT_BITS
+                } else {
+                    ((1000 + i as u64) << COUNT_BITS) | 1
+                };
+                counts.words[i].store(w, Ordering::Relaxed);
+            }
+            let other = loom::sync::Arc::clone(&counts);
+            let t = loom::thread::spawn(move || {
+                if other.acquire(b, 10, || false) == Ok(true) {
+                    other.release(b);
+                }
+            });
+            if counts.acquire(a, 10, || false) == Ok(true) {
+                counts.release(a);
+            }
+            t.join().unwrap();
+            let live: u64 = counts
+                .words
+                .iter()
+                .map(|w| w.load(Ordering::Acquire) & u64::from(COUNT_MAX))
+                .sum();
+            assert_eq!(live, counts.len() as u64 - 1, "a count was stranded");
+        });
+    }
+}

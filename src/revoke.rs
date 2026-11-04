@@ -130,6 +130,11 @@ impl RevocationEpoch {
     }
 }
 
+/// The birth of a revocation while it is being recorded: above every epoch
+/// a ticket can have checked at (the epoch never takes `u64::MAX`), so the
+/// entry reaches every live ticket until its real birth replaces this.
+pub(crate) const PENDING_BIRTH: u64 = u64::MAX;
+
 /// The epoch after `v`, stepping over `u64::MAX`.
 #[inline]
 const fn after(v: u64) -> u64 {
@@ -406,14 +411,19 @@ impl Revocations {
         self.kinds.load(Ordering::Acquire) == 0
     }
 
-    /// Records a revocation and moves the epoch, both under the writer lock,
-    /// so births are unique and increasing: an entry born at `b` was in the
-    /// table before the epoch reached `b`, and cleanup removes it only when
-    /// every live ticket has checked at `b` or later. Returns the new epoch;
-    /// `Err` (epoch unmoved) when the table is full.
+    /// Records a revocation and moves the epoch. The entry is published
+    /// first under a birth no ticket has reached ([`PENDING_BIRTH`]); its
+    /// birth is then the value of the epoch move that follows. A ticket that
+    /// missed the entry read the epoch before that move, so its recorded
+    /// epoch is below the birth and its next check finds the entry. (A
+    /// birth taken before the insert could be reached by an epoch move from
+    /// elsewhere, a release or another bouncer's revocation, and a ticket
+    /// checked at that value before the entry was visible would never be
+    /// reached.) Cleanup removes an entry only when every live ticket has
+    /// checked at its birth or later. Returns the birth; `Err` (epoch
+    /// unmoved) when the table is full.
     pub(crate) fn insert(&self, r: &Record, epoch: &RevocationEpoch) -> Result<u64, ()> {
         let mut w = self.lock();
-        let birth = epoch.next();
         let entry = Entry {
             key: r.key,
             flags: if r.keep_connection {
@@ -426,7 +436,7 @@ impl Revocations {
             offences: u16::from(r.code.number() as u8),
             until: 0,
             issued: 0,
-            id: birth,
+            id: PENDING_BIRTH,
         };
         let writer = &mut *w;
         // A second revocation of the same key keeps the stronger code and the
@@ -448,7 +458,14 @@ impl Revocations {
             }
             Err(_) => return Err(()),
         }
-        Ok(epoch.bump())
+        let birth = epoch.bump();
+        // The key is in the table, so this rewrites its slot in place.
+        let stamped = self.table.insert(&mut writer.table, entry, 0, |old| Entry {
+            id: birth,
+            ..*old
+        });
+        debug_assert!(matches!(stamped, Ok(Inserted::Merged { .. })));
+        Ok(birth)
     }
 
     fn count(&self, w: &mut Writer, key: &TableKey, add: bool) {
