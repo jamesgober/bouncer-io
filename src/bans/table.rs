@@ -722,7 +722,18 @@ impl Table {
     /// which avoids the clustering of linear probing at high load.
     #[inline]
     fn next_group(&self, g: usize, step: usize) -> usize {
-        (g + step) % self.tags.len()
+        // `g` is below the group count and `step` at most `MAX_PROBE`, so
+        // one subtraction wraps it unless the table is tinier than a step
+        // (then a division): no division on the common path.
+        let len = self.tags.len();
+        let n = g + step;
+        if n < len {
+            n
+        } else if n - len < len {
+            n - len
+        } else {
+            n % len
+        }
     }
 
     /// Sets one tag byte. Only the writer changes tags.
@@ -951,6 +962,18 @@ impl Table {
         now_secs: u64,
         groups: usize,
     ) -> (Option<(usize, Option<Entry>)>, Option<(usize, Entry)>) {
+        // A free slot (empty or deleted: the only tags with the high bit
+        // set) found by its tag reads no slot. Only a path with none is
+        // read slot by slot, for an expired entry or an eviction candidate.
+        let mut g = start;
+        for step in 1..=groups {
+            let free = self.tags[g].load(Ordering::Relaxed) & HIGH_BITS;
+            if free != 0 {
+                let i = (free.trailing_zeros() / 8) as usize;
+                return (Some((g * GROUP + i, None)), None);
+            }
+            g = self.next_group(g, step);
+        }
         let mut window_victim: Option<(usize, Entry)> = None;
         let mut g = start;
         for step in 1..=groups {

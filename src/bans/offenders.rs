@@ -9,6 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use super::table::TableKey;
+use crate::hash::Keyed;
 
 /// Records looked at, oldest first, to pick the one to drop when full.
 const CANDIDATES: usize = 2;
@@ -32,7 +33,7 @@ pub(crate) struct Offence {
 
 #[derive(Debug)]
 pub(crate) struct Offenders {
-    map: HashMap<TableKey, Offence>,
+    map: HashMap<TableKey, Offence, Keyed>,
     /// Keys in the order they were first noted (keys already dropped are
     /// skipped when they reach the front).
     order: VecDeque<TableKey>,
@@ -43,7 +44,7 @@ pub(crate) struct Offenders {
 impl Offenders {
     pub(crate) fn new(capacity: usize, half_life_secs: u64) -> Offenders {
         Offenders {
-            map: HashMap::with_capacity(capacity),
+            map: HashMap::with_capacity_and_hasher(capacity, Keyed::default()),
             order: VecDeque::with_capacity(capacity),
             capacity: capacity.max(1),
             half_life: half_life_secs.max(1),

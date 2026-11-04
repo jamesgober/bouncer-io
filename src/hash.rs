@@ -63,6 +63,7 @@ fn fold(x: u64, y: u64) -> u64 {
     (p as u64) ^ ((p >> 64) as u64)
 }
 
+#[derive(Clone)]
 struct State {
     v0: u64,
     v1: u64,
@@ -116,6 +117,100 @@ impl State {
             self.round();
         }
         self.v0 ^ self.v1 ^ self.v2 ^ self.v3
+    }
+}
+
+/// The hasher of the writer's maps whose keys a client can steer (offender
+/// memory, the escalation tracker): SipHash-1-3, the standard library's
+/// choice, under a random key per map, with each fixed-size write taken as
+/// one word. The standard library's hasher feeds a key's fields byte by
+/// byte; this costs about a tenth of that for a table key, with the same
+/// resistance to chosen collisions.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Keyed(HashKey);
+
+impl Default for Keyed {
+    /// A key from the operating system's randomness.
+    fn default() -> Self {
+        let word = |i: usize| {
+            let mut h = RandomState::new().build_hasher();
+            h.write_usize(i);
+            h.finish()
+        };
+        Keyed(HashKey::new(word(0), word(1)))
+    }
+}
+
+impl BuildHasher for Keyed {
+    type Hasher = KeyedHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> KeyedHasher {
+        KeyedHasher {
+            s: State::new(self.0.k0, self.0.k1),
+            words: 0,
+        }
+    }
+}
+
+pub(crate) struct KeyedHasher {
+    s: State,
+    words: u64,
+}
+
+impl KeyedHasher {
+    #[inline]
+    fn word(&mut self, m: u64) {
+        self.s.word::<1>(m);
+        self.words += 1;
+    }
+}
+
+impl Hasher for KeyedHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.s.clone().finish::<1, 3>(self.words)
+    }
+
+    /// Bytes in words of eight, zero-padded, then their length.
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut b = [0u8; 8];
+            b[..chunk.len()].copy_from_slice(chunk);
+            self.word(u64::from_le_bytes(b));
+        }
+        self.word(bytes.len() as u64);
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.word(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.word(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.word(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.word(i);
+    }
+
+    #[inline]
+    fn write_u128(&mut self, i: u128) {
+        self.word(i as u64);
+        self.word((i >> 64) as u64);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.word(i as u64);
     }
 }
 
