@@ -590,22 +590,27 @@ impl Bouncer {
                     return Err(r);
                 }
             };
+        let mut charged = crate::budgets::Charged::NONE;
         if charge {
-            if let Err(over) =
-                shared
-                    .budgets
-                    .admit_hashed(&mut hashes, now, shared.door_divisor(), || {
-                        shared.sources.is_shared(peer, now.secs())
-                    })
-            {
-                let r = Refusal::OverBudget {
-                    retry_after: over.0,
-                };
-                self.report_refusal(r, peer);
-                return Err(r);
+            match shared
+                .budgets
+                .admit_hashed(&mut hashes, now, shared.door_divisor(), || {
+                    shared.sources.is_shared(peer, now.secs())
+                }) {
+                Ok(c) => charged = c,
+                Err(over) => {
+                    let r = Refusal::OverBudget {
+                        retry_after: over.0,
+                    };
+                    self.report_refusal(r, peer);
+                    return Err(r);
+                }
             }
-            if shared.budgets.has_concurrency() {
+            if charged.client() {
                 flags |= F_CHARGED;
+            }
+            if charged.prefix() {
+                flags |= crate::registry::F_CHARGED_PREFIX;
             }
         }
         flags |= provenance.code() << crate::registry::PROVENANCE_SHIFT;
@@ -632,9 +637,7 @@ impl Bouncer {
                 Ok(t)
             }
             None => {
-                if charge {
-                    shared.budgets.release_connection(Some(peer), now);
-                }
+                shared.budgets.release_connection(Some(peer), charged);
                 self.report_refusal(Refusal::RegistryFull, peer);
                 Err(Refusal::RegistryFull)
             }

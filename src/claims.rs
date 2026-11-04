@@ -147,6 +147,175 @@ impl<P> Claims<P> {
     }
 }
 
+/// Bits of a [`Counts`] word that hold the count; the rest hold the key.
+const COUNT_BITS: u32 = 20;
+/// The largest count a slot holds.
+pub(crate) const COUNT_MAX: u32 = (1 << COUNT_BITS) - 1;
+/// Probes an acquire makes while slots change under it, before it fails
+/// closed.
+const ATTEMPTS: usize = 8;
+
+/// Counters (live connections, requests in flight) whose key and count share
+/// one word. Taking over an idle slot and counting into a slot are each one
+/// compare-and-swap of that word, so a count can never land under a key that
+/// replaced the one it was meant for, and a slot is never taken over while
+/// its count is above zero (with a separate count, both could happen between
+/// a probe and its increment). The word keeps the key's top 44 bits; two
+/// keys that share them share a count (more strict, never less).
+pub(crate) struct Counts {
+    words: Box<[AtomicU64]>,
+    mask: usize,
+}
+
+impl Counts {
+    /// At least `capacity` slots, rounded up to a power of two (at least 16).
+    pub(crate) fn new(capacity: u32) -> Counts {
+        let n = (capacity as usize).next_power_of_two().max(PROBE);
+        Counts {
+            words: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            mask: n - 1,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    /// The key part of a word for `key` (a [`Claims::key`] hash): never zero.
+    #[inline]
+    fn tag(key: u64) -> u64 {
+        (key >> COUNT_BITS) | 1
+    }
+
+    #[inline]
+    fn start(key: u64) -> u64 {
+        key.rotate_right(17)
+    }
+
+    /// Counts one under `key` when its count is below `limit` (or `over_ok`
+    /// says the key may exceed it, asked only then). `Ok(true)` counted;
+    /// `Ok(false)` not counted, every slot on the key's path held by another
+    /// key with a live count; `Err(())` at the limit, nothing counted (also
+    /// when the slots keep changing under the probe: fail closed).
+    #[inline]
+    pub(crate) fn acquire(
+        &self,
+        key: u64,
+        limit: u32,
+        over_ok: impl Fn() -> bool,
+    ) -> Result<bool, ()> {
+        let tag = Self::tag(key);
+        let limit = u64::from(limit.min(COUNT_MAX));
+        let fresh = (tag << COUNT_BITS) | 1;
+        'attempt: for _ in 0..ATTEMPTS {
+            let mut i = Self::start(key) as usize & self.mask;
+            let mut idle: Option<(usize, u64)> = None;
+            for _ in 0..PROBE {
+                let word = &self.words[i];
+                let mut w = word.load(Ordering::Acquire);
+                if w == 0 {
+                    match word.compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire) {
+                        Ok(_) => return Ok(true),
+                        Err(actual) => w = actual,
+                    }
+                }
+                if w >> COUNT_BITS == tag {
+                    loop {
+                        let count = w & u64::from(COUNT_MAX);
+                        if count == u64::from(COUNT_MAX) || (count >= limit && !over_ok()) {
+                            return Err(());
+                        }
+                        match word.compare_exchange_weak(
+                            w,
+                            w + 1,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => return Ok(true),
+                            Err(actual) if actual >> COUNT_BITS == tag => w = actual,
+                            // Taken over since it was read: its count was
+                            // zero, so nothing of this key is lost.
+                            Err(_) => continue 'attempt,
+                        }
+                    }
+                }
+                if idle.is_none() && w & u64::from(COUNT_MAX) == 0 {
+                    idle = Some((i, w));
+                }
+                i = (i + 1) & self.mask;
+            }
+            let Some((slot, w)) = idle else {
+                return Ok(false);
+            };
+            // Succeeds only if the slot still holds that key at zero; on a
+            // race, probe again (the winner may have been this key).
+            if self.words[slot]
+                .compare_exchange(w, fresh, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(true);
+            }
+        }
+        Err(())
+    }
+
+    /// Takes one from `key`'s count. A key can briefly hold two slots (two
+    /// threads taking over different idle slots for it at once), so a
+    /// matching slot at zero does not end the probe.
+    #[inline]
+    pub(crate) fn release(&self, key: u64) {
+        let tag = Self::tag(key);
+        let mut i = Self::start(key) as usize & self.mask;
+        for _ in 0..PROBE {
+            let word = &self.words[i];
+            let mut w = word.load(Ordering::Acquire);
+            if w == 0 {
+                return;
+            }
+            while w >> COUNT_BITS == tag && w & u64::from(COUNT_MAX) > 0 {
+                match word.compare_exchange_weak(w, w - 1, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => return,
+                    Err(actual) => w = actual,
+                }
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    /// `key`'s count (0 when it has no slot).
+    pub(crate) fn count(&self, key: u64) -> u32 {
+        let tag = Self::tag(key);
+        let mut i = Self::start(key) as usize & self.mask;
+        let mut total = 0u32;
+        for _ in 0..PROBE {
+            let w = self.words[i].load(Ordering::Acquire);
+            if w == 0 {
+                break;
+            }
+            if w >> COUNT_BITS == tag {
+                total = total.saturating_add((w & u64::from(COUNT_MAX)) as u32);
+            }
+            i = (i + 1) & self.mask;
+        }
+        total
+    }
+
+    /// Slots with a count above zero, 0 to 1 of the table (a full scan).
+    pub(crate) fn active_load(&self) -> f32 {
+        let used = self
+            .words
+            .iter()
+            .filter(|w| w.load(Ordering::Relaxed) & u64::from(COUNT_MAX) != 0)
+            .count();
+        used as f32 / self.words.len() as f32
+    }
+
+    /// Bytes reserved by the words.
+    pub(crate) fn bytes(&self) -> u64 {
+        (self.words.len() * 8) as u64
+    }
+}
+
 #[cfg(all(test, not(bouncer_loom)))]
 mod tests {
     use super::*;

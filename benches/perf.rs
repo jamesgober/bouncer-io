@@ -56,6 +56,7 @@ fn main() {
     let f = fixture::fixture_with(Budgets::off().door_rate(rate, rate).capacity(1 << 20));
     let lookup = LookupOnly::new(&f.prefixes);
     let equal = EqualJob::new(&f.prefixes);
+    let equal_both = EqualJob::with_prefix_rate(&f.prefixes);
     let mut m = Mix(77);
     let random: Vec<IpAddr> = (0..1 << 16)
         .map(|_| {
@@ -113,6 +114,16 @@ fn main() {
                 let t = equal.door(i as u64, black_box(probes[i % n]));
                 if t.is_some() {
                     equal.release(i as u64);
+                }
+                black_box(t.is_some());
+            }),
+        );
+        row(
+            &format!("same-job composition, both rate tiers/{name}"),
+            measure(|i| {
+                let t = equal_both.door(i as u64, black_box(probes[i % n]));
+                if t.is_some() {
+                    equal_both.release(i as u64);
                 }
                 black_box(t.is_some());
             }),

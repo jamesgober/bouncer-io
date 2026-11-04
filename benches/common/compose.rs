@@ -88,15 +88,40 @@ pub struct EqualJob {
     allow: Tries,
     proxies: Tries,
     live: dashmap::DashMap<u64, Arc<AtomicBool>>,
+    /// A second rate check per prefix (/24, /48), as bouncer's door makes:
+    /// `None` for the composition as D-081 defines it (one rate check).
+    prefix_limiter: Option<governor::DefaultKeyedRateLimiter<u128>>,
+}
+
+/// The prefix a door's second rate tier is keyed by: /24 or /48.
+#[inline]
+fn prefix_of(addr: IpAddr) -> u128 {
+    match addr {
+        IpAddr::V4(a) => u128::from(u32::from(a) & 0xffff_ff00),
+        IpAddr::V6(a) => (u128::from(a) & !((1u128 << 80) - 1)) | 1,
+    }
 }
 
 impl EqualJob {
     pub fn new(bans: &[Cidr]) -> EqualJob {
+        Self::build(bans, false)
+    }
+
+    /// The composition with a rate check per address and per prefix: the
+    /// same rate work as bouncer's door with both tiers.
+    pub fn with_prefix_rate(bans: &[Cidr]) -> EqualJob {
+        Self::build(bans, true)
+    }
+
+    fn build(bans: &[Cidr], prefix_rate: bool) -> EqualJob {
         let mut e = EqualJob {
             inner: LookupOnly::new(bans),
             allow: Tries::default(),
             proxies: Tries::default(),
             live: dashmap::DashMap::new(),
+            prefix_limiter: prefix_rate.then(|| {
+                RateLimiter::keyed(Quota::per_second(NonZeroU32::new(1_000_000_000).unwrap()))
+            }),
         };
         for c in cidrs(&ALLOW) {
             e.allow.insert(&c);
@@ -113,8 +138,13 @@ impl EqualJob {
     /// handle, registered under its id.
     #[inline]
     pub fn door(&self, id: u64, addr: IpAddr) -> Option<Arc<AtomicBool>> {
-        let admitted =
-            self.proxies.covers(addr) || self.allow.covers(addr) || self.inner.admit(addr);
+        let admitted = self.proxies.covers(addr)
+            || self.allow.covers(addr)
+            || (self.inner.admit(addr)
+                && self
+                    .prefix_limiter
+                    .as_ref()
+                    .is_none_or(|l| l.check_key(&prefix_of(addr)).is_ok()));
         if !admitted {
             return None;
         }

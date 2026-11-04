@@ -28,12 +28,16 @@ pub(crate) const F_IMMUNE: u64 = 1 << 21;
 pub(crate) const F_CLIENT_BOUND: u64 = 1 << 22;
 /// The connection ticket is held by its tag, not by a handle.
 pub(crate) const F_DETACHED: u64 = 1 << 23;
-/// The connection holds door concurrency slots, returned on release.
+/// The connection was counted by the door's client concurrency tier, and
+/// is returned there on release.
 pub(crate) const F_CHARGED: u64 = 1 << 27;
 /// A request revoked by a revocation that keeps its connection open.
 pub(crate) const F_KEEP_CONNECTION: u64 = 1 << 28;
 /// The ticket holds a tenant in-flight slot, returned on release.
 pub(crate) const F_TENANT_CHARGED: u64 = 1 << 29;
+/// The connection was counted by the door's prefix concurrency tier
+/// (`F_CHARGED`: by its client tier).
+pub(crate) const F_CHARGED_PREFIX: u64 = 1 << 30;
 /// Provenance, three bits at 24..27.
 pub(crate) const PROVENANCE_SHIFT: u32 = 24;
 pub(crate) const PROVENANCE_MASK: u64 = 0b111 << PROVENANCE_SHIFT;
