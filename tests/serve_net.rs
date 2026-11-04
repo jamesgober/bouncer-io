@@ -295,3 +295,104 @@ fn test_serve_net_releases_tickets_after_a_clean_request() {
     assert!(eventually(|| bouncer.health().tickets_live == 0));
     drop(running);
 }
+
+/// A login page: a wrong password is a strike against the client the PROXY
+/// header named, and a 401.
+struct Login {
+    door: Door,
+}
+
+impl HttpService for Login {
+    fn head(&self, head: &HttpHead<'_>, env: &mut Envelope) -> HeadAction {
+        let bouncer = &self.door.bouncer;
+        let tag = self
+            .door
+            .tags
+            .lock()
+            .unwrap()
+            .get(&env.connection().get())
+            .copied();
+        let id = RequestId(u128::from(env.seq().get()));
+        let Some(Ok(request)) = tag.map(|t| bouncer.request(t, id)) else {
+            return HeadAction::refuse(503);
+        };
+        if head.header_str("password") != Some("right") {
+            let _ = request.strike(bouncer_io::StrikeKind::LoginFailed);
+            return HeadAction::refuse(401);
+        }
+        HeadAction::Proceed
+    }
+
+    fn call(&self, _request: &HttpRequest<'_>, _env: &Envelope, reply: &mut HttpReply) -> Outcome {
+        reply.text(200, "welcome");
+        Outcome::Done
+    }
+}
+
+#[test]
+fn test_serve_net_credential_stuffing_behind_a_proxy_bans_the_48() {
+    // The replay's credential stuffing trace through a real server: every
+    // attempt a new TCP connection from the proxy, its PROXY header naming
+    // a new /64 of one /48; a client of another /48 behind the same proxy
+    // logs in throughout.
+    let bouncer = Bouncer::builder()
+        .trusted_proxies(&["127.0.0.1/32".parse().unwrap()])
+        .budgets(bouncer_io::Budgets::off())
+        .enforcement(
+            bouncer_io::Enforcement::observe_all().enforce(bouncer_io::StrikeKind::LoginFailed),
+        )
+        .try_build()
+        .expect("bouncer");
+    let door = Door {
+        bouncer: bouncer.clone(),
+        tags: Arc::default(),
+    };
+    let trusted = serve_net::net_io::TrustedProxies::parse("127.0.0.1").expect("proxies");
+    let running = Server::builder()
+        .listener(
+            ListenerSpec::tcp("edge", "127.0.0.1:0").ingress(serve_net::Ingress::Proxy(
+                serve_net::ProxySource::proxy_protocol(
+                    serve_net::net_io::ProxyVersions::V1,
+                    trusted,
+                ),
+            )),
+        )
+        .gate(door.clone())
+        .serve(Login { door })
+        .expect("serve");
+    let addr = running.local_addr().expect("address");
+    let attempt = |client: &str, password: &str| {
+        let sent = format!(
+            "PROXY TCP6 {client} ::1 40000 80\r\nGET /login HTTP/1.1\r\nHost: localhost\r\npassword: {password}\r\nConnection: close\r\n\r\n"
+        );
+        refused(addr, sent.as_bytes())
+    };
+    assert!(attempt("2001:db8:78::1", "right").starts_with("HTTP/1.1 200"));
+    let mut through = 0;
+    for i in 0..200u16 {
+        // A new /64 every time, over sixteen /56s.
+        let client = format!("2001:db8:77:{:x}::1", ((i % 16) << 8) | (i / 16));
+        if attempt(&client, "wrong").starts_with("HTTP/1.1 401") {
+            through += 1;
+        }
+        if i % 20 == 0 {
+            assert!(
+                attempt("2001:db8:78::1", "right").starts_with("HTTP/1.1 200"),
+                "the innocent behind the same proxy is served"
+            );
+        }
+    }
+    eprintln!("stuffing through serve-net: {through} of 200 attempts reached the login page");
+    assert!(through <= 80, "{through} attempts reached the login page");
+    assert!(
+        attempt("2001:db8:77:ffff::9", "right").is_empty(),
+        "the /48 is refused after its PROXY header"
+    );
+    assert!(
+        bouncer
+            .door("2001:db8:77:ffff::9".parse().unwrap())
+            .is_err()
+    );
+    assert!(attempt("2001:db8:78::2", "right").starts_with("HTTP/1.1 200"));
+    drop(running);
+}
