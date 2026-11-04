@@ -310,12 +310,7 @@ mod tests {
 
     #[test]
     fn test_keyed_hasher_depends_on_its_key() {
-        use std::hash::Hash;
-        let one = |b: &Keyed| {
-            let mut h = b.build_hasher();
-            (7u8, 32u8, 0u64, 0xc000_0201u64).hash(&mut h);
-            h.finish()
-        };
+        let one = |b: &Keyed| b.hash_one((7u8, 32u8, 0u64, 0xc000_0201u64));
         let (a, b) = (Keyed::default(), Keyed::default());
         assert_eq!(one(&a), one(&a), "the same key hashes the same");
         assert_ne!(one(&a), one(&b), "two maps hash under different keys");
