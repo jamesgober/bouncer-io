@@ -1345,6 +1345,8 @@ Protocol-neutral; the adapter maps it. Typical mapping:
 | `Unauthorized` | 401 | 1008 | authentication required |
 | `Forbidden` | 403 | 1008 | permission denied |
 
+`code.http_status()` is the HTTP column (503, 404, 429, 401, 403) and `DenialCode::from_http_status(status)` maps it back (`None` for any other status); the net-io gate carries the HTTP status as its denial code (0.9).
+
 Revocations deny with `Forbidden` unless the directive says otherwise; a route that must hide that a resource exists asks for `NotFound` (`Directive::deny_with`). When a ticket is revoked twice the stronger code is kept (`Forbidden` above `Unauthorized` above `TooManyRequests` above `NotFound` above `Unavailable`); bytes already formatted never change.
 
 ### `DenialTable`
@@ -2003,7 +2005,7 @@ Tier 2 · P1 (lanes and tenants P2) · 0.4 / 0.5 · door share 20-30 ns [est.]
 
 **Eviction never resets a limit.** The budget table evicts only keys that have fully recovered. When it is full and nothing has recovered, a new key is charged against its parent prefix, then the global budget: a flood of new addresses cannot lock everyone out, and a key cannot reset itself by flooding.
 
-Door-level budget refusals close abortively like every refusal; identity-level ones deny with `TooManyRequests` and the retry hint goes to the event.
+Door-level budget refusals close abortively like every refusal. A client a trusted PROXY header names (`bind_client` with `Provenance::ProxyProtocol`) is charged the door budgets there; over them it is denied with `Forbidden` and its ticket revoked, exactly as when it is banned, so it cannot tell the two apart (T-8). Identity-level refusals deny with `TooManyRequests` and the retry hint goes to the event. A concurrency tier counts at most 1,048,575 live connections (or requests in flight) per key; keys whose hashes share their top 44 bits share one count.
 
 ```rust
 use bouncer_io::{Bouncer, Budgets, Rate, TenantKey};
@@ -2438,9 +2440,9 @@ Tier 3 · P0 · 0.8
 
 | net-io calls | bouncer does |
 |---|---|
-| `Gate::admit(info, stage)` | `door_at` with net-io's id and accept time (converted through the bouncer's clock base, so use the system clock); `Ok(Admitted { lane: info.lane, ticket, tag })`, where `ticket` is the connection's `ConnectionGate` and `tag` its `TicketTag`; or `Err(Refusal::Reset { code: REFUSED })`, silent and identical for every reason. A peer with no IP address (Unix socket, named pipe) enters as `LOCAL_PEER` with `Provenance::Local` |
+| `Gate::admit(info, stage)` | `door_at` with net-io's id and accept time (converted through the bouncer's clock base); `Ok(Admitted { lane: info.lane, ticket, tag })`, where `ticket` is the connection's `ConnectionGate` and `tag` its `TicketTag`; or `Err(Refusal::Reset { code: REFUSED })`, silent and identical for every reason. A peer with no IP address (Unix socket, named pipe) enters as `LOCAL_PEER` with `Provenance::Local`, a proxy hop when `LOCAL_PEER` is a trusted proxy (as a TCP peer from loopback is). With a clock of its own (`BouncerBuilder::clock`), the gate judges on that clock instead of net-io's accept time |
 | `Gate::readmit(ticket, info)` after a trusted PROXY header | `bind_client` on the connection ticket with `Provenance::ProxyProtocol` |
-| `Gate::check(ticket, write)` before every write | the egress check by tag (1.3 ns while nothing is revoked): when the session set a response tag (`write.response`), that request is judged; otherwise the connection and its latest request. `Err(Denial { code })` carries the `DenialCode` as a number (1 `Unavailable`, 2 `NotFound`, 3 `TooManyRequests`, 4 `Unauthorized`, 5 `Forbidden`); net-io wipes its pending output, has the session format the denial only if nothing of the response has left, and closes with `SO_LINGER` 0 |
+| `Gate::check(ticket, write)` before every write | the egress check by tag (1.3 ns while nothing is revoked): when the session set a response tag (`write.response`), that request is judged; otherwise the connection and its latest request. `Err(Denial { code })` carries the denial's HTTP status (`DenialCode::http_status`: 503, 404, 429, 401, 403), which serve-net answers with; another protocol's session maps it back with `DenialCode::from_http_status`. net-io wipes its pending output, has the session format the denial only if nothing of the response has left, and closes with `SO_LINGER` 0; on Windows the abortive close can discard the formatted denial before it is sent, so the client then sees only the reset |
 | `Gate::closed(ticket, info, reason)`, exactly once | releases the connection ticket (its live requests are revoked with `CONNECTION_CLOSED`, its concurrency slot returned); close reasons that mean misbehaviour (`SlowPeer`, `ProxyInvalid`, `ProxyUntrusted`, `TlsFailed`, `HelloRefused`) become strikes |
 | `ServerHandle::kill(id, EJECTED)` | used by `NetIoEjector`, so eject-now sweeps and idle checks can close connections bouncer holds only by id; a close after a flush is an abort too |
 
