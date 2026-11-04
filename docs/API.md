@@ -2402,7 +2402,7 @@ Tier 2 · P1 · 0.5 · counters are per shard, relaxed, on the shard's own cache
 
 ## net-io integration
 
-Feature `net-io`, version 0.8 (net-io 0.3 or later). net-io defines the `Gate` trait and calls it; bouncer implements it; net-io never depends on bouncer. The shape follows net-io's 0.2 design lock (decision D-015), with the changes of PLAN D-107.
+Feature `net-io`, version 0.8 (net-io 0.6 from bouncer 0.9; 0.8 used net-io 0.3). net-io defines the `Gate` trait and calls it; bouncer implements it; net-io never depends on bouncer. The shape follows net-io's 0.2 design lock (decision D-015), with the changes of PLAN D-107.
 
 ```rust
 #[cfg(feature = "net-io")] impl net_io::Gate for Bouncer { type Ticket = ConnectionGate; }

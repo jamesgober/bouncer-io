@@ -123,7 +123,7 @@ Exit:
 - [x] A logged-in browser whose session is revoked mid-request gets the generic denial and its connection is closed (`tests/net_io.rs`, `tests/serve_net.rs`: the generic denial and nothing of the body, then the connection closes; a real browser, 2026-11-02).
 - [x] A streamed response cut by revocation leaks at most one chunk (loopback capture: nothing after the revocation reaches the client).
 - [x] serve-net running with bouncer on Windows and WSL (serve-net 0.3).
-- [ ] NFR-10: the door 20% faster than the same-job composition, admitted and random peers (PLAN D-081). Not met at 0.8; moved to 0.9.0 (see Moves recorded).
+- [ ] NFR-10: the door 20% faster than the same-job composition, admitted and random peers (PLAN D-081). Not met at 0.8; moved to 0.9.0 (see Moves recorded). At 0.9.0: not met against D-081's composition; a re-derived target is with James (D-120).
 
 NFR-10 work at 0.8 (A/B against the 0.7 base, pinned to one core; the totals, 0.7.0 against this branch, are in `docs/PERFORMANCE.md`):
 
@@ -168,10 +168,26 @@ Items:
   - The limits recorded with D-105 (19-bit slot version, long-key fingerprints), D-106 (slot alignment), D-108 (prefix strike bans of many people's strikes), D-109 (a shared address gets its prefix's door budget), and persistence rollback (not covered, `docs/SECURITY.md`).
 - A fresh performance pass on a quiet machine: every PLAN 11 target and both compositions re-measured, profiles of the door, ticket, bind, and insert paths, and every idea the profiles suggest tried by pinned A/B (kept or dropped with the numbers recorded).
 - The security and edge-case review run again in full: every threat of PLAN 8 and every edge case of PLAN 13 against the code as it is then, an adversarial review of everything changed since 0.7, and the fuzz targets and the soak for 24 hours on the final code.
+Status at 0.9.0:
+
+| Item | Outcome |
+|---|---|
+| NFR-10 | Not met against D-081's composition (admitted 16.3% faster, random peers at parity, near the bans 27.6% faster); met against a composition doing the same rate work (27.2%, 15.4%, 42.2%); 2.9 times its throughput at 32 threads. Measured by within-run ratios (D-120); a re-derived target goes to James in `docs/READINESS-1.0.md` |
+| The door's p99 per call | Measured with a nanosecond timer: 111 ns median, 462 ns p99 for cold random peers at best, on a fully loaded host. Re-derived target proposed (D-121); to be measured on an idle machine before 1.0 |
+| Ticket at 32 threads | Measured for the first time: 162 ns median, shards sharing cache lines; fixed (D-113): 57.9 ns at 32 threads, 42.4 at one. Re-derived target proposed (D-121) |
+| Ban insert | Back to about 0.7.0's cost: 4% faster than 0.8.0 in an alternating run (within that run's noise), with 24% fewer instructions per insert (keyed hashing for the writer's maps, a tag-first scan, no division per probe step) |
+| net-io 0.4 and later | Done: net-io 0.6, serve-net 0.6.1 (D-115; net-io 0.5.0, the first target, was yanked for a slowloris defect in its reactor); `readmit` through a real PROXY listener; the credential stuffing trace through serve-net behind a PROXY listener (79 of 200 attempts reach the login page, then the /48 is refused after its header) |
+| `NetIoEjector` after-flush aborts | Kept: net-io has no flush-then-close by id (readiness note) |
+| serve-net's envelope tag | Kept: serve-net's change (readiness note; a follow-up there) |
+| serve-net's 403 for every denial | Fixed: the gate's denial is the HTTP status (D-114) |
+| Limits of D-105, D-106, D-108, D-109, persistence rollback | Kept, each with its reason and cost in the readiness note; D-106's alignment is speed only |
+| Performance pass | Done: profiles of the door, ticket, bind, and insert paths (Callgrind by source line, now printed by CI); kept: D-113, the anchors (D-118), the insert work; dropped with reasons: a per-thread cache of free cells (breaks the registry's exact capacity), merging the release's two read-modify-writes (loses a tenant slot under a forced release), returning the slot from an insert to save the restamp's probe (a few nanoseconds on a cold path) |
+| Review | Done: an adversarial review of everything since 0.7 (nine findings: D-116 to D-119, all fixed test-first), every threat and edge case against the tests (D-122: 11 closed); FUZZ_SOAK_ROADMAP |
+
 Exit:
-- [ ] Every item above fixed, or kept with its reason and cost in the 1.0 readiness note.
-- [ ] The performance pass and the review recorded (findings fixed test-first; numbers in `docs/PERFORMANCE.md`).
-- [ ] `docs/READINESS-1.0.md` written for James: what is done, what is still open and why, what each open item costs, and a recommendation.
+- [x] Every item above fixed, or kept with its reason and cost in the 1.0 readiness note.
+- [x] The performance pass and the review recorded (findings fixed test-first; numbers in `docs/PERFORMANCE.md`).
+- [x] `docs/READINESS-1.0.md` written for James: what is done, what is still open and why, what each open item costs, and a recommendation.
 
 ## v0.9.x - Beta and release candidates
 Items: used end to end by the web stack and one non-HTTP service (a database network layer or the back-channel); API review against the simple-API rule; `cargo-semver-checks` in CI; release candidates `0.9.x`, only after the pre-1.0 polish exits.
