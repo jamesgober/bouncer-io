@@ -311,6 +311,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_every_denial_code_round_trips_its_http_status() {
+        for code in [
+            DenialCode::Unavailable,
+            DenialCode::NotFound,
+            DenialCode::TooManyRequests,
+            DenialCode::Unauthorized,
+            DenialCode::Forbidden,
+        ] {
+            assert_eq!(DenialCode::from_http_status(code.http_status()), Some(code));
+        }
+        assert_eq!(DenialCode::from_http_status(500), None);
+    }
+
+    #[test]
     fn test_verdict_helpers() {
         let d = Denial::new(DenialCode::Forbidden, Reference::new(1));
         assert!(Verdict::Pass.is_pass());

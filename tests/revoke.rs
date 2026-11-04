@@ -1038,3 +1038,36 @@ fn test_new_binds_of_a_revoked_session_are_still_refused() {
     let mut request = conn.request(RequestId(1)).unwrap();
     assert!(request.bind_session(session).is_deny());
 }
+
+#[test]
+fn test_revocation_storm_applies_every_revocation_and_reports_the_excess() {
+    // T-12: automated revocations above the rate (10,000 a second by
+    // default) still apply (they are security actions); the excess is
+    // reported in Observe mode.
+    let events = Arc::new(Events::default());
+    let b = Bouncer::builder()
+        .clock(Arc::new(ManualClock::new()))
+        .event_sink(events.clone())
+        .try_build()
+        .unwrap();
+    let conn = b.door(ip("192.0.2.5")).unwrap();
+    for i in 0..10_050u128 {
+        b.apply(Directive::revoke(AccountKey(i)).by(Actor::Policy(1)))
+            .unwrap();
+    }
+    let excess = events
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(id, mode)| {
+            *id == signals::REVOKE_APPLIED.id && *mode == bouncer_io::Mode::Observe
+        })
+        .count();
+    assert!(excess >= 1, "the storm is reported");
+    let mut last = conn.request(RequestId(1)).unwrap();
+    assert!(
+        last.bind_account(AccountKey(10_049)).is_deny(),
+        "the last revocation took effect"
+    );
+}

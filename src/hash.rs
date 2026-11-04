@@ -308,6 +308,26 @@ impl Seeds {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_keyed_hasher_depends_on_its_key() {
+        use std::hash::Hash;
+        let one = |b: &Keyed| {
+            let mut h = b.build_hasher();
+            (7u8, 32u8, 0u64, 0xc000_0201u64).hash(&mut h);
+            h.finish()
+        };
+        let (a, b) = (Keyed::default(), Keyed::default());
+        assert_eq!(one(&a), one(&a), "the same key hashes the same");
+        assert_ne!(one(&a), one(&b), "two maps hash under different keys");
+        let fixed = Keyed(HashKey::new(1, 2));
+        let field = |x: u64| {
+            let mut h = fixed.build_hasher();
+            h.write_u64(x);
+            h.finish()
+        };
+        assert_ne!(field(1), field(2));
+    }
+
     /// The round function, message schedule, and finalization are checked
     /// against the standard library's SipHash-2-4; SipHash-1-3 is the same
     /// construction with fewer rounds.

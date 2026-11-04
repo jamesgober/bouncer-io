@@ -194,51 +194,33 @@ fn loom_l5_revoke_never_lands_on_next_generation() {
     });
 }
 
-/// L-6: two admissions racing for a concurrency limit of one never both pass,
-/// and releases never take the count below zero.
+/// L-6: two admissions of one key racing for a concurrency limit of one
+/// never both pass, and releases never take the count below zero. The steps
+/// are those of the door's concurrency tiers (`Counts`, D-117).
 #[test]
 fn loom_l6_concurrency_counter_never_underflows() {
     loom::model(|| {
-        let count = Arc::new(crate::sync::AtomicU32::new(0));
-        let limit = 1u32;
-        let admit = move |c: &crate::sync::AtomicU32| {
-            let before = c.fetch_add(1, Ordering::AcqRel);
-            if before >= limit {
-                c.fetch_sub(1, Ordering::AcqRel);
-                false
-            } else {
-                true
-            }
-        };
-        let release = move |c: &crate::sync::AtomicU32| {
-            let mut v = c.load(Ordering::Acquire);
-            while v > 0 {
-                match c.compare_exchange_weak(v, v - 1, Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) => break,
-                    Err(actual) => v = actual,
-                }
-            }
-        };
-        let c2 = Arc::clone(&count);
+        let counts = Arc::new(crate::claims::Counts::new(16));
+        let key = crate::claims::Claims::key(0x5eed);
+        let c2 = Arc::clone(&counts);
         let other = thread::spawn(move || {
-            let ok = admit(&c2);
+            let ok = c2.acquire(key, 1, || false) == Ok(true);
             if ok {
-                release(&c2);
+                c2.release(key);
             }
             ok
         });
-        let mine = admit(&count);
+        let mine = counts.acquire(key, 1, || false) == Ok(true);
         let theirs = other.join().unwrap();
         if mine {
             // Both can pass only if the other released first.
-            release(&count);
+            counts.release(key);
         }
         let _ = theirs;
-        assert_eq!(
-            count.load(Ordering::Acquire),
-            0,
-            "the count leaked or underflowed"
-        );
+        assert_eq!(counts.count(key), 0, "the count leaked or underflowed");
+        // A release with nothing counted takes nothing.
+        counts.release(key);
+        assert_eq!(counts.count(key), 0);
     });
 }
 

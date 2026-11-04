@@ -1930,6 +1930,49 @@ mod tests {
     }
 
     #[test]
+    fn test_reseeds_are_reported_once_however_callers_race() {
+        let m = std::sync::Arc::new(mem(64));
+        for _ in 0..3 {
+            m.force_reseed();
+        }
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let m = std::sync::Arc::clone(&m);
+                std::thread::spawn(move || m.take_reseeds())
+            })
+            .collect();
+        let total: u64 = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        assert_eq!(total, 3);
+        assert_eq!(m.take_reseeds(), 0);
+    }
+
+    #[test]
+    fn test_an_anchor_holds_at_most_its_first_groups() {
+        // 100 /64s of one /48 fit the anchor's whole sequence, but an
+        // anchored key may use only its first four groups (D-118): the
+        // rest spill, and the anchor is marked.
+        let m = mem(4096);
+        let s = Sets::none();
+        let v6 = crowd(
+            &m,
+            &s,
+            |i| {
+                IpAddr::V6(std::net::Ipv6Addr::new(
+                    0x2001, 0xdb8, 0x44, i as u16, 0, 0, 0, 1,
+                ))
+            },
+            100,
+        );
+        let g = m
+            .table
+            .with(|t| t.locate(&BanMemory::key_at(&Cidr::host(v6[0]), 48)).0);
+        assert!(m.table.with(|t| t.overflowed(g)));
+        for &a in &v6 {
+            assert!(matches!(m.lookup_addr(a, 0), Lookup::Banned(_)), "{a}");
+        }
+    }
+
+    #[test]
     fn test_anchored_bans_survive_a_reseed() {
         let m = mem(4096);
         let s = Sets::none();

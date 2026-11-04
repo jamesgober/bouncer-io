@@ -48,6 +48,8 @@ jobs:
         run: cargo test --all-features
       - name: Test (no default features)
         run: cargo test --no-default-features
+      - name: Test in release (secret wiping and the ban and lift rate)
+        run: cargo test --release --all-features --test wipe --test edges
       - name: Build examples
         run: cargo build --examples
       - name: Doc (all features)

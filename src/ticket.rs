@@ -618,9 +618,13 @@ impl Ticket {
                 shared.sources.is_shared(addr, now.secs())
             }) {
                 Ok(c) => c,
-                // The same denial as a ban (T-8): a client must not tell
-                // the two apart.
-                Err(_) => return self.deny(DenialCode::Forbidden),
+                // The same denial as a ban, with the same effect on the
+                // ticket (T-8): a client must not tell the two apart.
+                Err(_) => {
+                    mark_revoked(cell, self.generation, DenialCode::Forbidden);
+                    self.seen = SEEN_ALWAYS_CHECK;
+                    return self.deny(DenialCode::Forbidden);
+                }
             }
         } else {
             crate::budgets::Charged::NONE

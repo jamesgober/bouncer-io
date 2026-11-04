@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
 
 use bouncer_io::{
     AccountKey, Actor, AllowList, BanSpec, Bouncer, BouncerError, Budgets, Cidr, Delta, Filter,
-    ImportError, NodeId, Page, Reason, RequestId, Sequence, SessionKey,
+    ImportError, LiftSpec, NodeId, Page, Reason, RequestId, Sequence, SessionKey,
 };
 use clock_lib::ManualClock;
 
@@ -272,31 +272,44 @@ fn test_delta_past_the_skew_bound_refused_with_an_event() {
 
 #[test]
 fn test_node_a_day_ahead_cannot_poison_the_cluster() {
-    // T-27: a node with a broken clock is one day ahead.
-    let clock = Arc::new(ManualClock::new());
-    let ahead = Arc::new(ManualClock::new());
-    ahead.step_wall_forward(Duration::from_secs(86_400));
-    let a = node(1, &clock);
-    let b = node(2, &clock);
-    let c = node(3, &ahead);
-    a.ban(ip("198.51.100.1")).unwrap();
-    let _ = b
-        .import(&a.export_delta(Sequence::START).unwrap(), Actor::Channel(1))
-        .unwrap();
-    let _ = c
-        .import(&a.export_delta(Sequence::START).unwrap(), Actor::Channel(1))
-        .unwrap();
-    // C lifts it with a stamp a day in the future, and bans something.
-    c.ban(ip("198.51.100.2")).unwrap();
-    let report = b
-        .import(&c.export_delta(Sequence::START).unwrap(), Actor::Channel(3))
-        .unwrap();
-    assert!(report.rejected >= 1);
+    // T-27: a node with a broken clock, `ahead` seconds fast, lifts A's ban
+    // as an administrator and bans something; B takes its delta through the
+    // administration channel, where a lift reaches every node's bans.
+    // Returns whether A's ban still stands on B and whether C's ban landed.
+    let run = |ahead: u64| {
+        let clock = Arc::new(ManualClock::new());
+        let fast = Arc::new(ManualClock::new());
+        fast.step_wall_forward(Duration::from_secs(ahead));
+        let a = node(1, &clock);
+        let b = node(2, &clock);
+        let c = node(3, &fast);
+        // Permanent, so the node a day ahead holds it too.
+        a.ban(BanSpec::address(ip("198.51.100.1")).permanent())
+            .unwrap();
+        let delta = a.export_delta(Sequence::START).unwrap();
+        let _ = b.import(&delta, Actor::Channel(1)).unwrap();
+        let _ = c.import(&delta, Actor::Channel(1)).unwrap();
+        c.lift(LiftSpec::key(ip("198.51.100.1")).by(Actor::Admin(3)))
+            .unwrap();
+        c.ban(ip("198.51.100.2")).unwrap();
+        let report = b
+            .import(&c.export_delta(Sequence::START).unwrap(), Actor::Admin(3))
+            .unwrap();
+        (
+            b.door(ip("198.51.100.1")).is_err(),
+            b.door(ip("198.51.100.2")).is_err(),
+            report.rejected,
+        )
+    };
+    let (stands, landed, _) = run(0);
     assert!(
-        b.door(ip("198.51.100.2")).is_ok(),
-        "a future-stamped ban is refused"
+        !stands && landed,
+        "with a sound clock the lift and the ban apply"
     );
-    assert!(b.door(ip("198.51.100.1")).is_err());
+    let (stands, landed, rejected) = run(86_400);
+    assert!(rejected >= 2, "both records are refused: {rejected}");
+    assert!(stands, "a future-stamped lift is refused: A's ban stands");
+    assert!(!landed, "a future-stamped ban is refused");
 }
 
 #[test]

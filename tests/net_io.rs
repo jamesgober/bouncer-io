@@ -290,6 +290,25 @@ fn test_net_io_revoked_session_gets_the_generic_denial_and_is_closed() {
 }
 
 #[test]
+fn test_net_io_denial_code_is_the_directives_http_status() {
+    let bouncer = Bouncer::new();
+    let (_server, addr, rx) = server(&bouncer);
+    let mut c = client(addr);
+    c.write_all(b"open\n").expect("write");
+    rx.recv_timeout(WAIT).expect("request opened");
+    bouncer
+        .apply(
+            bouncer_io::Directive::revoke(session_key())
+                .deny_with(bouncer_io::DenialCode::TooManyRequests),
+        )
+        .expect("revoke");
+    c.write_all(b"chunk\n").expect("write");
+    let mut got = Vec::new();
+    let _ = c.read_to_end(&mut got);
+    assert_eq!(got, b"denied 429\n");
+}
+
+#[test]
 fn test_net_io_stream_cut_by_revocation_leaks_at_most_one_chunk() {
     let bouncer = Bouncer::new();
     let (server, addr, rx) = server(&bouncer);

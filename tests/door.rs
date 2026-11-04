@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use bouncer_io::Rate;
 use bouncer_io::{
     AccountKey, Actor, AllowList, BanKey, BanSpec, Bouncer, BouncerError, Budgets, Cidr, ConnId,
     DenialCode, DurationPolicy, Event, EventSink, FingerprintKey, LiftSpec, Now, Provenance,
@@ -255,6 +256,35 @@ fn test_proxied_client_cannot_tell_a_ban_from_a_spent_budget() {
     };
     // Over its concurrency budget (the first connection holds its one).
     assert_eq!(code("198.51.100.4"), code("203.0.113.9"));
+    // Over its rate, and what each refusal leaves behind: the connection is
+    // revoked either way.
+    let clock = Arc::new(ManualClock::new());
+    let rated = Bouncer::builder()
+        .clock(clock)
+        .trusted_proxies(&[c("10.0.0.1/32")])
+        .budgets(Budgets::off().door_rate(Rate::per_second(1).burst(1), Rate::per_second(1000)))
+        .try_build()
+        .unwrap();
+    rated.ban(ip("203.0.113.9")).unwrap();
+    let mut first = rated.door(ip("10.0.0.1")).unwrap();
+    assert!(
+        first
+            .bind_client(ip("198.51.100.4"), Provenance::ProxyProtocol)
+            .is_pass()
+    );
+    let after = |client: &str| {
+        let mut hop = rated.door(ip("10.0.0.1")).unwrap();
+        let code = match hop.bind_client(ip(client), Provenance::ProxyProtocol) {
+            Verdict::Deny(d) => d.code,
+            _ => panic!("{client} admitted"),
+        };
+        let next = hop
+            .request(RequestId(9))
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        (code, next, hop.checkpoint().is_deny())
+    };
+    assert_eq!(after("198.51.100.4"), after("203.0.113.9"));
 }
 
 #[test]
@@ -533,6 +563,13 @@ fn test_stale_now_never_expires_early_and_end_is_exclusive() {
             .is_ok(),
         "until <= now"
     );
+    // A stale time after a later one is used as given: it can only make a
+    // ban look less expired, never more.
+    assert!(
+        b.door_at(ConnId(4), ip("192.0.2.1"), Provenance::Socket, at(105))
+            .is_err(),
+        "a stale now after the end still refuses"
+    );
     clock.advance(Duration::from_secs(10));
     assert!(admitted(&b, "192.0.2.1"));
 }
@@ -705,6 +742,31 @@ fn test_registry_flood_from_one_address_cannot_exhaust_it() {
         }
     }
     assert!(held.len() <= 64, "one address held {}", held.len());
+    assert!(
+        b.door(ip("192.0.2.77")).is_ok(),
+        "a legitimate address is still admitted"
+    );
+}
+
+#[test]
+fn test_registry_flood_from_one_prefix_leaves_room_for_others() {
+    // Threat T-14: 1,000 addresses of one /48 hold at most the prefix's
+    // concurrency limit, far below the registry's capacity.
+    let b = Bouncer::builder()
+        .tickets(2048)
+        .budgets(Budgets::default())
+        .try_build()
+        .unwrap();
+    let mut held = Vec::new();
+    for i in 0..1000u16 {
+        for _ in 0..4 {
+            let peer = IpAddr::from([0x2001, 0xdb8, 0x40, i, 0, 0, 0, 1]);
+            if let Ok(t) = b.door(peer) {
+                held.push(t);
+            }
+        }
+    }
+    assert!(held.len() <= 512, "one /48 held {}", held.len());
     assert!(
         b.door(ip("192.0.2.77")).is_ok(),
         "a legitimate address is still admitted"
