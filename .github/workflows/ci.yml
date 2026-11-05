@@ -48,6 +48,8 @@ jobs:
         run: cargo test --all-features
       - name: Test (no default features)
         run: cargo test --no-default-features
+      - name: Test in release (secret wiping and the ban and lift rate)
+        run: cargo test --release --all-features --test wipe --test edges
       - name: Build examples
         run: cargo build --examples
       - name: Doc (all features)
@@ -94,6 +96,14 @@ jobs:
           valgrind --tool=callgrind --callgrind-out-file=callgrind.out "$exe" --bench
       - name: Compare with the baseline (5% limit)
         run: python3 scripts/gate.py callgrind.out
+      - name: Profile the door by source line (for tuning; not a gate)
+        run: |
+          exe=$(ls -t target/release/deps/gate-* | grep -v '\.d$' | head -1)
+          for f in gate_door_admitted gate_door_banned; do
+            valgrind --tool=callgrind --toggle-collect="*$f*" --callgrind-out-file="$f.out" "$exe" --bench 2>/dev/null
+            echo "== $f: instructions per source line (10,000 operations) =="
+            callgrind_annotate --auto=yes --context=0 "$f.out" 2>/dev/null | awk '$1 ~ /^[0-9,]+$/ { n = $1; gsub(",", "", n); if (n + 0 >= 20000) print n "	" $0 }' | sort -rn | cut -f2- | head -60
+          done
 
   loom:
     name: Loom models

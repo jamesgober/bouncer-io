@@ -56,11 +56,23 @@ fn main() {
     let f = fixture::fixture_with(Budgets::off().door_rate(rate, rate).capacity(1 << 20));
     let lookup = LookupOnly::new(&f.prefixes);
     let equal = EqualJob::new(&f.prefixes);
+    let equal_both = EqualJob::with_prefix_rate(&f.prefixes);
     let mut m = Mix(77);
     let random: Vec<IpAddr> = (0..1 << 16)
         .map(|_| {
             if m.next() % 2 == 0 {
                 IpAddr::from((m.next() as u32).to_be_bytes())
+            } else {
+                fixture::v6((u128::from(m.next()) << 64) | (0x2001u128 << 112))
+            }
+        })
+        .collect();
+    // Random peers inside the space the bans cover (IPv4 with the top bit
+    // set, IPv6 under 2001::/16): a trie cannot stop at its root for these.
+    let near: Vec<IpAddr> = (0..1 << 16)
+        .map(|_| {
+            if m.next() % 2 == 0 {
+                IpAddr::from((m.next() as u32 | 0x8000_0000).to_be_bytes())
             } else {
                 fixture::v6((u128::from(m.next()) << 64) | (0x2001u128 << 112))
             }
@@ -74,6 +86,7 @@ fn main() {
     for (name, probes) in [
         ("admitted", &f.admitted),
         ("random", &random),
+        ("random near bans", &near),
         ("banned", &f.banned),
     ] {
         let n = probes.len();
@@ -106,6 +119,16 @@ fn main() {
             }),
         );
         row(
+            &format!("same-job composition, both rate tiers/{name}"),
+            measure(|i| {
+                let t = equal_both.door(i as u64, black_box(probes[i % n]));
+                if t.is_some() {
+                    equal_both.release(i as u64);
+                }
+                black_box(t.is_some());
+            }),
+        );
+        row(
             &format!("lookup-only composition/{name}"),
             measure(|i| {
                 black_box(lookup.admit(black_box(probes[i % n])));
@@ -129,6 +152,12 @@ fn main() {
                 f.bouncer
                     .datagram(black_box(f.admitted[i & 4095]), true, now),
             );
+        }),
+    );
+    row(
+        "datagram with both rate tiers, random",
+        measure(|i| {
+            let _ = black_box(f.bouncer.datagram(black_box(random[i & 0xffff]), true, now));
         }),
     );
     let no_rate = fixture::build(Budgets::off(), 10_000);
@@ -164,6 +193,16 @@ fn main() {
                 true,
                 now,
             ));
+        }),
+    );
+    row(
+        "judge only: 1m bans and admin set, random",
+        measure(|i| {
+            let _ = black_box(
+                no_rate
+                    .bouncer
+                    .datagram(black_box(random[i & 0xffff]), true, now),
+            );
         }),
     );
     drop(no_rate);

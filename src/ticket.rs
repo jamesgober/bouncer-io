@@ -613,16 +613,22 @@ impl Ticket {
         // A PROXY-protocol client is a connection: it is charged the door
         // budgets the proxy hop was not.
         let charge = self.kind == TicketKind::Connection && !exempt;
-        if charge
-            && shared
-                .budgets
-                .admit(addr, now, shared.door_divisor(), || {
-                    shared.sources.is_shared(addr, now.secs())
-                })
-                .is_err()
-        {
-            return self.deny(DenialCode::TooManyRequests);
-        }
+        let charged = if charge {
+            match shared.budgets.admit(addr, now, shared.door_divisor(), || {
+                shared.sources.is_shared(addr, now.secs())
+            }) {
+                Ok(c) => c,
+                // The same denial as a ban, with the same effect on the
+                // ticket (T-8): a client must not tell the two apart.
+                Err(_) => {
+                    mark_revoked(cell, self.generation, DenialCode::Forbidden);
+                    self.seen = SEEN_ALWAYS_CHECK;
+                    return self.deny(DenialCode::Forbidden);
+                }
+            }
+        } else {
+            crate::budgets::Charged::NONE
+        };
         let present = write_source(cell, addr);
         cell.present_child
             .fetch_or(present << PRESENT_SHIFT, Ordering::AcqRel);
@@ -636,15 +642,16 @@ impl Ticket {
             if immune {
                 next |= F_IMMUNE;
             }
-            if charge {
+            if charged.client() {
                 next |= F_CHARGED;
+            }
+            if charged.prefix() {
+                next |= crate::registry::F_CHARGED_PREFIX;
             }
             Some(next)
         });
         if updated.is_err() {
-            if charge {
-                shared.budgets.release_connection(Some(addr), now);
-            }
+            shared.budgets.release_connection(Some(addr), charged);
             return self.deny(DenialCode::Unavailable);
         }
         // The client may fall under a source revocation: run the full check.
@@ -1564,10 +1571,14 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
                     .send(shared);
                 }
             }
-            if st & F_CHARGED != 0 {
+            let charged = crate::budgets::Charged::from_flags(
+                st & F_CHARGED != 0,
+                st & crate::registry::F_CHARGED_PREFIX != 0,
+            );
+            if charged != crate::budgets::Charged::NONE {
                 shared
                     .budgets
-                    .release_connection(source_present(cell, present_child), shared.now());
+                    .release_connection(source_present(cell, present_child), charged);
             }
         }
         TicketKind::Request => {

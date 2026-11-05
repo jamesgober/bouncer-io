@@ -73,17 +73,18 @@ struct Guard(Bouncer);
 
 impl Checkpoint for Guard {
     fn check(&self, env: &Envelope, at: CheckpointAt) -> Verdict {
-        let revoked = at == CheckpointAt::BeforeReply
-            && env.user_word() != 0
-            && self
-                .0
-                .egress(TicketTag::from_raw(env.user_word()))
-                .is_deny();
-        if revoked {
-            Verdict::Deny { status: 403 }
-        } else {
-            Verdict::Pass
+        if at == CheckpointAt::BeforeReply && env.user_word() != 0 {
+            // The denial's own status: 403 for a revocation, 429 or 503 when
+            // the directive said so.
+            if let bouncer_io::Verdict::Deny(d) =
+                self.0.egress(TicketTag::from_raw(env.user_word()))
+            {
+                return Verdict::Deny {
+                    status: d.code.http_status(),
+                };
+            }
         }
+        Verdict::Pass
     }
 }
 

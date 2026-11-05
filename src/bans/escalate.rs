@@ -205,7 +205,7 @@ pub(crate) struct Plan {
 #[derive(Debug, Default)]
 pub(crate) struct Tracker {
     /// parent -> (child, noted at secs)
-    parents: HashMap<Cidr, Vec<(Cidr, u64)>>,
+    parents: HashMap<Cidr, Vec<(Cidr, u64)>, crate::hash::Keyed>,
     /// Parents in the order they were first noted, for evicting the oldest
     /// in constant time. May hold parents already gone; they are skipped.
     order: VecDeque<Cidr>,

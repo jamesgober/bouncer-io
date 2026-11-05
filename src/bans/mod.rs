@@ -553,7 +553,16 @@ impl BanMemory {
             HashKey::new(rng.next_u64(), rng.next_u64()),
         );
         BanMemory {
-            table: Tables::new(Table::new(capacity, key)),
+            // Each family's shortest automatic length anchors the longer
+            // ones (D-104): a door lookup reads one group for them all.
+            table: Tables::new(Table::with_anchors(
+                capacity,
+                key,
+                (
+                    v4_lengths.iter().copied().min(),
+                    v6_lengths.iter().copied().min(),
+                ),
+            )),
             reseeds_seen: std::sync::atomic::AtomicU64::new(0),
             present_v4: AtomicU64::new(0),
             present_v6: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
@@ -1218,12 +1227,22 @@ impl BanMemory {
         self.lookup_hashed(&mut hashes, now_secs)
     }
 
+    /// Rebuilds the table under a fresh key now (tests).
+    #[cfg(all(test, not(bouncer_loom)))]
+    pub(crate) fn force_reseed(&self) {
+        let mut w = self.lock();
+        assert!(self.table.reseed(&mut w.table));
+    }
+
     /// Reseeds since the last call (each is reported once).
     pub(crate) fn take_reseeds(&self) -> u64 {
         let now = self.table.reseeds();
-        now - self
-            .reseeds_seen
-            .swap(now, std::sync::atomic::Ordering::Relaxed)
+        // Two callers can read the count in one order and record it in the
+        // other: the larger value wins, and the later caller reports none.
+        now.saturating_sub(
+            self.reseeds_seen
+                .fetch_max(now, std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// As [`lookup_addr`](Self::lookup_addr), through a hash cache the door
@@ -1337,8 +1356,14 @@ impl BanMemory {
                 (Some(g), Some(t)) if anchor.is_some_and(|a| len >= a) => (g, t),
                 _ => (spots[i].0, table.first_tags(spots[i].0)),
             };
+            // An anchored length uses the anchor's first groups only.
+            let groups = if anchor.is_some_and(|a| len > a) {
+                table::ANCHOR_GROUPS
+            } else {
+                table::MAX_PROBE
+            };
             // The full key is only compared on a tag match.
-            match table.find_at(&keys[i], g, spots[i].1, tags, now_secs) {
+            match table.find_at(&keys[i], g, spots[i].1, tags, now_secs, groups) {
                 Probe::Hit(e) => return Some(Lookup::Banned(e.id)),
                 Probe::Busy => busy = true,
                 Probe::Miss => {}
@@ -1352,7 +1377,14 @@ impl BanMemory {
                     }
                     let own = table.locate(&keys[i]).0;
                     let tag = spots[i].1;
-                    match table.find_at(&keys[i], own, tag, table.first_tags(own), now_secs) {
+                    match table.find_at(
+                        &keys[i],
+                        own,
+                        tag,
+                        table.first_tags(own),
+                        now_secs,
+                        table::MAX_PROBE,
+                    ) {
                         Probe::Hit(e) => return Some(Lookup::Banned(e.id)),
                         Probe::Busy => busy = true,
                         Probe::Miss => {}
@@ -1807,6 +1839,164 @@ mod tests {
             Now::default(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_anchors_are_each_familys_shortest_automatic_length() {
+        let m = mem(64);
+        assert_eq!(m.table.with(Table::anchors), (Some(24), Some(48)));
+    }
+
+    /// Bans `n` addresses inside `prefix` (hosts for IPv4, /64s for IPv6).
+    fn crowd(m: &BanMemory, s: &Sets, inside: impl Fn(u32) -> IpAddr, n: u32) -> Vec<IpAddr> {
+        (0..n)
+            .map(|i| {
+                let a = inside(i);
+                m.ban(
+                    &BanSpec::address(a).permanent(),
+                    &s.guards(),
+                    Now::default(),
+                )
+                .unwrap();
+                a
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_crowded_anchor_overflows_and_every_ban_is_found() {
+        // Every host of one /24 and 300 /64s of one /48: far more keys than
+        // the anchor's probe sequence holds, so the rest live in their own
+        // sequences and the anchor group is marked.
+        let m = mem(4096);
+        let s = Sets::none();
+        let v4 = crowd(&m, &s, |i| IpAddr::from([198, 51, 100, i as u8]), 256);
+        let v6 = crowd(
+            &m,
+            &s,
+            |i| {
+                IpAddr::V6(std::net::Ipv6Addr::new(
+                    0x2001, 0xdb8, 5, i as u16, 0, 0, 0, 9,
+                ))
+            },
+            300,
+        );
+        let anchor_group = |a: IpAddr, len: u8| {
+            m.table
+                .with(|t| t.locate(&BanMemory::key_at(&Cidr::host(a), len)).0)
+        };
+        let g4 = anchor_group(v4[0], 24);
+        let g6 = anchor_group(v6[0], 48);
+        assert!(
+            m.table.with(|t| t.overflowed(g4)),
+            "the /24's group overflowed"
+        );
+        assert!(
+            m.table.with(|t| t.overflowed(g6)),
+            "the /48's group overflowed"
+        );
+        for &a in v4.iter().chain(&v6) {
+            assert!(
+                matches!(m.lookup_addr(a, 0), Lookup::Banned(_)),
+                "{a} banned"
+            );
+        }
+        // Neighbours outside the bans are clear.
+        assert_eq!(m.lookup_addr(ip("198.51.101.1"), 0), Lookup::Clear);
+        assert_eq!(m.lookup_addr(ip("2001:db8:5:12c::1"), 0), Lookup::Clear);
+        assert_eq!(m.lookup_addr(ip("2001:db8:6::1"), 0), Lookup::Clear);
+        // Lift every other one: the lifted are clear, the rest still banned,
+        // wherever each lived.
+        for (i, &a) in v4.iter().chain(&v6).enumerate() {
+            if i % 2 == 0 {
+                assert_eq!(m.lift(&LiftSpec::key(a)).unwrap().removed, 1, "{a}");
+            }
+        }
+        for (i, &a) in v4.iter().chain(&v6).enumerate() {
+            let banned = matches!(m.lookup_addr(a, 0), Lookup::Banned(_));
+            assert_eq!(banned, i % 2 == 1, "{a}");
+        }
+        // A ban of the anchor prefix itself covers everything inside it.
+        m.ban(
+            &BanSpec::prefix(c("198.51.100.0/24")),
+            &s.guards(),
+            Now::default(),
+        )
+        .unwrap();
+        assert!(
+            v4.iter()
+                .all(|&a| matches!(m.lookup_addr(a, 0), Lookup::Banned(_)))
+        );
+    }
+
+    #[test]
+    fn test_reseeds_are_reported_once_however_callers_race() {
+        let m = std::sync::Arc::new(mem(64));
+        for _ in 0..3 {
+            m.force_reseed();
+        }
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let m = std::sync::Arc::clone(&m);
+                std::thread::spawn(move || m.take_reseeds())
+            })
+            .collect();
+        let total: u64 = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        assert_eq!(total, 3);
+        assert_eq!(m.take_reseeds(), 0);
+    }
+
+    #[test]
+    fn test_an_anchor_holds_at_most_its_first_groups() {
+        // 100 /64s of one /48 fit the anchor's whole sequence, but an
+        // anchored key may use only its first four groups (D-118): the
+        // rest spill, and the anchor is marked.
+        let m = mem(4096);
+        let s = Sets::none();
+        let v6 = crowd(
+            &m,
+            &s,
+            |i| {
+                IpAddr::V6(std::net::Ipv6Addr::new(
+                    0x2001, 0xdb8, 0x44, i as u16, 0, 0, 0, 1,
+                ))
+            },
+            100,
+        );
+        let g = m
+            .table
+            .with(|t| t.locate(&BanMemory::key_at(&Cidr::host(v6[0]), 48)).0);
+        assert!(m.table.with(|t| t.overflowed(g)));
+        for &a in &v6 {
+            assert!(matches!(m.lookup_addr(a, 0), Lookup::Banned(_)), "{a}");
+        }
+    }
+
+    #[test]
+    fn test_anchored_bans_survive_a_reseed() {
+        let m = mem(4096);
+        let s = Sets::none();
+        let v4 = crowd(&m, &s, |i| IpAddr::from([203, 0, 113, i as u8]), 200);
+        let v6 = crowd(
+            &m,
+            &s,
+            |i| {
+                IpAddr::V6(std::net::Ipv6Addr::new(
+                    0x2001, 0xdb8, 9, i as u16, 0, 0, 0, 1,
+                ))
+            },
+            200,
+        );
+        m.force_reseed();
+        assert!(m.take_reseeds() >= 1);
+        assert_eq!(m.table.with(Table::anchors), (Some(24), Some(48)));
+        for &a in v4.iter().chain(&v6) {
+            assert!(
+                matches!(m.lookup_addr(a, 0), Lookup::Banned(_)),
+                "{a} after reseed"
+            );
+        }
+        assert_eq!(m.lookup_addr(ip("203.0.114.1"), 0), Lookup::Clear);
     }
 
     #[test]

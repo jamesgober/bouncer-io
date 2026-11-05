@@ -20,11 +20,11 @@ use core::sync::atomic::AtomicU64 as Tat;
 use rate_net::{Decision, GcraParams, Quota};
 
 use crate::{
-    claims::Claims,
+    claims::{Claims, Counts},
     error::{BouncerError, ConfigError, ConfigProblem},
     hash::HashKey,
     keys::{Cidr, Family, TenantKey},
-    sync::{AtomicU32, AtomicU64, Ordering},
+    sync::{AtomicU64, Ordering},
     ticket::LaneClass,
     time::Now,
 };
@@ -311,10 +311,39 @@ struct RateTier {
     burst: u32,
 }
 
-/// One tier of concurrency counters: each slot holds its key's count.
+/// One tier of concurrency counters: each slot holds its key and its count
+/// in one word.
 struct ConcurrencyTier {
-    claims: Claims<AtomicU32>,
+    counts: Counts,
     limit: u32,
+}
+
+/// The door's concurrency tiers that counted one connection: what its
+/// release returns, and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Charged(u8);
+
+impl Charged {
+    pub(crate) const NONE: Charged = Charged(0);
+
+    /// The tiers recorded in a cell's state flags.
+    pub(crate) const fn from_flags(client: bool, prefix: bool) -> Charged {
+        Charged((client as u8) | ((prefix as u8) << 1))
+    }
+
+    /// The client tier counted the connection.
+    pub(crate) const fn client(self) -> bool {
+        self.0 & 1 != 0
+    }
+
+    /// The prefix tier counted the connection.
+    pub(crate) const fn prefix(self) -> bool {
+        self.0 & 2 != 0
+    }
+
+    const fn tier(self, i: usize) -> bool {
+        self.0 & (1 << i) != 0
+    }
 }
 
 /// Throttles: a factor and an end, per key.
@@ -426,7 +455,7 @@ impl DoorBudgets {
             .filter(|&(a, p)| a > 0 && p > 0)
             .map(|(a, p)| {
                 let tier = |limit: u32| ConcurrencyTier {
-                    claims: Claims::new(conc_cap),
+                    counts: Counts::new(conc_cap),
                     limit,
                 };
                 [tier(a), tier(p)]
@@ -448,7 +477,7 @@ impl DoorBudgets {
         let conc = self
             .concurrency
             .as_ref()
-            .map_or(0, |t| t.iter().map(|c| c.claims.bytes()).sum());
+            .map_or(0, |t| t.iter().map(|c| c.counts.bytes()).sum());
         rate + conc + self.throttles.bytes()
     }
 
@@ -456,7 +485,7 @@ impl DoorBudgets {
         self.rate
             .as_ref()
             .map(|t| t[0].claims.len() as u32)
-            .or_else(|| self.concurrency.as_ref().map(|t| t[0].claims.len() as u32))
+            .or_else(|| self.concurrency.as_ref().map(|t| t[0].counts.len() as u32))
             .unwrap_or(0)
     }
 
@@ -483,11 +512,6 @@ impl DoorBudgets {
             ))
         };
         [hash(client), hash(prefix)]
-    }
-
-    /// Whether admissions hold concurrency slots (returned on release).
-    pub(crate) fn has_concurrency(&self) -> bool {
-        self.concurrency.is_some()
     }
 
     /// The throttle factor in force for a key now (1 when none).
@@ -529,7 +553,7 @@ impl DoorBudgets {
         now: Now,
         divisor: u32,
         shared_source: impl Fn() -> bool,
-    ) -> Result<(), OverBudget> {
+    ) -> Result<Charged, OverBudget> {
         self.admit_hashed(
             &mut crate::bans::AddrHashes::new(addr),
             now,
@@ -547,9 +571,9 @@ impl DoorBudgets {
         now: Now,
         divisor: u32,
         shared_source: impl Fn() -> bool,
-    ) -> Result<(), OverBudget> {
+    ) -> Result<Charged, OverBudget> {
         if self.rate.is_none() && self.concurrency.is_none() {
-            return Ok(());
+            return Ok(Charged::NONE);
         }
         let keys = self.keys_hashed(hashes);
         let now_d = Duration::from_nanos(now.as_nanos());
@@ -571,31 +595,30 @@ impl DoorBudgets {
                 }
             }
         }
+        let mut charged = 0u8;
         if let Some(tiers) = &self.concurrency {
-            let mut taken: [Option<usize>; 2] = [None, None];
             for (i, (tier, &key)) in tiers.iter().zip(keys.iter()).enumerate() {
-                let claims = &tier.claims;
-                let idle = |slot: usize| claims.val(slot).load(Ordering::Acquire) == 0;
-                if let Some((slot, _)) = claims.find_or_claim(key, idle, |_| {}) {
-                    let count = claims.val(slot);
-                    let before = count.fetch_add(1, Ordering::AcqRel);
-                    // Over the address limit, a shared address keeps the
-                    // slot it took (returned on release as usual) and is held
-                    // to the prefix limit.
-                    if before >= (tier.limit / divisor.max(1)).max(1) && !(i == 0 && gives_way()) {
-                        count.fetch_sub(1, Ordering::AcqRel);
-                        for (j, s) in taken.iter().enumerate().take(i) {
-                            if let Some(s) = s {
-                                tiers[j].claims.val(*s).fetch_sub(1, Ordering::AcqRel);
+                let limit = (tier.limit / divisor.max(1)).max(1);
+                // Over the address limit, a shared address is counted anyway
+                // (returned on release as usual) and held to the prefix
+                // limit.
+                match tier.counts.acquire(key, limit, || i == 0 && gives_way()) {
+                    Ok(true) => charged |= 1 << i,
+                    // Every slot on the path held: not counted, so not
+                    // returned either.
+                    Ok(false) => {}
+                    Err(()) => {
+                        for (j, &k) in keys.iter().enumerate().take(i) {
+                            if charged & (1 << j) != 0 {
+                                tiers[j].counts.release(k);
                             }
                         }
                         return Err(OverBudget(Duration::ZERO));
                     }
-                    taken[i] = Some(slot);
                 }
             }
         }
-        Ok(())
+        Ok(Charged(charged))
     }
 
     /// The datagram budget step: the rate tiers only (no concurrency). An
@@ -654,22 +677,17 @@ impl DoorBudgets {
         }
     }
 
-    /// Returns a connection's concurrency slots.
-    pub(crate) fn release_connection(&self, addr: Option<IpAddr>, _now: Now) {
+    /// Returns what a connection's admission counted.
+    pub(crate) fn release_connection(&self, addr: Option<IpAddr>, charged: Charged) {
         let (Some(addr), Some(tiers)) = (addr, &self.concurrency) else {
             return;
         };
-        for (tier, key) in tiers.iter().zip(self.keys(addr)) {
-            if let Some(slot) = tier.claims.find(key) {
-                let count = tier.claims.val(slot);
-                let mut c = count.load(Ordering::Acquire);
-                while c > 0 {
-                    match count.compare_exchange_weak(c, c - 1, Ordering::AcqRel, Ordering::Acquire)
-                    {
-                        Ok(_) => break,
-                        Err(actual) => c = actual,
-                    }
-                }
+        if charged == Charged::NONE {
+            return;
+        }
+        for (i, (tier, key)) in tiers.iter().zip(self.keys(addr)).enumerate() {
+            if charged.tier(i) {
+                tier.counts.release(key);
             }
         }
     }
@@ -682,10 +700,11 @@ impl DoorBudgets {
             t.claims
                 .active_load(|i| t.pace.peek_at(t.claims.val(i), now_d).remaining() < t.burst)
         });
-        let conc = self.concurrency.iter().flatten().map(|t| {
-            t.claims
-                .active_load(|i| t.claims.val(i).load(Ordering::Relaxed) > 0)
-        });
+        let conc = self
+            .concurrency
+            .iter()
+            .flatten()
+            .map(|t| t.counts.active_load());
         rate.chain(conc).fold(0.0, f32::max)
     }
 
@@ -740,10 +759,7 @@ impl DoorBudgets {
         }
         if let Some(tiers) = &self.concurrency {
             for ((tier, key), (_, conc, bk)) in tiers.iter().zip(keys).zip(names) {
-                let used = tier
-                    .claims
-                    .find(key)
-                    .map_or(0, |s| tier.claims.val(s).load(Ordering::Acquire));
+                let used = tier.counts.count(key);
                 out.push(BudgetState {
                     class: conc,
                     key: bk,
@@ -761,11 +777,7 @@ impl DoorBudgets {
         let Some(tiers) = &self.concurrency else {
             return 0;
         };
-        let key = self.keys(addr)[0];
-        tiers[0]
-            .claims
-            .find(key)
-            .map_or(0, |s| tiers[0].claims.val(s).load(Ordering::Acquire))
+        tiers[0].counts.count(self.keys(addr)[0])
     }
 }
 
@@ -873,7 +885,7 @@ impl IdentityBudgets {
             .tenant_in_flight
             .filter(|&n| n > 0)
             .map(|limit| ConcurrencyTier {
-                claims: Claims::new(cap),
+                counts: Counts::new(cap),
                 limit,
             });
         IdentityBudgets {
@@ -891,7 +903,7 @@ impl IdentityBudgets {
             t.claims.bytes()
                 + ((t.cells.len() + t.plans.len()) * core::mem::size_of::<BucketCore>()) as u64
         });
-        let flight = self.in_flight.as_ref().map_or(0, |c| c.claims.bytes());
+        let flight = self.in_flight.as_ref().map_or(0, |c| c.counts.bytes());
         lanes + tenant + flight + self.throttles.bytes()
     }
 
@@ -993,19 +1005,11 @@ impl IdentityBudgets {
         let Some(c) = &self.in_flight else {
             return Ok(false);
         };
-        let key = self.flight_key(tenant);
-        let claims = &c.claims;
-        let idle = |slot: usize| claims.val(slot).load(Ordering::Acquire) == 0;
-        let Some((slot, _)) = claims.find_or_claim(key, idle, |_| {}) else {
-            return Ok(false);
-        };
-        let count = claims.val(slot);
-        let before = count.fetch_add(1, Ordering::AcqRel);
-        if before >= c.limit {
-            count.fetch_sub(1, Ordering::AcqRel);
-            return Err(OverBudget(Duration::ZERO));
-        }
-        Ok(true)
+        // `Ok(false)`: every slot on the path held, not counted (and so
+        // not returned).
+        c.counts
+            .acquire(self.flight_key(tenant), c.limit, || false)
+            .map_err(|()| OverBudget(Duration::ZERO))
     }
 
     fn flight_key(&self, tenant: u64) -> u64 {
@@ -1024,16 +1028,7 @@ impl IdentityBudgets {
         let Some(c) = &self.in_flight else {
             return;
         };
-        if let Some(slot) = c.claims.find(self.flight_key(tenant)) {
-            let count = c.claims.val(slot);
-            let mut v = count.load(Ordering::Acquire);
-            while v > 0 {
-                match count.compare_exchange_weak(v, v - 1, Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) => break,
-                    Err(actual) => v = actual,
-                }
-            }
-        }
+        c.counts.release(self.flight_key(tenant));
     }
 
     /// The fullest table's load, 0 to 1: slots holding a key that has not
@@ -1048,10 +1043,7 @@ impl IdentityBudgets {
             t.claims
                 .active_load(|i| t.cells[i].available_at(now_d) < t.capacity)
         });
-        let flight = self.in_flight.iter().map(|c| {
-            c.claims
-                .active_load(|i| c.claims.val(i).load(Ordering::Relaxed) > 0)
-        });
+        let flight = self.in_flight.iter().map(|c| c.counts.active_load());
         lanes.chain(tenant).chain(flight).fold(0.0, f32::max)
     }
 
@@ -1065,9 +1057,7 @@ impl IdentityBudgets {
         let Some(c) = &self.in_flight else {
             return 0;
         };
-        c.claims
-            .find(self.flight_key(tenant))
-            .map_or(0, |s| c.claims.val(s).load(Ordering::Acquire))
+        c.counts.count(self.flight_key(tenant))
     }
 }
 
@@ -1152,17 +1142,87 @@ mod tests {
     fn test_concurrency_limit_and_release() {
         let b = budgets(Budgets::off().door_concurrency(2, 100));
         let now = Now::default();
-        assert!(b.admit(ip("192.0.2.1"), now, 1, || false).is_ok());
-        assert!(b.admit(ip("192.0.2.1"), now, 1, || false).is_ok());
-        assert!(b.admit(ip("192.0.2.1"), now, 1, || false).is_err());
-        assert_eq!(b.concurrent(ip("192.0.2.1")), 2);
-        b.release_connection(Some(ip("192.0.2.1")), now);
-        assert!(b.admit(ip("192.0.2.1"), now, 1, || false).is_ok());
+        let a = ip("192.0.2.1");
+        let first = b.admit(a, now, 1, || false).unwrap();
+        assert!(first.client() && first.prefix());
+        assert!(b.admit(a, now, 1, || false).is_ok());
+        assert!(b.admit(a, now, 1, || false).is_err());
+        assert_eq!(b.concurrent(a), 2);
+        b.release_connection(Some(a), first);
+        assert!(b.admit(a, now, 1, || false).is_ok());
         // Releases never go below zero.
         for _ in 0..5 {
-            b.release_connection(Some(ip("192.0.2.1")), now);
+            b.release_connection(Some(a), first);
         }
-        assert_eq!(b.concurrent(ip("192.0.2.1")), 0);
+        assert_eq!(b.concurrent(a), 0);
+    }
+
+    #[test]
+    fn test_concurrency_slot_takeover_never_leaks_a_count() {
+        // More keys than slots, so idle slots keep changing hands while
+        // other threads count into them. A count that lands under the key
+        // that took the slot over (or a takeover of a slot with a live
+        // count) leaves a count that no release returns.
+        let cfg = Budgets::off().door_concurrency(1_000, 100_000).capacity(16);
+        let b = std::sync::Arc::new(DoorBudgets::new(&cfg, HashKey::new(1, 2), 1));
+        let now = Now::default();
+        let threads: Vec<_> = (0..8u8)
+            .map(|t| {
+                let b = std::sync::Arc::clone(&b);
+                std::thread::spawn(move || {
+                    for i in 0..20_000u32 {
+                        let a = IpAddr::from([10, t, (i % 7) as u8, (i % 61) as u8]);
+                        if let Ok(c) = b.admit(a, now, 1, || false) {
+                            b.release_connection(Some(a), c);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let tiers = b.concurrency.as_ref().unwrap();
+        for tier in tiers {
+            assert_eq!(tier.counts.active_load(), 0.0, "a count was never returned");
+        }
+    }
+
+    #[test]
+    fn test_uncounted_connection_returns_nothing() {
+        // A connection admitted without a slot (every slot on its path held)
+        // must not take a count from the slot its key gets later.
+        let cfg = Budgets::off().door_concurrency(10, 1_000_000).capacity(16);
+        let b = DoorBudgets::new(&cfg, HashKey::new(1, 2), 1);
+        let now = Now::default();
+        let mut held = Vec::new();
+        let mut uncounted = None;
+        for i in 0..64u8 {
+            let a = IpAddr::from([10, 9, 0, i]);
+            let c = b.admit(a, now, 1, || false).unwrap();
+            if c.client() {
+                held.push((a, c));
+            } else if uncounted.is_none() {
+                uncounted = Some((a, c));
+            }
+        }
+        let (a, c) = uncounted.expect("a full table leaves some connection uncounted");
+        assert!(!c.client());
+        // Its key gets a slot once one is idle, with another connection.
+        for (h, hc) in held.drain(..) {
+            b.release_connection(Some(h), hc);
+        }
+        let later = b.admit(a, now, 1, || false).unwrap();
+        assert!(later.client());
+        assert_eq!(b.concurrent(a), 1);
+        b.release_connection(Some(a), c);
+        assert_eq!(
+            b.concurrent(a),
+            1,
+            "the uncounted release took a live count"
+        );
+        b.release_connection(Some(a), later);
+        assert_eq!(b.concurrent(a), 0);
     }
 
     #[test]

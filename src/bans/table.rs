@@ -66,6 +66,14 @@ pub(crate) const FLAG_EVICTABLE: u8 = 1;
 /// How many groups of eight slots a probe sequence may visit.
 pub(crate) const MAX_PROBE: usize = crate::MAX_PROBE as usize;
 
+/// How many groups of its anchor's sequence an anchored key may use; past
+/// them it lives in its own sequence and the anchor's group is marked. The
+/// bound keeps a crowded prefix (every /64 of a /48 banned) from filling a
+/// whole sequence, which would make each lookup of an address inside it
+/// read every group of the sequence, and slow the keys of other prefixes
+/// whose sequences cross it.
+pub(crate) const ANCHOR_GROUPS: usize = 4;
+
 /// Spins a reader allows a writer that holds a slot before it gives up.
 #[cfg(not(bouncer_loom))]
 const READ_SPINS: u32 = 256;
@@ -407,6 +415,18 @@ struct Spot {
     anchored: bool,
 }
 
+impl Spot {
+    /// The groups a key may use from its home group.
+    #[inline]
+    fn groups(&self) -> usize {
+        if self.anchored {
+            ANCHOR_GROUPS
+        } else {
+            MAX_PROBE
+        }
+    }
+}
+
 /// Writer-side bookkeeping, kept inside the owner's writer lock.
 #[derive(Debug)]
 pub(crate) struct TableWriter {
@@ -702,7 +722,18 @@ impl Table {
     /// which avoids the clustering of linear probing at high load.
     #[inline]
     fn next_group(&self, g: usize, step: usize) -> usize {
-        (g + step) % self.tags.len()
+        // `g` is below the group count and `step` at most `MAX_PROBE`, so
+        // one subtraction wraps it unless the table is tinier than a step
+        // (then a division): no division on the common path.
+        let len = self.tags.len();
+        let n = g + step;
+        if n < len {
+            n
+        } else if n - len < len {
+            n - len
+        } else {
+            n % len
+        }
     }
 
     /// Sets one tag byte. Only the writer changes tags.
@@ -721,10 +752,15 @@ impl Table {
     pub(crate) fn find(&self, key: &TableKey, now_secs: u64) -> Probe {
         let s = self.spot(key);
         let tags = self.first_tags(s.home);
-        match self.find_at(key, s.home, s.tag, tags, now_secs) {
-            Probe::Miss if s.anchored && self.overflowed(s.home) => {
-                self.find_at(key, s.own, s.tag, self.first_tags(s.own), now_secs)
-            }
+        match self.find_at(key, s.home, s.tag, tags, now_secs, s.groups()) {
+            Probe::Miss if s.anchored && self.overflowed(s.home) => self.find_at(
+                key,
+                s.own,
+                s.tag,
+                self.first_tags(s.own),
+                now_secs,
+                MAX_PROBE,
+            ),
             found => found,
         }
     }
@@ -737,7 +773,8 @@ impl Table {
         self.tags[group].load(Ordering::Acquire)
     }
 
-    /// Continues a lookup whose first tag word is already loaded.
+    /// Continues a lookup whose first tag word is already loaded, over at
+    /// most `groups` groups.
     #[inline]
     pub(crate) fn find_at(
         &self,
@@ -746,9 +783,10 @@ impl Table {
         h2: u8,
         mut tags: u64,
         now_secs: u64,
+        groups: usize,
     ) -> Probe {
         let mut want: Option<Stored> = None;
-        for step in 1..=MAX_PROBE {
+        for step in 1..=groups {
             let mut candidates = match_tag(tags, h2);
             while candidates != 0 {
                 let i = (candidates.trailing_zeros() / 8) as usize;
@@ -770,7 +808,7 @@ impl Table {
                     };
                 }
             }
-            if has_empty(tags) {
+            if has_empty(tags) || step == groups {
                 return Probe::Miss;
             }
             g = self.next_group(g, step);
@@ -791,10 +829,10 @@ impl Table {
         s: Spot,
         stored: Stored,
     ) -> Option<(usize, Raw)> {
-        self.position_from(w, key, stored, s.home, s.tag)
+        self.position_from(w, key, stored, s.home, s.tag, s.groups())
             .or_else(|| {
                 (s.anchored && self.overflowed(s.home))
-                    .then(|| self.position_from(w, key, stored, s.own, s.tag))
+                    .then(|| self.position_from(w, key, stored, s.own, s.tag, MAX_PROBE))
                     .flatten()
             })
     }
@@ -806,9 +844,10 @@ impl Table {
         stored: Stored,
         start: usize,
         h2: u8,
+        groups: usize,
     ) -> Option<(usize, Raw)> {
         let mut g = start;
-        for step in 1..=MAX_PROBE {
+        for step in 1..=groups {
             let tags = self.tags[g].load(Ordering::Relaxed);
             for i in 0..GROUP {
                 if tag_at(tags, i) == h2 {
@@ -879,9 +918,9 @@ impl Table {
         // The first reusable slot on the home probe path: empty, deleted, or
         // expired; for an anchored key whose anchor's path is full, one on
         // its own path (and the anchor's group is marked).
-        let (mut free, mut window_victim) = self.scan(w, s.home, now_secs);
+        let (mut free, mut window_victim) = self.scan(w, s.home, now_secs, s.groups());
         if free.is_none() && s.anchored {
-            let (own_free, _) = self.scan(w, s.own, now_secs);
+            let (own_free, _) = self.scan(w, s.own, now_secs, MAX_PROBE);
             if own_free.is_some() {
                 self.mark_overflow(s.home);
                 free = own_free;
@@ -921,10 +960,23 @@ impl Table {
         w: &TableWriter,
         start: usize,
         now_secs: u64,
+        groups: usize,
     ) -> (Option<(usize, Option<Entry>)>, Option<(usize, Entry)>) {
+        // A free slot (empty or deleted: the only tags with the high bit
+        // set) found by its tag reads no slot. Only a path with none is
+        // read slot by slot, for an expired entry or an eviction candidate.
+        let mut g = start;
+        for step in 1..=groups {
+            let free = self.tags[g].load(Ordering::Relaxed) & HIGH_BITS;
+            if free != 0 {
+                let i = (free.trailing_zeros() / 8) as usize;
+                return (Some((g * GROUP + i, None)), None);
+            }
+            g = self.next_group(g, step);
+        }
         let mut window_victim: Option<(usize, Entry)> = None;
         let mut g = start;
-        for step in 1..=MAX_PROBE {
+        for step in 1..=groups {
             let tags = self.tags[g].load(Ordering::Relaxed);
             for i in 0..GROUP {
                 let slot = g * GROUP + i;
@@ -1160,47 +1212,64 @@ impl Tables {
     ) -> Result<Inserted, NoRoom> {
         match self.with(|t| t.insert(w, entry, now_secs, &merge)) {
             Err(NoRoom::ProbeBound | NoRoom::Collision) => {
-                // The writer holds the lock: the current table cannot change.
-                let old_ref: std::sync::Arc<Table>;
-                let old: &Table = if self.version.load(std::sync::atomic::Ordering::Acquire) == 0 {
-                    &self.first
-                } else {
-                    old_ref = self.load();
-                    &old_ref
-                };
-                let key = HashKey::new(w.rng.next_u64(), w.rng.next_u64());
-                let fresh = Table::with_anchors(old.capacity, key, old.anchors);
-                let mut moved = TableWriter {
-                    live: 0,
-                    hand: 0,
-                    rng: w.rng.clone(),
-                    originals: HashMap::with_capacity_and_hasher(w.originals.len(), Fingerprinted),
-                    keep: w.keep,
-                };
-                let mut ok = true;
-                old.for_each(w, |e| {
-                    ok &= fresh.insert(&mut moved, *e, 0, |_| *e).is_ok();
-                });
-                if !ok {
+                let Some(fresh) = self.rebuild(w) else {
                     return Err(NoRoom::ProbeBound);
-                }
-                let result = fresh.insert(&mut moved, entry, now_secs, &merge);
-                w.live = moved.live;
-                w.hand = 0;
-                w.originals = moved.originals;
-                *self
-                    .current
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    std::sync::Arc::new(fresh);
-                self.version
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
-                self.reseeds
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                result
+                };
+                fresh.insert(w, entry, now_secs, &merge)
             }
             other => other,
         }
+    }
+
+    /// Rebuilds the table under a fresh key and publishes it; `None` (the
+    /// old table kept) when an entry did not fit the new one. The writer
+    /// holds the lock, so the current table cannot change meanwhile; slots
+    /// written into the published table after this are seen by readers
+    /// through their sequence locks, as on any insert.
+    fn rebuild(&self, w: &mut TableWriter) -> Option<std::sync::Arc<Table>> {
+        let old_ref: std::sync::Arc<Table>;
+        let old: &Table = if self.version.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            &self.first
+        } else {
+            old_ref = self.load();
+            &old_ref
+        };
+        let key = HashKey::new(w.rng.next_u64(), w.rng.next_u64());
+        let fresh = Table::with_anchors(old.capacity, key, old.anchors);
+        let mut moved = TableWriter {
+            live: 0,
+            hand: 0,
+            rng: w.rng.clone(),
+            originals: HashMap::with_capacity_and_hasher(w.originals.len(), Fingerprinted),
+            keep: w.keep,
+        };
+        let mut ok = true;
+        old.for_each(w, |e| {
+            ok &= fresh.insert(&mut moved, *e, 0, |_| *e).is_ok();
+        });
+        if !ok {
+            return None;
+        }
+        w.live = moved.live;
+        w.hand = 0;
+        w.originals = moved.originals;
+        w.rng = moved.rng;
+        let fresh = std::sync::Arc::new(fresh);
+        *self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::clone(&fresh);
+        self.version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.reseeds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(fresh)
+    }
+
+    /// Rebuilds the table under a fresh key now (tests).
+    #[cfg(all(test, not(bouncer_loom)))]
+    pub(crate) fn reseed(&self, w: &mut TableWriter) -> bool {
+        self.rebuild(w).is_some()
     }
 }
 

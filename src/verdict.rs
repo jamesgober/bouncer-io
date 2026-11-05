@@ -134,6 +134,40 @@ impl DenialCode {
         }
     }
 
+    /// The HTTP status this code stands for: 503, 404, 429, 401, or 403.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::DenialCode;
+    /// assert_eq!(DenialCode::TooManyRequests.http_status(), 429);
+    /// assert_eq!(DenialCode::from_http_status(429), Some(DenialCode::TooManyRequests));
+    /// assert_eq!(DenialCode::from_http_status(200), None);
+    /// ```
+    #[must_use]
+    pub const fn http_status(self) -> u16 {
+        match self {
+            DenialCode::Unavailable => 503,
+            DenialCode::NotFound => 404,
+            DenialCode::TooManyRequests => 429,
+            DenialCode::Unauthorized => 401,
+            DenialCode::Forbidden => 403,
+        }
+    }
+
+    /// The code an HTTP status stands for, if it is one of the five.
+    #[must_use]
+    pub const fn from_http_status(status: u16) -> Option<DenialCode> {
+        match status {
+            503 => Some(DenialCode::Unavailable),
+            404 => Some(DenialCode::NotFound),
+            429 => Some(DenialCode::TooManyRequests),
+            401 => Some(DenialCode::Unauthorized),
+            403 => Some(DenialCode::Forbidden),
+            _ => None,
+        }
+    }
+
     pub(crate) const fn from_number(n: u8) -> DenialCode {
         match n {
             2 => DenialCode::NotFound,
@@ -275,6 +309,20 @@ impl DenialTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_every_denial_code_round_trips_its_http_status() {
+        for code in [
+            DenialCode::Unavailable,
+            DenialCode::NotFound,
+            DenialCode::TooManyRequests,
+            DenialCode::Unauthorized,
+            DenialCode::Forbidden,
+        ] {
+            assert_eq!(DenialCode::from_http_status(code.http_status()), Some(code));
+        }
+        assert_eq!(DenialCode::from_http_status(500), None);
+    }
 
     #[test]
     fn test_verdict_helpers() {

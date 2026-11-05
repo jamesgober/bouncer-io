@@ -24,6 +24,8 @@ What the door, the checkpoint, and the ticket cost, measured against composition
 - [Checkpoints and revocation storms](#checkpoints-and-revocation-storms)
 - [What 0.6 changed](#what-06-changed)
 - [What 0.8 changed](#what-08-changed)
+- [What 0.9 changed](#what-09-changed)
+- [Many threads](#many-threads)
 - [The NFR-10 target](#the-nfr-10-target)
 - [The regression gate](#the-regression-gate)
 
@@ -35,7 +37,8 @@ What the door, the checkpoint, and the ticket cost, measured against composition
 | Toolchain | Rust 1.95.0, release profile (fat LTO, one codegen unit) |
 | Bench | `cargo bench --bench perf` |
 | Method | each case runs in 61 rounds of 20,000 operations; the tables show the fastest round and the median round, in nanoseconds per operation |
-| Pinning | the process is pinned to one logical core (`ProcessorAffinity` 0x4). Unpinned, the scheduler moves the process between the CPU's two core complexes and results swing by 30% or more; pinned, two runs agree within a few percent |
+| Pinning | the process is pinned to one logical core (`ProcessorAffinity` 0x4 before 0.9, 0x1000 from 0.9: logical core 2 turned out to share its physical core with a long-running job of other work). Unpinned, the scheduler moves the process between the CPU's two core complexes and results swing by 30% or more; pinned, two runs agree within a few percent |
+| Comparing | from 0.9, the door is judged against the compositions by the median of six processes' within-run ratios: an identical binary's absolute numbers moved 15% between processes (each gets its own memory layout), while the ratio within one process held within 2 points |
 | Fixture | 1,000,000 bans over IPv4 /32 and /24 and IPv6 /64, /56, /48, plus 10,000 administrator prefixes at other lengths; an allow list and trusted proxies of two entries each; probes: 4,096 admitted addresses, 65,536 random addresses over the whole space, 4,096 banned addresses |
 
 The two compositions (`benches/common/compose.rs`):
@@ -93,10 +96,10 @@ A checkpoint is as cheap as reading a flag (PLAN 11: within 10% of an `AtomicBoo
 | checkpoint slow path under 150 ns with 7 keys | p50 64.4 ns, p99 96.2 ns | met |
 | before commit under 5 ns | 0.2 ns | met |
 | transport egress under 3 ns | 1.3 ns | met |
-| door, 1,000,000 bans and 10,000 administrator prefixes: under 100 ns p99 | 92.1 ns per call on a lightly loaded machine (fastest round, admitted), median round 99.9; per-call p99 needs a nanosecond timer (`Instant` on Windows resolves 100 ns) | open, 0.9.0 |
-| ticket issue and release under 40 ns median, 32 threads | 41.0 ns, one thread; 32 threads not measured | open |
+| door, 1,000,000 bans and 10,000 administrator prefixes: under 100 ns p99 | per call with a nanosecond timer (Linux, `examples/door_p99.rs`, 1,000,000 distinct cold peers): p50 111 ns, p99 462 ns at best, on a host whose every core was busy; warm, 95.5 ns per call (fastest round, admitted) | not met; re-derived target proposed (PLAN D-121) |
+| ticket issue and release under 40 ns median, 32 threads | 42.4 ns at one thread on an idle core, 57.9 ns median at 32 (D-113) | not met; re-derived target proposed (PLAN D-121) |
 | bind under 30 ns each | about 27 ns (request and session bind 68.0, request alone 41.0) | met |
-| revoke under 1 µs | 83.4 ns (account) | met |
+| revoke under 1 µs | 134 ns (account, 0.9: a second slot write, D-116) | met |
 | ban insert under 500 ns | median 453 ns while the table fills to 1.2 million (fastest round 331) | met |
 | eject-now sweep, 65,536 cells, under 1 ms | 361 µs over 65,535 live cells | met |
 | memory per ban 45 to 48 B, hard limit 64 B | 37.7 B (32-byte slots at the table's load, tag bytes and overflow bits included) | met |
@@ -143,9 +146,56 @@ What did it: the ban table hashes with a keyed multiply mix instead of SipHash a
 
 Tried and dropped: connection release without its link swap (loom model L-7 fails without it, D-103); a per-thread stash of free connection cells, and budgets reusing the lookup's prefix hash (no gain measured); the ticket owner releasing with a plain load and store (loom model L-5 rejects it); loading the budget slots before the ban lookup, again on the new table (random peers +26%, banned peers +92%); touching the prefix tier's slot after the ban lookup, before the client tier's locked update (no gain measured).
 
+## What 0.9 changed
+
+The door against both compositions, within-run ratios (door/composition), median of six processes, one idle core; the second composition also checks a rate per prefix, the same rate work as the door (D-120):
+
+| Case | `door_at` | Same-job composition | ratio | with a prefix rate too | ratio |
+|---|---|---|---|---|---|
+| admitted | 95.5 | 114.7 | 0.837 | 133.2 | 0.728 |
+| random peers | 124.3 | 124.2 | 1.004 | 147.1 | 0.846 |
+| random peers near the bans | 112.0 | 151.2 | 0.724 | 191.2 | 0.578 |
+| banned | 63.8 | 17.0 | 3.75 | 16.5 | 3.86 |
+
+ns per operation: each row's median over the six processes of its fastest round. "Random peers near the bans" draws IPv4 addresses with the top bit set and IPv6 under 2001::/16, the space the dynamic bans cover; in the plain random set a quarter of the peers are IPv4 below that, which the fixture's administrator /8s cover almost entirely, so they take the refusal path. A second run, under full load from other work, gave the same ratios within 3 points.
+
+What moved, and why:
+
+- **The anchors are on** (D-118). D-104's grouped lookup, one probe group for every automatic length of an address, had never been switched on. It is now, with an anchored key held to its anchor's first four groups. `door_at` random peers 133.6 to 124.3 ns, the judgement of random peers 74.6 to 63.8 ns.
+- **Shards no longer share cache lines** (D-113). This changes nothing on one thread; it is the many-threads table below.
+- **Ban insert** has 24% fewer instructions (5,880 against 7,735 per insert under Callgrind). Offender memory and the escalation tracker hash with keyed SipHash-1-3 one word per field, where the standard library's hasher took each field byte by byte. The free-slot scan reads tags before slots, and probe steps wrap without a division. Its time is back to about 0.7.0's: 4% faster than 0.8.0 in an alternating run, within that run's noise.
+- **Revocation** costs a second slot write (D-116): account revocation 101 to 134 ns on an idle core (17% in an alternating run under load). This is the price of births that a racing epoch move cannot defeat.
+
+0.8.0 against 0.9, alternating on one core under full load from other work (both sides saw the same load; the composition rows moved up to 8% between them, which is this run's noise):
+
+| Case | 0.8.0 | 0.9 | change |
+|---|---:|---:|---:|
+| `door_at`, random peers | 224.6 | 195.6 | -12.9% |
+| `door`, random peers | 355.3 | 323.1 | -9.1% |
+| `door_at`, admitted | 149.4 | 147.9 | -1.0% |
+| judgement, 1,000,000 bans and the administrator set | 68.6 | 57.9 | -15.6% |
+| ban insert, fastest round while the table fills | 620.1 | 593.9 | -4.2% |
+| revoke (account) | 151.5 | 176.8 | +16.7% |
+
+Where the instructions of an admitted `door_at` go (Callgrind, 1,105 in all): the two rate tiers 287, the probe of the automatic lengths 236 and its slot comparisons 69, ticket issue 140 and release 86, the rest the door's own steps. A banned one (636): the lookup 305, the reference 114, reporting the refusal 28.
+
+## Many threads
+
+`benches/threads.rs`, every thread its own 1,024 addresses in /48s of their own (so no two threads share a prefix's rate state), not pinned, on a machine with other work running:
+
+| Threads | ticket cycle, median | `door_at`, median | `door_at`, M a second | composition, median | composition, M a second |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 58.1 | 151.0 | 6.7 | 161.4 | 6.1 |
+| 2 | 56.9 | 152.4 | 13.2 | 212.7 | 8.0 |
+| 8 | 58.0 | 166.8 | 48.1 | 435.4 | 16.5 |
+| 16 | 58.2 | 184.5 | 81.7 | 581.6 | 26.8 |
+| 32 | 58.2 | 194.2 | 100.9 | 851.4 | 34.4 |
+
+The door with both rate tiers and 1,000,000 bans against the composition with its rate per address and per prefix; at 32 threads the door does 2.9 times its work. Before D-113 the ticket cycle took 162 ns at 32 threads (its free lists and shard handles shared cache lines); on an idle pinned core it is 42.4 ns at one thread and flat to eight. The door's p99 at 32 threads, about 3 µs, is two threads per core with other work on the machine.
+
 ## The NFR-10 target
 
-NFR-10 (PLAN D-081, decided by James): the door at least 20% faster than the same-job composition, At 0.8 `door_at` is 15% faster than the composition admitted and within 3% of it for random peers (101.6 against 119.8 ns, and 130.8 against 126.6 ns, in the same loaded run). The target is not met; the 0.9.0 polish milestone takes it up on a quiet machine, and what is left, with what each step is expected to give, is in `dev/ROADMAP.md`.
+NFR-10 (PLAN D-081, decided by James): the door at least 20% faster than the same-job composition, admitted and random peers. At 0.9 it is not met against that composition (admitted 16.3% faster, random peers at parity); against a composition doing the door's rate work (a rate per address and per prefix) the door is 27.2% and 15.4% faster, and 2.9 times its throughput at 32 threads. Why the remaining gap is not closed without giving something up, and the re-derived target proposed to James, are in PLAN D-120 and [`docs/READINESS-1.0.md`](./READINESS-1.0.md).
 
 ## The regression gate
 

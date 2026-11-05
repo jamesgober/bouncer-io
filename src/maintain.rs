@@ -231,11 +231,19 @@ pub(crate) fn run(shared: &Shared, now: Now) -> MaintenanceReport {
     let cells = &shared.registry.cells;
     for (index, cell) in cells.iter().enumerate() {
         let st = cell.state.load(Ordering::Acquire);
-        if st & F_LIVE == 0 || st & (F_REVOKED | F_PENDING_CLIENT) != 0 {
+        if st & F_LIVE == 0 || st & F_REVOKED != 0 {
             continue;
         }
         let gen_ = generation(st);
         let mut seen = cell.seen.load(Ordering::Acquire);
+        if st & F_PENDING_CLIENT != 0 {
+            // A proxied request without its client: its bind checks it
+            // against every revocation born after it was issued, so those
+            // stay until it binds or ends (the handshake deadline bounds
+            // that). It cannot be checked here: it has no client yet.
+            min_seen = min_seen.min(seen);
+            continue;
+        }
         if seen != epoch && idle_before.is_some_and(|cut| seen <= cut) {
             report.idle_checked += 1;
             match check_cell(shared, index as u32, gen_, epoch) {

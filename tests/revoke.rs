@@ -190,6 +190,30 @@ fn test_revoke_never_issued_connection_reclaimed() {
 }
 
 #[test]
+fn test_cleanup_keeps_a_revocation_a_pending_request_owes() {
+    // A proxied request running before a source revocation, whose client is
+    // only bound after maintenance has run, is still reached: cleanup must
+    // count it among the tickets that have not checked yet.
+    let b = Bouncer::builder()
+        .trusted_proxies(&[c("198.51.100.1/32")])
+        .budgets(Budgets::off())
+        .try_build()
+        .unwrap();
+    let mut hop = b.door(ip("198.51.100.1")).unwrap();
+    let mut pending = hop.request(RequestId(1)).unwrap();
+    b.apply(Directive::revoke(c("203.0.113.0/24"))).unwrap();
+    // Every other live ticket checks past the revocation.
+    assert!(hop.checkpoint().is_pass());
+    let _ = b.maintain(b.now());
+    assert!(
+        pending
+            .bind_client(ip("203.0.113.5"), Provenance::ForwardedHeader)
+            .is_deny(),
+        "the revocation was cleaned up before the pending request checked"
+    );
+}
+
+#[test]
 fn test_revoke_source_covering_trusted_proxy() {
     // Edge case 38.
     let b = Bouncer::builder()
@@ -841,10 +865,11 @@ fn test_budget_exempt_and_proxy_hops_not_charged() {
         h1.bind_client(ip("203.0.113.1"), Provenance::ProxyProtocol)
             .is_pass()
     );
+    // Refused with the denial a ban gets: a client cannot tell them apart.
     let mut h2 = b.door(ip("10.0.0.1")).unwrap();
     assert_eq!(
         denied(h2.bind_client(ip("203.0.113.1"), Provenance::ProxyProtocol)),
-        Some(DenialCode::TooManyRequests)
+        Some(DenialCode::Forbidden)
     );
     drop(h1);
     let mut h3 = b.door(ip("10.0.0.1")).unwrap();
@@ -1012,4 +1037,37 @@ fn test_new_binds_of_a_revoked_session_are_still_refused() {
     b.revoke(session, Reason::LOGOUT).unwrap();
     let mut request = conn.request(RequestId(1)).unwrap();
     assert!(request.bind_session(session).is_deny());
+}
+
+#[test]
+fn test_revocation_storm_applies_every_revocation_and_reports_the_excess() {
+    // T-12: automated revocations above the rate (10,000 a second by
+    // default) still apply (they are security actions); the excess is
+    // reported in Observe mode.
+    let events = Arc::new(Events::default());
+    let b = Bouncer::builder()
+        .clock(Arc::new(ManualClock::new()))
+        .event_sink(events.clone())
+        .try_build()
+        .unwrap();
+    let conn = b.door(ip("192.0.2.5")).unwrap();
+    for i in 0..10_050u128 {
+        b.apply(Directive::revoke(AccountKey(i)).by(Actor::Policy(1)))
+            .unwrap();
+    }
+    let excess = events
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(id, mode)| {
+            *id == signals::REVOKE_APPLIED.id && *mode == bouncer_io::Mode::Observe
+        })
+        .count();
+    assert!(excess >= 1, "the storm is reported");
+    let mut last = conn.request(RequestId(1)).unwrap();
+    assert!(
+        last.bind_account(AccountKey(10_049)).is_deny(),
+        "the last revocation took effect"
+    );
 }

@@ -11,6 +11,39 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-05
+
+### Security
+
+- **A revocation could miss a connection or request that was running when it was made.** If another thread moved the revocation epoch at the same moment (a connection closing with live requests, or another bouncer sharing the epoch), `revoke` returned and the ticket kept passing its checkpoints, including `before_commit`. Revocations now take their birth from the epoch move made after they are visible.
+- **The door's concurrency budgets lost counts.** A count could land under a key that had just taken its slot over, and nothing ever returned it. With more keys than slots, every slot of the table ended up holding a stranded count, and newcomers then went uncounted. A second leak: a connection admitted with no free slot took a count back on release from the slot its key held later. Key and count now share one word, and a connection returns exactly what it was counted for.
+- **A client named by a PROXY header could tell a ban from a spent door budget**, as a 403 against a 429. Both are now the same denial with the same effect on the ticket.
+- **Maintenance could clean up a revocation that a proxied request still owed** while it waited for its client.
+- **The `net-io` feature requires net-io 0.6.** net-io 0.5.0 was yanked for a slowloris defect in its reactor.
+
+### Fixed
+
+- The 0.8.0 notes said that an address's ban keys share one probe sequence. That design (D-104) was never switched on. It is now, and an anchored key uses at most four groups of its anchor's sequence, so one crowded prefix cannot slow lookups of the addresses inside it or of other prefixes.
+- Registry shards shared cache lines. The ticket cycle at 32 threads falls from 162 ns to 58 ns median, and throughput rises from 99 to 333 million cycles a second.
+- Unix-socket and named-pipe peers were all refused when loopback was a trusted proxy. They are now proxy hops, like a TCP peer from loopback.
+- Under a clock of its own, the net-io gate read net-io's accept time against that clock's start, where a timed ban could look long expired. It now reads the bouncer's clock.
+- The reseed count could underflow when two bans raced: a panic in debug builds, a bogus count in release.
+
+### Added
+
+- `DenialCode::http_status` and `DenialCode::from_http_status`.
+- `benches/threads.rs`: the ticket cycle, and the door against the composition, at 1 to 32 threads.
+- A second composition in the comparison benches, with a rate check per address and per prefix, the rate work the door does.
+- Loom models L-9 (a revocation against epoch moves from elsewhere) and L-10 (a concurrency slot's takeover). L-6 now models the new counter.
+- `docs/READINESS-1.0.md`.
+
+### Changed
+
+- The net-io gate's denial code is the HTTP status of the denial (403, 429, 503, 404, 401), which serve-net answers with. It was 1 to 5, which serve-net turned into 403 for every denial.
+- net-io 0.6 for the `net-io` feature; serve-net 0.6.1 for the tests and the example.
+- A concurrency tier counts at most 1,048,575 live connections per key.
+- `door_at` is 13% faster for random peers than in 0.8.0, and the judgement of a peer is 16% faster. Ban insert is back to about 0.7.0's cost. Account revocation is about 33 ns slower, for the fix above.
+
 ## [0.8.0] - 2026-11-02
 
 ### Added
@@ -320,7 +353,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/bouncer-io/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/bouncer-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/bouncer-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/bouncer-io/compare/v0.5.0...v0.6.0

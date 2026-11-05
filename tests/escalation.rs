@@ -412,3 +412,39 @@ fn test_lifted_children_do_not_count_toward_escalation() {
         "never more than one banned at a time"
     );
 }
+
+#[test]
+fn test_prefix_strikes_never_ban_over_a_shared_address() {
+    // T-5 and D-108: strikes from a /24's hosts reach the prefix threshold
+    // (40 at the default), but one of its addresses is flagged as shared,
+    // so the /24 is not banned; without the flag it is.
+    let run = |shared: bool| {
+        let b = Bouncer::builder()
+            .budgets(Budgets::off())
+            .enforcement(Enforcement::observe_all().enforce(StrikeKind::LoginFailed))
+            .try_build()
+            .unwrap();
+        let nat = ip("100.64.0.1");
+        if shared {
+            let conn = b.door(nat).unwrap();
+            for s in 0..100u8 {
+                let mut r = conn.request(RequestId(u128::from(s))).unwrap();
+                let _ = r.bind_session(SessionKey::from_digest([s; 16]));
+            }
+            assert!(b.explain(nat).shared_source);
+        }
+        // Four strikes from each of twelve hosts: none reaches its own
+        // threshold, the /24 passes 40.
+        for h in 10..22u8 {
+            for _ in 0..4 {
+                // Once the /24 is banned, its hosts are refused.
+                if let Ok(conn) = b.door(IpAddr::from([100, 64, 0, h])) {
+                    let _ = conn.strike(StrikeKind::LoginFailed);
+                }
+            }
+        }
+        b.door(ip("100.64.0.200")).is_err()
+    };
+    assert!(run(false), "the /24 is banned when nothing in it is shared");
+    assert!(!run(true), "no prefix ban over a shared address");
+}

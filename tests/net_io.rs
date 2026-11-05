@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use bouncer_io::{Bouncer, Reason, RequestId, SessionKey, Ticket, TicketTag};
 use net_io::{
-    CloseReason, ConnectionInfo, GateTag, Input, ListenerSpec, Output, Server, ServerBuilder,
-    Session, SessionContext, Step,
+    CloseReason, ConnectionInfo, GateTag, Input, ListenerSpec, Output, ProxyMode, ProxyVersions,
+    Server, ServerBuilder, Session, SessionContext, Step, TrustedProxies,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -35,7 +35,9 @@ struct Paced {
     request: Option<Ticket>,
     next: u128,
     flood: bool,
-    opened: mpsc::Sender<()>,
+    /// `None` when a request opens, the code when the session is asked to
+    /// format a denial.
+    opened: mpsc::Sender<Option<u16>>,
 }
 
 impl Session for Paced {
@@ -57,7 +59,7 @@ impl Session for Paced {
                     cx.output()
                         .begin_tagged_response(GateTag::from(request.tag()));
                     self.request = Some(request);
-                    let _ = self.opened.send(());
+                    let _ = self.opened.send(None);
                 }
                 b"chunk" => {
                     if cx.output().push(&[b'c'; CHUNK]).is_err() {
@@ -89,15 +91,35 @@ impl Session for Paced {
     }
 
     fn on_denied(&mut self, code: u16, output: &mut Output) {
+        let _ = self.opened.send(Some(code));
         let _ = output.push(format!("denied {code}\n").as_bytes());
     }
 }
 
-fn server(bouncer: &Bouncer) -> (Server, SocketAddr, mpsc::Receiver<()>) {
+fn server(bouncer: &Bouncer) -> (Server, SocketAddr, mpsc::Receiver<Option<u16>>) {
+    server_on(bouncer, ListenerSpec::tcp("127.0.0.1:0"))
+}
+
+/// A listener that requires a PROXY v1 header from loopback, the proxy.
+fn proxied(bouncer: &Bouncer) -> (Server, SocketAddr, mpsc::Receiver<Option<u16>>) {
+    server_on(
+        bouncer,
+        ListenerSpec::tcp("127.0.0.1:0")
+            .proxy(ProxyMode::Required {
+                versions: ProxyVersions::V1,
+            })
+            .trusted_proxies(TrustedProxies::parse("127.0.0.1").expect("proxies")),
+    )
+}
+
+fn server_on(
+    bouncer: &Bouncer,
+    spec: ListenerSpec,
+) -> (Server, SocketAddr, mpsc::Receiver<Option<u16>>) {
     let (tx, rx) = mpsc::channel();
     let b = bouncer.clone();
     let server = ServerBuilder::new()
-        .listener(ListenerSpec::tcp("127.0.0.1:0"))
+        .listener(spec)
         .workers(2)
         .sessions(move |info: &ConnectionInfo| Paced {
             bouncer: b.clone(),
@@ -167,6 +189,88 @@ fn test_net_io_banned_client_is_refused_at_the_door() {
     assert!(eventually(|| server.stats().refused > refused_before));
 }
 
+/// A PROXY v1 header naming `client` as the source, from loopback.
+fn proxy_header(client: &str) -> Vec<u8> {
+    format!("PROXY TCP4 {client} 127.0.0.1 40000 80\r\n").into_bytes()
+}
+
+#[test]
+fn test_net_io_proxy_header_names_the_client_the_door_judges() {
+    // `readmit` through a real server: net-io parses the header from a
+    // trusted proxy and asks the gate again with the real client.
+    let bouncer = Bouncer::builder()
+        .trusted_proxies(&["127.0.0.1/32".parse().unwrap()])
+        .try_build()
+        .expect("bouncer");
+    bouncer
+        .ban("203.0.113.9".parse::<IpAddr>().unwrap())
+        .expect("ban");
+    let (server, addr, _rx) = proxied(&bouncer);
+
+    // A client the header names is served...
+    let mut c = client(addr);
+    c.write_all(&proxy_header("198.51.100.7")).expect("header");
+    c.write_all(b"chunk\n").expect("write");
+    let mut got = [0u8; CHUNK];
+    c.read_exact(&mut got).expect("served");
+
+    // ...a banned one is refused after its header, the proxy is not...
+    let (got_banned, _) = refused(
+        addr,
+        &[proxy_header("203.0.113.9"), b"chunk\n".to_vec()].concat(),
+    );
+    assert!(got_banned.is_empty(), "a banned client reads nothing");
+    let after_header = CloseReason::Refused(net_io::RefusalCause::Gate(bouncer_io::REFUSED));
+    assert!(eventually(|| server.stats().closed_for(after_header) == 1));
+
+    // ...and the ticket carries the client, not the proxy: banning the
+    // client cuts its connection at its next write.
+    let _ = bouncer.apply(bouncer_io::Directive::revoke_and_ban(
+        "198.51.100.7".parse::<IpAddr>().unwrap(),
+    ));
+    let _ = c.write_all(b"chunk\n");
+    let mut rest = Vec::new();
+    let _ = c.read_to_end(&mut rest);
+    assert!(!rest.contains(&b'c'), "nothing more of the body");
+    let mut again = client(addr);
+    again
+        .write_all(&proxy_header("192.0.2.33"))
+        .expect("header");
+    again.write_all(b"chunk\n").expect("write");
+    again
+        .read_exact(&mut got)
+        .expect("the proxy itself is not banned");
+}
+
+#[test]
+fn test_net_io_a_bouncer_with_its_own_clock_judges_on_it() {
+    // net-io's accept time is on the system clock; a bouncer with a clock
+    // of its own must not read it against its own start, where a timed ban
+    // could look long expired.
+    use net_io::{AdmitStage, Gate};
+    let clock = std::sync::Arc::new(clock_lib::ManualClock::new());
+    let bouncer = Bouncer::builder()
+        .clock(clock.clone())
+        .try_build()
+        .expect("bouncer");
+    bouncer
+        .ban(
+            bouncer_io::BanSpec::address("203.0.113.9".parse::<IpAddr>().unwrap())
+                .for_duration(Duration::from_secs(3600)),
+        )
+        .expect("ban");
+    let info = ConnectionInfo::for_testing("203.0.113.9:4000".parse().unwrap());
+    assert!(
+        bouncer.admit(&info, AdmitStage::Accept).is_err(),
+        "a peer banned for an hour is refused"
+    );
+    clock.advance(Duration::from_secs(3601));
+    assert!(
+        bouncer.admit(&info, AdmitStage::Accept).is_ok(),
+        "and admitted after it"
+    );
+}
+
 #[test]
 fn test_net_io_revoked_session_gets_the_generic_denial_and_is_closed() {
     let bouncer = Bouncer::new();
@@ -181,14 +285,42 @@ fn test_net_io_revoked_session_gets_the_generic_denial_and_is_closed() {
     c.write_all(b"chunk\n").expect("write");
     let mut got = Vec::new();
     let _ = c.read_to_end(&mut got);
-    assert_eq!(
-        got, b"denied 5\n",
-        "the generic denial and nothing of the body"
+    // The session formats the generic denial; on the wire it arrives, or
+    // the abortive close discards it unsent (Windows, now and then): never
+    // anything of the body.
+    assert_eq!(rx.recv_timeout(WAIT), Ok(Some(403)));
+    assert!(
+        got == b"denied 403\n" || got.is_empty(),
+        "the generic denial and nothing of the body: {got:?}"
     );
     assert!(eventually(|| server
         .stats()
         .closed_for(CloseReason::EgressDenied(0))
         == 1));
+}
+
+#[test]
+fn test_net_io_denial_code_is_the_directives_http_status() {
+    let bouncer = Bouncer::new();
+    let (_server, addr, rx) = server(&bouncer);
+    let mut c = client(addr);
+    c.write_all(b"open\n").expect("write");
+    rx.recv_timeout(WAIT).expect("request opened");
+    bouncer
+        .apply(
+            bouncer_io::Directive::revoke(session_key())
+                .deny_with(bouncer_io::DenialCode::TooManyRequests),
+        )
+        .expect("revoke");
+    c.write_all(b"chunk\n").expect("write");
+    let mut got = Vec::new();
+    let _ = c.read_to_end(&mut got);
+    assert_eq!(
+        rx.recv_timeout(WAIT),
+        Ok(Some(429)),
+        "the directive's status"
+    );
+    assert!(got == b"denied 429\n" || got.is_empty(), "{got:?}");
 }
 
 #[test]
