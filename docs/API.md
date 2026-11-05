@@ -18,7 +18,7 @@
 
 The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every item lists its tier, its grade, the version that brings it, and what it costs. The rustdoc on [docs.rs](https://docs.rs/bouncer-io) becomes the exhaustive reference as each item lands; until then this file is the contract.
 
-> **Status: `0.8.0` (alpha).** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. The net-io feature arrived at 0.8.
+> **Status: `0.9.0` (alpha).** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. The net-io feature arrived at 0.8; 0.9 is the pre-1.0 polish.
 
 **Reading the item headers.** *Tier 1* is the simple surface (one-line constructors, no builder), *Tier 2* is configuration, *Tier 3* is the full surface for integrations and other libraries. *P0* is required for the crate's job, *P1* is what users of the best existing tools expect, *P2* is high value for serious deployments, *P3* comes after 1.0. Costs are targets, marked `[est.]` until they are measured at 0.6.
 
@@ -120,7 +120,7 @@ B6b is enforced by the transport itself, so a pipeline that forgets every other 
 [dependencies]
 bouncer-io = "0.2"
 # with the net-io hooks and metrics:
-# bouncer-io = { version = "0.8", features = ["net-io", "metrics"] }
+# bouncer-io = { version = "0.9", features = ["net-io", "metrics"] }
 ```
 
 | Feature | Default | Enables | Grade | Ver |

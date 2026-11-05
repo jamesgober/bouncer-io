@@ -11,6 +11,8 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-05
+
 ### Security
 
 - **A revocation could miss a connection or request that was running when it was made.** If another thread moved the revocation epoch at the same moment (a connection closing with live requests, or another bouncer sharing the epoch), `revoke` returned and the ticket kept passing its checkpoints, including `before_commit`. Revocations now take their birth from the epoch move made after they are visible.
@@ -351,7 +353,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/bouncer-io/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/bouncer-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/bouncer-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/bouncer-io/compare/v0.5.0...v0.6.0

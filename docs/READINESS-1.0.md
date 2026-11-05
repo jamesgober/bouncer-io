@@ -68,7 +68,7 @@ Keeping 20% against D-081's composition would mean accepting one of those three 
   - **Five smaller fixes** (D-119): a cleanup race with proxied requests; a client behind a PROXY listener could tell a ban from a spent budget; Unix-socket peers were refused when loopback was trusted; a custom clock under net-io; a reseed counter race.
 - **Review**: every threat (27) and edge case (71) was checked against the tests by a reviewer reading without the design's reasoning. The 11 found weak or missing are covered now (D-122).
 - **Concurrency**: loom models L-1 to L-10. Every protocol change of 0.8 and 0.9 has a model that fails when the change is undone.
-- **Fuzzing and soak**: 24 hours each at 0.7 with no findings. Two hours of fuzzing on the 0.8 code with no findings. FUZZ_SOAK_09
+- **Fuzzing and soak**: 24 hours each at 0.7 with no findings. Two hours of fuzzing on the 0.8 code with no findings. 24 hours each on the final 0.9 code (2026-11-04 to 2026-11-05) with no findings: the five fuzz targets ran 9.5 billion inputs between them with no crash and no artifact; the soak made 8.1 billion connections (540 million refused as banned, 50.8 million revocations, none missed) with live heap between 31.914 and 31.923 MB from the first hour to the last.
 
 ## Open, with reason and cost
 
