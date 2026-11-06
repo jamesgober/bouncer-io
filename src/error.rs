@@ -131,6 +131,15 @@ pub enum PersistError {
     /// The MAC does not match: tampered, or the wrong key (or a key is
     /// missing on one side).
     Mac,
+    /// The store is older than its [`VersionAnchor`](crate::VersionAnchor)
+    /// says was written: put back from an older backup, or its journal was
+    /// cut. Loading it would bring back lifted bans and forget newer ones.
+    RolledBack {
+        /// The version the store holds.
+        store: crate::StoreVersion,
+        /// The version last written.
+        anchor: crate::StoreVersion,
+    },
 }
 
 impl fmt::Display for PersistError {
@@ -159,6 +168,11 @@ impl fmt::Display for PersistError {
             Self::Mac => write!(
                 f,
                 "the snapshot or journal MAC does not match: treat it as tampering and check the `mac_key`"
+            ),
+            Self::RolledBack { store, anchor } => write!(
+                f,
+                "the store (epoch {}, batch {}) is older than the last one written (epoch {}, batch {}): it was restored from a backup or cut; clear the version anchor only if that restore was deliberate",
+                store.epoch, store.batches, anchor.epoch, anchor.batches
             ),
         }
     }

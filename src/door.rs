@@ -220,6 +220,9 @@ impl Shared {
             Lookup::Banned(id) => Judgement::Refuse(Refusal::Banned {
                 reference: self.reference(id),
             }),
+            Lookup::Admin(reference) => Judgement::Refuse(Refusal::Banned {
+                reference: Reference::new(reference),
+            }),
             Lookup::Busy => Judgement::Refuse(Refusal::Banned {
                 reference: Reference::new(0),
             }),
@@ -228,7 +231,7 @@ impl Shared {
 
     /// The stable reference of a ban.
     pub(crate) fn reference(&self, id: u64) -> Reference {
-        Reference::new(self.references.hash3(id, 0, 0) | 1)
+        Reference::new(crate::bans::reference_of(&self.references, id))
     }
 }
 

@@ -1337,10 +1337,7 @@ impl Ticket {
         }
         // 5. Remember.
         if let Some(src) = source_of(cell) {
-            out.remembered = matches!(
-                shared.bans.lookup_addr(src, shared.now().secs()),
-                crate::bans::Lookup::Banned(_)
-            );
+            out.remembered = shared.bans.lookup_addr(src, shared.now().secs()).banned();
         }
         // 6. Report, noting whether the connection was ejected (without an
         // `Ejector`, or with the connection kept, the caller closes it).

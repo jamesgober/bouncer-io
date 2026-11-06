@@ -2,8 +2,8 @@
 //! L-1 epoch ordering, L-4 bind against revoke, L-5 release against revoke,
 //! L-6 concurrency counters, L-7 a request issued while its connection is
 //! released, L-8 the door against `revoke_and_ban`, L-9 a revocation against
-//! epoch moves from elsewhere. Built only under
-//! `--cfg bouncer_loom`.
+//! epoch moves from elsewhere, L-10 the door filter against bans and its own
+//! rebuilds. Built only under `--cfg bouncer_loom`.
 
 use loom::{
     sync::{
@@ -14,7 +14,10 @@ use loom::{
 };
 
 use crate::{
-    bans::table::{Entry, KIND_SESSION, Probe, Table, TableKey, TableWriter},
+    bans::{
+        filter::Filter,
+        table::{Entry, KIND_SESSION, KIND_V4, Probe, Table, TableKey, TableWriter},
+    },
     directive::{ActorKind, Reason},
     hash::HashKey,
     registry::{Cell, F_LIVE, F_REVOKED, KIND_CONNECTION, generation},
@@ -77,18 +80,25 @@ fn loom_l1_epoch_publishes_entry() {
             e.bump();
             r.store(1, LoomOrdering::SeqCst);
         });
-        let was_returned = returned.load(LoomOrdering::SeqCst);
-        let now = epoch.load_seq_cst();
+        let (e, t, r) = (
+            Arc::clone(&epoch),
+            Arc::clone(&table),
+            Arc::clone(&returned),
+        );
+        let checker = thread::spawn(move || {
+            let was_returned = r.load(LoomOrdering::SeqCst);
+            let now = e.load_seq_cst();
+            let hit = now != 0 && matches!(t.find(&key(), 0), Probe::Hit(_));
+            (was_returned, now, hit)
+        });
+        revoker.join().unwrap();
+        let (was_returned, now, hit) = checker.join().unwrap();
         if now != 0 {
-            assert!(
-                matches!(table.find(&key(), 0), Probe::Hit(_)),
-                "new epoch without the entry"
-            );
+            assert!(hit, "new epoch without the entry");
         }
         if was_returned == 1 {
             assert_ne!(now, 0, "a commit after revoke returned passed");
         }
-        revoker.join().unwrap();
     });
 }
 
@@ -107,10 +117,14 @@ fn loom_l4_bind_and_revoke_never_both_miss() {
             e.bump(); // ends with fence(SeqCst)
             p.load(Ordering::Relaxed) != 0
         });
-        present.fetch_or(1, Ordering::AcqRel);
-        fence(Ordering::SeqCst);
-        let binder_saw = matches!(table.find(&key(), 0), Probe::Hit(_));
+        let (t, p) = (Arc::clone(&table), Arc::clone(&present));
+        let binder = thread::spawn(move || {
+            p.fetch_or(1, Ordering::AcqRel);
+            fence(Ordering::SeqCst);
+            matches!(t.find(&key(), 0), Probe::Hit(_))
+        });
         let revoker_saw = revoker.join().unwrap();
+        let binder_saw = binder.join().unwrap();
         assert!(binder_saw || revoker_saw, "both sides missed the other");
     });
 }
@@ -144,15 +158,20 @@ fn loom_l8_door_never_escapes_revoke_and_ban() {
             t.insert(&mut w, entry(), 0, |old| Entry { id: birth, ..*old })
                 .unwrap();
         });
-        let seen = epoch.load();
-        if banned.load(LoomOrdering::SeqCst) != 0 {
-            revoker.join().unwrap();
-            return;
-        }
-        // Admitted: the ticket's check at issue, as `Ticket::issue` runs it.
-        fence(Ordering::SeqCst);
-        let mut denied = reaches(&table, seen);
+        let (e, t, b) = (Arc::clone(&epoch), Arc::clone(&table), Arc::clone(&banned));
+        let door = thread::spawn(move || {
+            let seen = e.load();
+            if b.load(LoomOrdering::SeqCst) != 0 {
+                return None;
+            }
+            // Admitted: the ticket's check at issue, as `Ticket::issue` runs it.
+            fence(Ordering::SeqCst);
+            Some((seen, reaches(&t, seen)))
+        });
         revoker.join().unwrap();
+        let Some((seen, mut denied)) = door.join().unwrap() else {
+            return;
+        };
         // Its next checkpoint: the epoch has moved past `seen` if it needs to.
         let now = epoch.load();
         if now != seen {
@@ -179,11 +198,15 @@ fn loom_l5_revoke_never_lands_on_next_generation() {
         });
         // Release: the same compare-and-swap `release_cell` performs.
         let next = gen0.wrapping_add(1);
-        let released = update(&cell.state, Ordering::AcqRel, Ordering::Acquire, |st| {
-            (generation(st) == gen0 && st & F_LIVE != 0).then_some(u64::from(next) << 32)
+        let c = Arc::clone(&cell);
+        let releaser = thread::spawn(move || {
+            update(&c.state, Ordering::AcqRel, Ordering::Acquire, |st| {
+                (generation(st) == gen0 && st & F_LIVE != 0).then_some(u64::from(next) << 32)
+            })
+            .is_ok()
         });
-        assert!(released.is_ok());
         revoker.join().unwrap();
+        assert!(releaser.join().unwrap());
         let st = cell.state.load(Ordering::Acquire);
         assert_eq!(generation(st), next);
         assert_eq!(
@@ -210,8 +233,10 @@ fn loom_l6_concurrency_counter_never_underflows() {
             }
             ok
         });
-        let mine = counts.acquire(key, 1, || false) == Ok(true);
+        let c1 = Arc::clone(&counts);
+        let me = thread::spawn(move || c1.acquire(key, 1, || false) == Ok(true));
         let theirs = other.join().unwrap();
+        let mine = me.join().unwrap();
         if mine {
             // Both can pass only if the other released first.
             counts.release(key);
@@ -255,25 +280,27 @@ fn loom_l7_request_issued_during_release_never_passes() {
         });
         // The issuer: check the connection, count the child, record the
         // epoch, then look at the connection again.
-        let st = parent.state.load(Ordering::Acquire);
-        let outcome = if generation(st) != gen0 || st & F_LIVE == 0 {
-            None
-        } else {
-            let counted = update(&parent.link, Ordering::AcqRel, Ordering::Acquire, |l| {
+        let (parent2, e2) = (Arc::clone(&parent), Arc::clone(&epoch));
+        let issuer = thread::spawn(move || {
+            let st = parent2.state.load(Ordering::Acquire);
+            if generation(st) != gen0 || st & F_LIVE == 0 {
+                return None;
+            }
+            let counted = update(&parent2.link, Ordering::AcqRel, Ordering::Acquire, |l| {
                 (generation(l) == gen0).then(|| l.wrapping_add(1))
             })
             .is_ok();
-            if counted {
-                let seen = epoch.load();
-                fence(Ordering::SeqCst);
-                let pst = parent.state.load(Ordering::Acquire);
-                let revoked = generation(pst) != gen0 || pst & F_LIVE == 0;
-                Some((seen, revoked))
-            } else {
-                None
+            if !counted {
+                return None;
             }
-        };
+            let seen = e2.load();
+            fence(Ordering::SeqCst);
+            let pst = parent2.state.load(Ordering::Acquire);
+            let revoked = generation(pst) != gen0 || pst & F_LIVE == 0;
+            Some((seen, revoked))
+        });
         releaser.join().unwrap();
+        let outcome = issuer.join().unwrap();
         if let Some((seen, revoked)) = outcome {
             assert!(
                 revoked || seen != epoch.load(),
@@ -333,5 +360,66 @@ fn loom_l9_revocation_reaches_a_live_ticket_despite_other_epoch_moves() {
             denied,
             "the revocation missed a ticket that was live before it"
         );
+    });
+}
+
+fn v4(len: u8, word: u64) -> TableKey {
+    TableKey {
+        kind: KIND_V4,
+        len,
+        k0: 0,
+        k1: word,
+    }
+}
+
+/// L-10a: a door that reads the epoch a `revoke_and_ban` moved sees the
+/// ban's filter bits, even when the filter switched buffers just before
+/// (the writer adds the key, then moves the epoch, as `revoke_and_ban`
+/// does). A door that reads the old epoch is reached by the revocation
+/// instead (L-8).
+#[test]
+fn loom_l10_filter_never_hides_a_ban_the_epoch_announced() {
+    loom::model(|| {
+        let epoch = Arc::new(RevocationEpoch::new());
+        let filter = Arc::new(Filter::new(1, HashKey::new(1, 2)));
+        let (anchor, k) = (v4(24, 0xc000_0200), v4(32, 0xc000_0201));
+        let (e, f) = (Arc::clone(&epoch), Arc::clone(&filter));
+        let before = epoch.load();
+        // Both sides are spawned: loom then also runs the writer first.
+        let writer = thread::spawn(move || {
+            f.rebuild(|_| {});
+            f.add(&anchor, &k);
+            e.bump();
+        });
+        let (e, f) = (Arc::clone(&epoch), Arc::clone(&filter));
+        let door = thread::spawn(move || (e.load(), f.maybe(&anchor, &[k])));
+        writer.join().unwrap();
+        let (seen, maybe) = door.join().unwrap();
+        assert!(
+            maybe == 1 || seen == before,
+            "the door read the new epoch and the filter hid the ban"
+        );
+    });
+}
+
+/// L-10b: a reader stalled while the filter is rebuilt twice (its buffer
+/// cleared and filled again) never answers "no" for a key the table holds
+/// throughout: the buffer's generation word sends it to the table.
+#[test]
+fn loom_l10_filter_rebuilds_never_hide_a_held_key() {
+    loom::model(|| {
+        let filter = Arc::new(Filter::new(1, HashKey::new(3, 4)));
+        let (anchor, k) = (v4(24, 0xc000_0200), v4(32, 0xc000_0201));
+        filter.add(&anchor, &k);
+        let f = Arc::clone(&filter);
+        let writer = thread::spawn(move || {
+            for _ in 0..2 {
+                f.rebuild(|add| add(&anchor, &k));
+            }
+        });
+        let f = Arc::clone(&filter);
+        let reader = thread::spawn(move || f.maybe(&anchor, &[k]));
+        writer.join().unwrap();
+        assert_eq!(reader.join().unwrap(), 1, "a held key read as absent");
     });
 }

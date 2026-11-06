@@ -8,6 +8,7 @@
 
 pub(crate) mod compiled;
 pub(crate) mod escalate;
+pub(crate) mod filter;
 pub(crate) mod offenders;
 pub(crate) mod restore;
 pub(crate) mod table;
@@ -679,13 +680,31 @@ impl AdminEntry {
     }
 }
 
+/// An administrator prefix as the door reads it: when it ends, and its
+/// ban's reference, computed when the set is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DoorAdmin {
+    until: u32,
+    reference: u64,
+}
+
 /// The answer of a door-side lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lookup {
     Clear,
+    /// A dynamic ban, by id.
     Banned(u64),
+    /// An administrator prefix, by its ban's reference.
+    Admin(u64),
     /// A writer held a slot past the spin bound; the caller fails closed.
     Busy,
+}
+
+impl Lookup {
+    /// `true` for a ban of either kind.
+    pub(crate) const fn banned(self) -> bool {
+        matches!(self, Lookup::Banned(_) | Lookup::Admin(_))
+    }
 }
 
 /// Where a key is stored.
@@ -702,6 +721,8 @@ pub(crate) const MAX_ADMIN_PREFIXES: usize = 1 << 20;
 
 struct Writer {
     table: TableWriter,
+    /// The door filter's counts.
+    filter: filter::FilterCounts,
     /// Live entries per (kind, length), to keep the present masks exact.
     counts_v4: [u32; 33],
     counts_v6: [u32; 129],
@@ -717,7 +738,7 @@ struct Writer {
 }
 
 /// The per-thread cache of the administrator set: bouncer id, version, set.
-type AdminCache = Option<(u64, u64, Arc<PrefixSet<AdminEntry>>)>;
+type AdminCache = Option<(u64, u64, Arc<PrefixSet<DoorAdmin>>)>;
 
 thread_local! {
     static ADMIN_CACHE: RefCell<AdminCache> = const { RefCell::new(None) };
@@ -744,6 +765,11 @@ pub(crate) struct Own {
 /// The ban memory of one bouncer.
 pub(crate) struct BanMemory {
     table: Tables,
+    /// Every address key in the table, by its anchor prefix.
+    filter: filter::Filter,
+    /// Each family's anchor length (its shortest automatic length).
+    anchor_v4: u8,
+    anchor_v6: u8,
     /// Reseeds already reported.
     reseeds_seen: std::sync::atomic::AtomicU64,
     present_v4: AtomicU64,
@@ -751,7 +777,9 @@ pub(crate) struct BanMemory {
     present_ident: AtomicU64,
     admin_version: AtomicU64,
     admin_count: AtomicU64,
-    admin: RwLock<Arc<PrefixSet<AdminEntry>>>,
+    admin: RwLock<Arc<PrefixSet<DoorAdmin>>>,
+    /// The key of ban references (the bouncer's).
+    references: HashKey,
     uid: u64,
     writer: Mutex<Writer>,
     auto_v4: u64,
@@ -799,6 +827,7 @@ impl BanMemory {
         policy: DurationPolicy,
         escalation: EscalationPolicy,
         rng_seed: u64,
+        references: HashKey,
     ) -> BanMemory {
         let mut auto_v4 = 0u64;
         for &l in v4_lengths {
@@ -819,7 +848,14 @@ impl BanMemory {
             HashKey::new(rng.next_u64(), rng.next_u64()),
             HashKey::new(rng.next_u64(), rng.next_u64()),
         );
+        let filter = filter::Filter::new(
+            capacity,
+            HashKey::new(rng.next_u64(), rng.next_u64()),
+        );
         BanMemory {
+            filter,
+            anchor_v4: v4_lengths.iter().copied().min().unwrap_or(0),
+            anchor_v6: v6_lengths.iter().copied().min().unwrap_or(0),
             // Each family's shortest automatic length anchors the longer
             // ones (D-104): a door lookup reads one group for them all.
             table: Tables::new(Table::with_anchors(
@@ -837,9 +873,11 @@ impl BanMemory {
             admin_version: AtomicU64::new(0),
             admin_count: AtomicU64::new(0),
             admin: RwLock::new(Arc::new(PrefixSet::empty())),
+            references,
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             writer: Mutex::new(Writer {
                 table: TableWriter::new(rng_seed ^ 0x7ab1_e5ee_d000_0001),
+                filter: filter::FilterCounts::default(),
                 counts_v4: [0; 33],
                 counts_v6: [0; 129],
                 counts_ident: [0; 16],
@@ -888,7 +926,7 @@ impl BanMemory {
     /// Bytes reserved by the dynamic table and the originals of its
     /// fingerprinted keys.
     pub(crate) fn table_bytes(&self) -> u64 {
-        self.table.bytes() + self.lock().table.bytes()
+        self.table.bytes() + self.lock().table.bytes() + self.filter.bytes()
     }
 
     /// Entries the dynamic table holds at most.
@@ -1441,7 +1479,19 @@ impl BanMemory {
     }
 
     fn publish_admin(&self, list: &[(Cidr, AdminEntry)]) {
-        let set = PrefixSet::build(list, |a, _| *a);
+        let door: Vec<(Cidr, DoorAdmin)> = list
+            .iter()
+            .map(|(c, e)| {
+                (
+                    *c,
+                    DoorAdmin {
+                        until: e.until,
+                        reference: reference_of(&self.references, e.id),
+                    },
+                )
+            })
+            .collect();
+        let set = PrefixSet::build(&door, |a, _| *a);
         let count = set.len() as u64;
         *self
             .admin
@@ -1453,6 +1503,17 @@ impl BanMemory {
 
     /// Keeps the per-length counts and the present masks exact.
     fn count(&self, w: &mut Writer, key: &TableKey, add: bool) {
+        if let Some(a) = self.filter_anchor(key) {
+            if add {
+                self.filter.add(&a, key);
+                w.filter.added += 1;
+            } else {
+                w.filter.stale += 1;
+                if w.filter.wants_rebuild() {
+                    self.rebuild_filter(w);
+                }
+            }
+        }
         let bump = |c: &mut u32| {
             if add {
                 *c += 1;
@@ -1479,6 +1540,53 @@ impl BanMemory {
                 let n = bump(&mut w.counts_ident[usize::from(kind & 15)]);
                 set_bit(&self.present_ident, u32::from(kind & 63), n > 0);
             }
+        }
+    }
+
+    /// Rebuilds the door's filter from the table, dropping the bits of keys
+    /// no longer in it.
+    #[cold]
+    fn rebuild_filter(&self, w: &mut Writer) {
+        let mut added = 0;
+        self.filter.rebuild(|add| {
+            self.table.for_each(&w.table, |e| {
+                if let Some(a) = self.filter_anchor(&e.key) {
+                    add(&a, &e.key);
+                    added += 1;
+                }
+            });
+        });
+        w.filter.added = added;
+        w.filter.stale = 0;
+        w.filter.rebuilds += 1;
+    }
+
+    /// The anchor prefix's key of an address key (`None` for other kinds).
+    #[inline]
+    fn filter_anchor(&self, key: &TableKey) -> Option<TableKey> {
+        match key.kind {
+            table::KIND_V4 => {
+                let a = self.anchor_v4.min(key.len);
+                let m = if a == 0 { 0 } else { u64::from(u32::MAX << (32 - u32::from(a))) };
+                Some(TableKey {
+                    kind: key.kind,
+                    len: a,
+                    k0: 0,
+                    k1: key.k1 & m,
+                })
+            }
+            table::KIND_V6 => {
+                let a = self.anchor_v6.min(key.len);
+                let bits = (u128::from(key.k0) << 64) | u128::from(key.k1);
+                let m = if a == 0 { 0 } else { bits & (u128::MAX << (128 - u32::from(a))) };
+                Some(TableKey {
+                    kind: key.kind,
+                    len: a,
+                    k0: (m >> 64) as u64,
+                    k1: m as u64,
+                })
+            }
+            _ => None,
         }
     }
 
@@ -1548,7 +1656,30 @@ impl BanMemory {
                 }
             }
         }
-        // Nothing banned at any automatic length: no table to read.
+        // Nothing banned at any automatic length: no table to read. The
+        // filter keeps only the lengths that may hold one of the address's
+        // keys (most addresses keep none).
+        if count > 0 && !overflow {
+            let anchor = Self::key_at(
+                &host,
+                match host.family() {
+                    Family::V4 => self.anchor_v4,
+                    Family::V6 => self.anchor_v6,
+                },
+            );
+            let mut keys = [anchor; PROBE_BATCH];
+            for (k, &len) in keys.iter_mut().zip(&lengths[..count]) {
+                *k = Self::key_at(&host, len);
+            }
+            let mut maybe = self.filter.maybe(&anchor, &keys[..count]);
+            let mut kept = 0;
+            while maybe != 0 {
+                lengths[kept] = lengths[maybe.trailing_zeros() as usize];
+                kept += 1;
+                maybe &= maybe - 1;
+            }
+            count = kept;
+        }
         let hit = (count > 0)
             .then(|| {
                 self.table
@@ -1571,9 +1702,13 @@ impl BanMemory {
         }
         if self.admin_count.load(Ordering::Acquire) > 0 {
             match self
-                .with_admin(|set| set.find_map(addr, |e| (!e.expired(now_secs)).then_some(e.id)))
+                .with_admin(|set| {
+                    set.find_map(addr, |e| {
+                        (e.until == 0 || u64::from(e.until) > now_secs).then_some(e.reference)
+                    })
+                })
             {
-                Some(Some(id)) => return Lookup::Banned(id),
+                Some(Some(reference)) => return Lookup::Admin(reference),
                 Some(None) => {}
                 None => busy = true,
             }
@@ -1798,7 +1933,7 @@ impl BanMemory {
 
     /// Runs `f` on the current administrator set through the per-thread
     /// cache; `None` only if neither the cache nor the lock can be used.
-    fn with_admin<T>(&self, f: impl FnOnce(&PrefixSet<AdminEntry>) -> T) -> Option<T> {
+    fn with_admin<T>(&self, f: impl FnOnce(&PrefixSet<DoorAdmin>) -> T) -> Option<T> {
         let version = self.admin_version.load(Ordering::Acquire);
         let mut f = Some(f);
         let cached = ADMIN_CACHE
@@ -1823,7 +1958,7 @@ impl BanMemory {
         }
     }
 
-    fn read_admin(&self) -> Option<Arc<PrefixSet<AdminEntry>>> {
+    fn read_admin(&self) -> Option<Arc<PrefixSet<DoorAdmin>>> {
         self.admin.read().ok().map(|g| Arc::clone(&g))
     }
 
@@ -1831,6 +1966,13 @@ impl BanMemory {
     pub(crate) fn admin_bytes(&self) -> u64 {
         self.read_admin().map_or(0, |s| s.bytes()) + self.lock().offenders.bytes()
     }
+}
+
+/// The stable reference of ban `id`: keyed SipHash-1-3, so references do
+/// not reveal ids or how many bans there are.
+#[inline]
+pub(crate) fn reference_of(key: &HashKey, id: u64) -> u64 {
+    key.hash3(id, 0, 0) | 1
 }
 
 /// Merges a new ban into an existing one with the same key: the longer end
@@ -1901,6 +2043,7 @@ mod tests {
             DurationPolicy::default().jitter(Duration::ZERO),
             EscalationPolicy::default().off(),
             9,
+            HashKey::new(7, 8),
         )
     }
 
@@ -1942,10 +2085,7 @@ mod tests {
             Now::default(),
         )
         .unwrap();
-        assert!(matches!(
-            m.lookup_addr(ip("203.0.113.7"), 0),
-            Lookup::Banned(_)
-        ));
+        assert!(m.lookup_addr(ip("203.0.113.7"), 0).banned());
         assert_eq!(m.lookup_addr(ip("203.0.113.8"), 0), Lookup::Clear);
         m.ban(
             &BanSpec::prefix(c("198.51.100.0/24")),
@@ -1953,10 +2093,35 @@ mod tests {
             Now::default(),
         )
         .unwrap();
-        assert!(matches!(
-            m.lookup_addr(ip("198.51.100.200"), 0),
-            Lookup::Banned(_)
-        ));
+        assert!(m.lookup_addr(ip("198.51.100.200"), 0).banned());
+    }
+
+    #[test]
+    fn test_filter_rebuilds_after_lifts_and_never_hides_a_ban() {
+        // D-125: the door filter keeps every ban the table holds through
+        // lifts and the rebuilds they cause, and forgets the lifted ones.
+        let m = mem(32_768);
+        let s = Sets::none();
+        let v4 = |n: u32| IpAddr::from((0x8000_0000 | (n << 8) | (n & 0xff)).to_be_bytes());
+        let v6 = |n: u32| -> IpAddr {
+            std::net::Ipv6Addr::from((0x2001_0db8u128 << 96) | (u128::from(n) << 64) | 1).into()
+        };
+        for n in 0..10_000 {
+            for a in [v4(n), v6(n)] {
+                m.ban(&BanSpec::address(a).permanent(), &s.guards(), Now::default())
+                    .unwrap();
+            }
+        }
+        for n in 0..8_000 {
+            m.lift(&LiftSpec::key(v4(n))).unwrap();
+            m.lift(&LiftSpec::key(v6(n))).unwrap();
+        }
+        assert!(m.lock().filter.rebuilds >= 2, "{:?}", m.lock().filter);
+        for n in 0..10_000 {
+            for a in [v4(n), v6(n)] {
+                assert_eq!(m.lookup_addr(a, 0).banned(), n >= 8_000, "{a}");
+            }
+        }
     }
 
     #[test]
@@ -1969,10 +2134,7 @@ mod tests {
             Now::default(),
         )
         .unwrap();
-        assert!(matches!(
-            m.lookup_addr(ip("2001:db8:1:2:ffff::1"), 0),
-            Lookup::Banned(_)
-        ));
+        assert!(m.lookup_addr(ip("2001:db8:1:2:ffff::1"), 0).banned());
         assert_eq!(m.lookup_addr(ip("2001:db8:1:3::1"), 0), Lookup::Clear);
     }
 
@@ -1986,10 +2148,7 @@ mod tests {
             Now::default(),
         )
         .unwrap();
-        assert!(matches!(
-            m.lookup_addr(ip("10.200.0.1"), 0),
-            Lookup::Banned(_)
-        ));
+        assert!(m.lookup_addr(ip("10.200.0.1"), 0).banned());
         let err = m.ban(
             &BanSpec::prefix(c("11.0.0.0/8")).by(Actor::Policy(1)),
             &s.guards(),
@@ -2033,10 +2192,7 @@ mod tests {
         let later = Now::from_nanos(700 * 1_000_000_000);
         assert_eq!(m.lookup_addr(ip("192.0.2.1"), later.secs()), Lookup::Clear);
         m.ban(&spec, &s.guards(), later).unwrap();
-        assert!(matches!(
-            m.lookup_addr(ip("192.0.2.1"), later.secs() + 1199),
-            Lookup::Banned(_)
-        ));
+        assert!(m.lookup_addr(ip("192.0.2.1"), later.secs() + 1199).banned());
         assert_eq!(
             m.lookup_addr(ip("192.0.2.1"), later.secs() + 1200),
             Lookup::Clear
@@ -2070,10 +2226,7 @@ mod tests {
             Now::default(),
         )
         .unwrap();
-        assert!(matches!(
-            m.lookup_addr(a, u64::from(u32::MAX)),
-            Lookup::Banned(_)
-        ));
+        assert!(m.lookup_addr(a, u64::from(u32::MAX)).banned());
     }
 
     #[test]
@@ -2164,7 +2317,7 @@ mod tests {
         );
         for &a in v4.iter().chain(&v6) {
             assert!(
-                matches!(m.lookup_addr(a, 0), Lookup::Banned(_)),
+                m.lookup_addr(a, 0).banned(),
                 "{a} banned"
             );
         }
@@ -2180,7 +2333,7 @@ mod tests {
             }
         }
         for (i, &a) in v4.iter().chain(&v6).enumerate() {
-            let banned = matches!(m.lookup_addr(a, 0), Lookup::Banned(_));
+            let banned = m.lookup_addr(a, 0).banned();
             assert_eq!(banned, i % 2 == 1, "{a}");
         }
         // A ban of the anchor prefix itself covers everything inside it.
@@ -2192,7 +2345,7 @@ mod tests {
         .unwrap();
         assert!(
             v4.iter()
-                .all(|&a| matches!(m.lookup_addr(a, 0), Lookup::Banned(_)))
+                .all(|&a| m.lookup_addr(a, 0).banned())
         );
     }
 
@@ -2235,7 +2388,7 @@ mod tests {
             .with(|t| t.locate(&BanMemory::key_at(&Cidr::host(v6[0]), 48)).0);
         assert!(m.table.with(|t| t.overflowed(g)));
         for &a in &v6 {
-            assert!(matches!(m.lookup_addr(a, 0), Lookup::Banned(_)), "{a}");
+            assert!(m.lookup_addr(a, 0).banned(), "{a}");
         }
     }
 
@@ -2259,7 +2412,7 @@ mod tests {
         assert_eq!(m.table.with(Table::anchors), (Some(24), Some(48)));
         for &a in v4.iter().chain(&v6) {
             assert!(
-                matches!(m.lookup_addr(a, 0), Lookup::Banned(_)),
+                m.lookup_addr(a, 0).banned(),
                 "{a} after reseed"
             );
         }

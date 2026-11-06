@@ -110,7 +110,10 @@ pub use crate::{
         normalize, prefix_of,
     },
     maintain::{CloseKind, Ejector, MaintenanceReport},
-    persist::{FilePersistence, LoadFailure, Persistence, SNAPSHOT_FORMAT, SNAPSHOT_MAGIC},
+    persist::{
+        FileAnchor, FilePersistence, LoadFailure, Persistence, SNAPSHOT_FORMAT, SNAPSHOT_MAGIC,
+        StoreVersion, VersionAnchor,
+    },
     revoke::{Revocation, RevocationEpoch, RevokeMode, Target},
     share::{Delta, ImportReport, NodeId, Sequence},
     strikes::{Enforcement, IgnoredBecause, Mode, Posture, StrikeKind, StrikeOutcome, StrikeRules},
