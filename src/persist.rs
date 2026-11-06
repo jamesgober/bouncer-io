@@ -13,8 +13,8 @@
 //! journal batch's MAC covers the previous MAC and the batch, so batches
 //! cannot be altered, reordered, dropped from the middle, or spliced in from
 //! another file without the key. Cutting the journal after a whole batch,
-//! or putting back an older snapshot and journal together, is not detected:
-//! that needs a counter kept outside the files (see `docs/SECURITY.md`). A
+//! or putting back an older snapshot and journal together, is detected with
+//! a [`VersionAnchor`] kept outside the files, and not without one. A
 //! batch from another epoch (left by a crash during compaction)
 //! is ignored. Writing happens off the hot path: changes queue in memory
 //! and the maintainer writes and syncs them about every second.

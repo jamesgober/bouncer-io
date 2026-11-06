@@ -1659,22 +1659,24 @@ impl BanMemory {
         // Nothing banned at any automatic length: no table to read. The
         // filter keeps only the lengths that may hold one of the address's
         // keys (most addresses keep none).
+        let anchor = Self::key_at(
+            &host,
+            match host.family() {
+                Family::V4 => self.anchor_v4,
+                Family::V6 => self.anchor_v6,
+            },
+        );
+        let mut keys = [anchor; PROBE_BATCH];
+        for (k, &len) in keys.iter_mut().zip(&lengths[..count]) {
+            *k = Self::key_at(&host, len);
+        }
         if count > 0 && !overflow {
-            let anchor = Self::key_at(
-                &host,
-                match host.family() {
-                    Family::V4 => self.anchor_v4,
-                    Family::V6 => self.anchor_v6,
-                },
-            );
-            let mut keys = [anchor; PROBE_BATCH];
-            for (k, &len) in keys.iter_mut().zip(&lengths[..count]) {
-                *k = Self::key_at(&host, len);
-            }
             let mut maybe = self.filter.maybe(&anchor, &keys[..count]);
             let mut kept = 0;
             while maybe != 0 {
-                lengths[kept] = lengths[maybe.trailing_zeros() as usize];
+                let i = maybe.trailing_zeros() as usize;
+                lengths[kept] = lengths[i];
+                keys[kept] = keys[i];
                 kept += 1;
                 maybe &= maybe - 1;
             }
@@ -1682,8 +1684,16 @@ impl BanMemory {
         }
         let hit = (count > 0)
             .then(|| {
-                self.table
-                    .with(|table| Self::probe_lengths(table, &host, &lengths[..count], now_secs))
+                self.table.with(|table| {
+                    Self::probe_lengths(
+                        table,
+                        &host,
+                        &lengths[..count],
+                        &keys[..count],
+                        &anchor,
+                        now_secs,
+                    )
+                })
             })
             .flatten();
         match hit {
@@ -1722,21 +1732,21 @@ impl BanMemory {
     /// (its overflow bit set) sends the longer ones to their own sequences
     /// too. Each length's key is built and hashed once.
     #[inline]
-    fn probe_lengths(table: &Table, host: &Cidr, lengths: &[u8], now_secs: u64) -> Option<Lookup> {
+    fn probe_lengths(
+        table: &Table,
+        host: &Cidr,
+        lengths: &[u8],
+        keys: &[TableKey],
+        anchor_key: &TableKey,
+        now_secs: u64,
+    ) -> Option<Lookup> {
         let anchor = match host.family() {
             Family::V4 => table.anchors().0,
             Family::V6 => table.anchors().1,
         };
-        let mut keys = [TableKey {
-            kind: 0,
-            len: 0,
-            k0: 0,
-            k1: 0,
-        }; PROBE_BATCH];
         let mut spots = [(0usize, 0u8); PROBE_BATCH];
         let mut home = None;
         for (i, &len) in lengths.iter().enumerate() {
-            keys[i] = Self::key_at(host, len);
             spots[i] = match anchor {
                 // Past the anchor: the tag is all a key needs of its own.
                 Some(a) if len > a => (usize::MAX, Table::anchored_tag(&keys[i])),
@@ -1749,7 +1759,13 @@ impl BanMemory {
         // No ban at the anchor length itself: its group still anchors the
         // longer lengths.
         if home.is_none() {
-            home = anchor.map(|a| table.locate(&Self::key_at(host, a)).0);
+            home = anchor.map(|a| {
+                if anchor_key.len == a {
+                    table.locate(anchor_key).0
+                } else {
+                    table.locate(&Self::key_at(host, a)).0
+                }
+            });
         }
         let home_tags = home.map(|g| table.first_tags(g));
         let mut busy = false;
@@ -1968,11 +1984,13 @@ impl BanMemory {
     }
 }
 
-/// The stable reference of ban `id`: keyed SipHash-1-3, so references do
-/// not reveal ids or how many bans there are.
+/// The reference of ban `id`: keyed SipHash-1-3 of the id under the
+/// bouncer's reference key, so references do not reveal ids or how many
+/// bans there are. Stable for the bouncer's life (its key comes from its
+/// seed).
 #[inline]
 pub(crate) fn reference_of(key: &HashKey, id: u64) -> u64 {
-    key.hash3(id, 0, 0) | 1
+    key.hash1(id) | 1
 }
 
 /// Merges a new ban into an existing one with the same key: the longer end

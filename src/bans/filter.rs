@@ -2,9 +2,9 @@
 //!
 //! Every address key lives in the block of its anchor prefix (the family's
 //! shortest automatic length, as in the table, D-104), so one 64-byte block
-//! answers for every automatic length of an address. A key sets one bit in
-//! each of the block's eight words. "No" is exact: the key is not in the
-//! table. "Maybe" sends the door to the table for that length.
+//! answers for every automatic length of an address. A key sets four bits,
+//! each in a word of the block its hash picks. "No" is exact: the key is
+//! not in the table. "Maybe" sends the door to the table for that length.
 //!
 //! Lifts and expiries leave their bits set, which only adds false "maybe"s.
 //! When enough have built up, the writer rebuilds the filter from the table
@@ -28,6 +28,9 @@ const WORDS: usize = 8;
 const WORDS: usize = 2;
 /// Filter bits per ban the table can hold, at least (each buffer).
 const BITS_PER_KEY: usize = 6;
+/// Bits a key sets: at about 8 bits per key this is near the best false
+/// "maybe" rate (about 3%), and half the work of one bit in every word.
+const PROBES: u32 = 4;
 /// Stale keys a rebuild waits for, at least.
 const MIN_STALE: u64 = 4096;
 
@@ -82,20 +85,33 @@ impl Filter {
         }
     }
 
+    /// The keyed hash of an anchor prefix: it picks the block, and keys the
+    /// bits of every key anchored there.
     #[inline]
     fn hash(&self, k: &TableKey) -> u64 {
         self.key
             .mix3((u64::from(k.kind) << 8) | u64::from(k.len), k.k0, k.k1)
     }
 
+    /// A key's bits in its anchor's block: one multiply over the anchor's
+    /// keyed hash and what the key adds to its anchor (its length and its
+    /// longer bits).
     #[inline]
-    fn index(&self, anchor: &TableKey) -> usize {
-        self.hash(anchor) as usize & self.mask
+    fn bits(anchor_hash: u64, k: &TableKey) -> u64 {
+        crate::hash::remix(anchor_hash ^ k.k1 ^ k.k0.rotate_left(32) ^ (u64::from(k.len) << 56))
+    }
+
+    /// The word and bit of a key's `j`th probe: 9 bits of its hash each.
+    #[inline]
+    fn probe(h: u64, j: u32) -> (usize, u64) {
+        let p = h >> (9 * j);
+        (p as usize & (WORDS - 1), 1u64 << ((p >> 3) & 63))
     }
 
     fn set(block: &Block, h: u64) {
-        for (i, w) in block.0.iter().enumerate() {
-            w.fetch_or(1u64 << ((h >> (6 * i)) & 63), Ordering::Relaxed);
+        for j in 0..PROBES {
+            let (w, bit) = Self::probe(h, j);
+            block.0[w].fetch_or(bit, Ordering::Relaxed);
         }
     }
 
@@ -103,7 +119,8 @@ impl Filter {
     /// is written to the table, under the writer lock.
     pub(crate) fn add(&self, anchor: &TableKey, key: &TableKey) {
         let buf = &self.bufs[self.active.load(Ordering::Relaxed) as usize & 1];
-        Self::set(&buf[self.index(anchor)], self.hash(key));
+        let a = self.hash(anchor);
+        Self::set(&buf[a as usize & self.mask], Self::bits(a, key));
     }
 
     /// One bit per key of `keys` (all anchored at `anchor`): set when that
@@ -117,20 +134,21 @@ impl Filter {
         if g & 1 != 0 {
             return all;
         }
-        let block = &self.bufs[b][self.index(anchor)];
-        let words: [u64; WORDS] = core::array::from_fn(|i| block.0[i].load(Ordering::Relaxed));
+        let a = self.hash(anchor);
+        let block = &self.bufs[b][a as usize & self.mask];
+        let mut out = 0;
+        for (n, k) in keys.iter().enumerate() {
+            let h = Self::bits(a, k);
+            let mut hit = true;
+            for j in 0..PROBES {
+                let (w, bit) = Self::probe(h, j);
+                hit &= block.0[w].load(Ordering::Relaxed) & bit != 0;
+            }
+            out |= u32::from(hit) << n;
+        }
         fence(Ordering::Acquire);
         if gen_.load(Ordering::Relaxed) != g {
             return all;
-        }
-        let mut out = 0;
-        for (n, k) in keys.iter().enumerate() {
-            let h = self.hash(k);
-            let mut hit = true;
-            for (i, w) in words.iter().enumerate() {
-                hit &= w >> ((h >> (6 * i)) & 63) & 1 != 0;
-            }
-            out |= u32::from(hit) << n;
         }
         out
     }
@@ -151,7 +169,10 @@ impl Filter {
                 w.store(0, Ordering::Relaxed);
             }
         }
-        fill(&mut |anchor, key| Self::set(&buf[self.index(anchor)], self.hash(key)));
+        fill(&mut |anchor, key| {
+            let a = self.hash(anchor);
+            Self::set(&buf[a as usize & self.mask], Self::bits(a, key));
+        });
         gen_.store(g.wrapping_add(2), Ordering::Release);
         self.active.store(next as u64, Ordering::Release);
     }
