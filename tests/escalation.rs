@@ -8,9 +8,9 @@ use std::{
 };
 
 use bouncer_io::{
-    AccountKey, Actor, AllowList, BanKey, BanSpec, Bouncer, Budgets, Cidr, DatagramVerdict,
-    Directive, DurationPolicy, Enforcement, EscalationPolicy, Event, EventSink, Filter, Mode, Page,
-    Rate, Reason, RequestId, SessionKey, StrikeKind, StrikeOutcome, signals,
+    AccountKey, Actor, AllowList, BanKey, BanKeys, BanSpec, Bouncer, Budgets, Cidr,
+    DatagramVerdict, Directive, DurationPolicy, Enforcement, EscalationPolicy, Event, EventSink,
+    Filter, Mode, Page, Rate, Reason, RequestId, SessionKey, StrikeKind, StrikeOutcome, signals,
 };
 use clock_lib::ManualClock;
 
@@ -447,4 +447,149 @@ fn test_prefix_strikes_never_ban_over_a_shared_address() {
     };
     assert!(run(false), "the /24 is banned when nothing in it is shared");
     assert!(!run(true), "no prefix ban over a shared address");
+}
+
+#[test]
+fn test_connection_ban_never_takes_a_shared_address_on_a_weak_word() {
+    // T-5: a directive aimed at a connection or request behind a shared
+    // address bans the ticket's session, not the address, unless a strong
+    // actor names the address itself.
+    let setup = || {
+        let b = Bouncer::builder()
+            .budgets(Budgets::off())
+            .try_build()
+            .unwrap();
+        let nat = ip("100.64.0.9");
+        let conn = b.door(nat).unwrap();
+        for s in 0..500u32 {
+            let mut r = conn.request(RequestId(u128::from(s))).unwrap();
+            let mut d = [0u8; 16];
+            d[..4].copy_from_slice(&s.to_be_bytes());
+            assert!(r.bind_session(SessionKey::from_digest(d)).is_pass());
+        }
+        assert!(b.explain(nat).shared_source);
+        (b, nat, conn)
+    };
+    let attacker = SessionKey::from_digest([0xab; 16]);
+
+    // A weak actor, the default keys: the session, not the address.
+    let (b, nat, conn) = setup();
+    let mut r = conn.request(RequestId(9_000)).unwrap();
+    assert!(r.bind_session(attacker).is_pass());
+    let applied = b
+        .apply(
+            Directive::revoke_and_ban(RequestId(9_000))
+                .by(Actor::Policy(3))
+                .confidence(50),
+        )
+        .unwrap();
+    assert!(b.door(nat).is_ok(), "the shared address is not banned");
+    assert!(!b.explain(attacker).admitted, "the request's session is");
+    assert_eq!(applied.bans, 1);
+
+    // A weak actor that asks for the source by name: refused, recorded.
+    let (b, nat, conn) = setup();
+    let _r = conn.request(RequestId(9_001)).unwrap();
+    let applied = b
+        .apply(
+            Directive::ban(RequestId(9_001))
+                .by(Actor::Local)
+                .ban_keys(BanKeys::SOURCE),
+        )
+        .unwrap();
+    assert!(b.door(nat).is_ok(), "a local heuristic cannot ban it");
+    assert!(applied.downgraded && applied.bans == 0);
+
+    // A peer node's channel is weak too.
+    let (b, nat, conn) = setup();
+    let mut r = conn.request(RequestId(9_002)).unwrap();
+    assert!(r.bind_session(attacker).is_pass());
+    b.apply(Directive::ban(RequestId(9_002)).by(Actor::Channel(2)))
+        .unwrap();
+    assert!(b.door(nat).is_ok());
+    assert!(!b.explain(attacker).admitted);
+
+    // The default keys with a strong actor: still the session, as documented.
+    let (b, nat, conn) = setup();
+    let mut r = conn.request(RequestId(9_003)).unwrap();
+    assert!(r.bind_session(attacker).is_pass());
+    b.apply(Directive::ban(RequestId(9_003)).by(Actor::Admin(1)))
+        .unwrap();
+    assert!(b.door(nat).is_ok());
+    assert!(!b.explain(attacker).admitted);
+
+    // A strong actor that names the source bans it.
+    let (b, nat, conn) = setup();
+    let _r = conn.request(RequestId(9_004)).unwrap();
+    let applied = b
+        .apply(
+            Directive::ban(RequestId(9_004))
+                .by(Actor::Admin(1))
+                .ban_keys(BanKeys::SOURCE),
+        )
+        .unwrap();
+    assert!(applied.ban.is_some() && !applied.downgraded);
+    assert!(b.door(nat).is_err(), "an administrator still can");
+
+    // Nothing shared: the default keys ban the source, as before.
+    let b = Bouncer::builder()
+        .budgets(Budgets::off())
+        .try_build()
+        .unwrap();
+    let addr = ip("198.51.100.40");
+    let conn = b.door(addr).unwrap();
+    let _r = conn.request(RequestId(1)).unwrap();
+    b.apply(
+        Directive::ban(RequestId(1))
+            .by(Actor::Policy(3))
+            .confidence(50),
+    )
+    .unwrap();
+    assert!(b.door(addr).is_err());
+}
+
+#[test]
+fn test_decoy_touch_behind_a_shared_address_bans_the_identities_only() {
+    // T-5: a decoy touch is definitive for whoever touched it, but bouncer's
+    // own word never bans a shared address (likely a NAT).
+    let b = Bouncer::builder()
+        .budgets(Budgets::off())
+        .try_build()
+        .unwrap();
+    let nat = ip("100.64.0.33");
+    let conn = b.door(nat).unwrap();
+    for s in 0..500u32 {
+        let mut r = conn.request(RequestId(u128::from(s))).unwrap();
+        let mut d = [0u8; 16];
+        d[..4].copy_from_slice(&s.to_be_bytes());
+        assert!(r.bind_session(SessionKey::from_digest(d)).is_pass());
+    }
+    assert!(b.explain(nat).shared_source);
+    let toucher = SessionKey::from_digest([0xdc; 16]);
+    let mut r = conn.request(RequestId(9_100)).unwrap();
+    assert!(r.bind_session(toucher).is_pass());
+    assert!(r.bind_account(AccountKey(91)).is_pass());
+    let outcome = r.strike(StrikeKind::DecoyTouched);
+    assert!(matches!(outcome, StrikeOutcome::Banned(_)), "{outcome:?}");
+    assert!(r.checkpoint().is_deny(), "the touching request is revoked");
+    assert!(b.door(nat).is_ok(), "the shared address is not banned");
+    assert!(!b.explain(toucher).admitted);
+    assert!(!b.explain(AccountKey(91)).admitted);
+    assert!(
+        b.explain(SessionKey::from_digest([0; 16])).admitted,
+        "nobody else"
+    );
+
+    // Nothing shared: the source is banned, as before.
+    let b = Bouncer::builder()
+        .budgets(Budgets::off())
+        .try_build()
+        .unwrap();
+    let addr = ip("198.51.100.41");
+    let conn = b.door(addr).unwrap();
+    assert!(matches!(
+        conn.strike(StrikeKind::DecoyTouched),
+        StrikeOutcome::Banned(_)
+    ));
+    assert!(b.door(addr).is_err());
 }

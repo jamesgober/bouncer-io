@@ -55,6 +55,16 @@ pub struct Rate {
 
 impl Rate {
     /// `limit` per second; burst equal to the limit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Rate;
+    /// let r = Rate::per_second(50);
+    /// assert_eq!((r.limit(), r.burst_size()), (50, 50));
+    /// assert_eq!(r, Rate::new(50, std::time::Duration::from_secs(1))?);
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     #[must_use]
     pub const fn per_second(limit: u32) -> Rate {
         Rate {
@@ -65,6 +75,16 @@ impl Rate {
     }
 
     /// `limit` per minute; burst equal to the limit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Rate;
+    /// let r = Rate::per_minute(10);
+    /// assert_eq!((r.limit(), r.burst_size()), (10, 10));
+    /// assert_eq!(r, Rate::new(10, std::time::Duration::from_secs(60))?);
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     #[must_use]
     pub const fn per_minute(limit: u32) -> Rate {
         Rate {
@@ -79,6 +99,17 @@ impl Rate {
     /// # Errors
     ///
     /// [`BouncerError::Config`] for a zero limit or a zero period.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{BouncerError, Rate};
+    /// use std::time::Duration;
+    /// let r = Rate::new(5, Duration::from_secs(10))?;
+    /// assert_eq!((r.limit(), r.burst_size()), (5, 5));
+    /// assert!(matches!(Rate::new(5, Duration::ZERO), Err(BouncerError::Config(_))));
+    /// # Ok::<(), BouncerError>(())
+    /// ```
     pub fn new(limit: u32, period: Duration) -> Result<Rate, BouncerError> {
         if limit == 0 {
             return Err(ConfigError::new("rate", ConfigProblem::TooSmall { min: 1 }).into());
@@ -94,6 +125,20 @@ impl Rate {
     }
 
     /// The burst: how many may arrive at once.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Budgets, Rate};
+    /// let bouncer = Bouncer::builder()
+    ///     .budgets(Budgets::off().door_rate(Rate::per_minute(1).burst(3), Rate::per_minute(1_000)))
+    ///     .try_build()?;
+    /// let addr: std::net::IpAddr = "192.0.2.80".parse()?;
+    /// // One a minute, but three may arrive at once.
+    /// let admitted = (0..5).filter(|_| bouncer.door(addr).is_ok()).count();
+    /// assert_eq!(admitted, 3);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub const fn burst(mut self, burst: u32) -> Rate {
         self.burst = burst;
@@ -101,12 +146,28 @@ impl Rate {
     }
 
     /// The limit per period.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Rate;
+    /// assert_eq!(Rate::per_minute(90).limit(), 90);
+    /// assert_eq!(Rate::per_minute(90).burst(5).limit(), 90);
+    /// ```
     #[must_use]
     pub const fn limit(&self) -> u32 {
         self.limit
     }
 
     /// The burst size.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Rate;
+    /// assert_eq!(Rate::per_second(20).burst_size(), 20);
+    /// assert_eq!(Rate::per_second(20).burst(5).burst_size(), 5);
+    /// ```
     #[must_use]
     pub const fn burst_size(&self) -> u32 {
         self.burst
@@ -186,6 +247,18 @@ impl Default for Budgets {
 
 impl Budgets {
     /// No budgets at all.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Budgets};
+    /// let bouncer = Bouncer::builder().budgets(Budgets::off()).try_build()?;
+    /// let addr: std::net::IpAddr = "192.0.2.81".parse()?;
+    /// // The default holds one address to a burst of 40; with no budgets all 100 get in.
+    /// let held = (0..100).map(|_| bouncer.door(addr)).collect::<Result<Vec<_>, _>>()?;
+    /// assert_eq!(held.len(), 100);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn off() -> Budgets {
         Budgets {
@@ -200,6 +273,20 @@ impl Budgets {
     }
 
     /// The accept rate per address and per prefix.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Budgets, Rate, Refusal};
+    /// let bouncer = Bouncer::builder()
+    ///     .budgets(Budgets::off().door_rate(Rate::per_minute(2), Rate::per_minute(100)))
+    ///     .try_build()?;
+    /// let addr: std::net::IpAddr = "192.0.2.82".parse()?;
+    /// assert!(bouncer.door(addr).is_ok() && bouncer.door(addr).is_ok());
+    /// assert!(matches!(bouncer.door(addr), Err(Refusal::OverBudget { .. })));
+    /// assert!(bouncer.door("192.0.2.83".parse()?).is_ok()); // another address, its own budget
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn door_rate(mut self, per_address: Rate, per_prefix: Rate) -> Budgets {
         self.door_rate = Some((per_address, per_prefix));
@@ -207,6 +294,20 @@ impl Budgets {
     }
 
     /// Concurrent connections per address and per prefix.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Budgets, Refusal};
+    /// let bouncer = Bouncer::builder().budgets(Budgets::off().door_concurrency(2, 100)).try_build()?;
+    /// let addr: std::net::IpAddr = "192.0.2.84".parse()?;
+    /// let first = bouncer.door(addr)?;
+    /// let _second = bouncer.door(addr)?;
+    /// assert!(matches!(bouncer.door(addr), Err(Refusal::OverBudget { .. })));
+    /// drop(first); // the slot comes back when the ticket is released
+    /// assert!(bouncer.door(addr).is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn door_concurrency(mut self, per_address: u32, per_prefix: u32) -> Budgets {
         self.door_concurrency = Some((per_address, per_prefix));
@@ -215,6 +316,20 @@ impl Budgets {
 
     /// The rate of one lane, per session (or per client when no session is
     /// bound), charged at [`Ticket::bind_lane`](crate::Ticket::bind_lane).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Budgets, LaneClass, Rate, RequestId};
+    /// let bouncer = Bouncer::builder()
+    ///     .budgets(Budgets::off().lane_rate(LaneClass::Auth, Rate::per_minute(1)))
+    ///     .try_build()?;
+    /// let conn = bouncer.door("192.0.2.85".parse()?)?;
+    /// assert!(conn.request(RequestId(1))?.bind_lane(LaneClass::Auth).is_pass());
+    /// assert!(conn.request(RequestId(2))?.bind_lane(LaneClass::Auth).is_deny());
+    /// assert!(conn.request(RequestId(3))?.bind_lane(LaneClass::Normal).is_pass()); // no budget there
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn lane_rate(mut self, lane: LaneClass, per_key: Rate) -> Budgets {
         self.lanes[lane.index()] = Some(per_key);
@@ -223,6 +338,20 @@ impl Budgets {
 
     /// The default rate per tenant (a token bucket), charged at
     /// [`Ticket::bind_tenant`](crate::Ticket::bind_tenant).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Budgets, Rate, RequestId, TenantKey};
+    /// let bouncer = Bouncer::builder()
+    ///     .budgets(Budgets::off().tenant_rate(Rate::per_minute(1)))
+    ///     .try_build()?;
+    /// let conn = bouncer.door("192.0.2.86".parse()?)?;
+    /// assert!(conn.request(RequestId(1))?.bind_tenant(TenantKey(3)).is_pass());
+    /// assert!(conn.request(RequestId(2))?.bind_tenant(TenantKey(3)).is_deny());
+    /// assert!(conn.request(RequestId(3))?.bind_tenant(TenantKey(4)).is_pass()); // each tenant has its own
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn tenant_rate(mut self, default: Rate) -> Budgets {
         self.tenant_rate = Some(default);
@@ -231,6 +360,27 @@ impl Budgets {
 
     /// A tenant's own rate (its plan), replacing the default for that
     /// tenant. A later plan for the same tenant replaces an earlier one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, BouncerError, Budgets, Rate, RequestId, TenantKey};
+    /// let bouncer = Bouncer::builder()
+    ///     .budgets(
+    ///         Budgets::off()
+    ///             .tenant_rate(Rate::per_minute(1))
+    ///             .tenant_plan(TenantKey(7), Rate::per_minute(3)),
+    ///     )
+    ///     .try_build()?;
+    /// let conn = bouncer.door("192.0.2.87".parse()?)?;
+    /// let bind = |id: u128, tenant: u64| -> Result<bool, BouncerError> {
+    ///     Ok(conn.request(RequestId(id))?.bind_tenant(TenantKey(tenant)).is_pass())
+    /// };
+    /// assert!(bind(1, 8)? && !bind(2, 8)?); // the default: one a minute
+    /// assert!(bind(3, 7)? && bind(4, 7)? && bind(5, 7)?); // tenant 7's plan: three
+    /// assert!(!bind(6, 7)?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn tenant_plan(mut self, tenant: TenantKey, rate: Rate) -> Budgets {
         self.tenant_plans.retain(|(t, _)| *t != tenant);
@@ -240,13 +390,39 @@ impl Budgets {
 
     /// Requests in flight per tenant, taken at `bind_tenant` and returned
     /// when the ticket is released.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Budgets, RequestId, TenantKey};
+    /// let bouncer = Bouncer::builder().budgets(Budgets::off().tenant_in_flight(1)).try_build()?;
+    /// let conn = bouncer.door("192.0.2.88".parse()?)?;
+    /// let mut first = conn.request(RequestId(1))?;
+    /// assert!(first.bind_tenant(TenantKey(5)).is_pass());
+    /// assert!(conn.request(RequestId(2))?.bind_tenant(TenantKey(5)).is_deny());
+    /// drop(first); // returned when the ticket is released
+    /// assert!(conn.request(RequestId(3))?.bind_tenant(TenantKey(5)).is_pass());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn tenant_in_flight(mut self, default: u32) -> Budgets {
         self.tenant_in_flight = Some(default);
         self
     }
 
-    /// Keys the budget tables hold at most (default 65,536).
+    /// Keys the budget tables hold at most (default 65,536; 16 under
+    /// [`Budgets::off`]). Tables hold at least 1,024 whatever is set; 0 and
+    /// more than 16,777,216 are refused.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Budgets};
+    /// let bouncer = Bouncer::builder().budgets(Budgets::default().capacity(4_096)).try_build()?;
+    /// assert_eq!(bouncer.capacity().budget_keys, 4_096);
+    /// assert!(Bouncer::builder().budgets(Budgets::default().capacity(0)).try_build().is_err());
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     #[must_use]
     pub fn capacity(mut self, keys: u32) -> Budgets {
         self.capacity = keys;

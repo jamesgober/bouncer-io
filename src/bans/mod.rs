@@ -55,6 +55,16 @@ impl BanId {
     }
 
     /// The raw value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let bouncer = bouncer_io::Bouncer::new();
+    /// let id = bouncer.ban("198.51.100.1".parse::<std::net::IpAddr>()?)?;
+    /// let listing = bouncer.list(&bouncer_io::Filter::all(), bouncer_io::Page::first(10));
+    /// assert_eq!(listing.items[0].id.get(), id.get());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
@@ -121,6 +131,17 @@ pub struct BanSpec {
 
 impl BanSpec {
     /// A ban of any key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{BanSpec, Bouncer, SessionKey};
+    /// let bouncer = Bouncer::new();
+    /// let session = SessionKey::from_digest([7; 16]);
+    /// bouncer.ban(BanSpec::key(session))?;
+    /// assert!(!bouncer.explain(session).admitted);
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     #[must_use]
     pub fn key(key: impl Into<BanKey>) -> BanSpec {
         BanSpec {
@@ -133,18 +154,56 @@ impl BanSpec {
     }
 
     /// A ban of one client: an IPv4 address, or an IPv6 address's /64.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{BanSpec, Bouncer};
+    /// let bouncer = Bouncer::new();
+    /// bouncer.ban(BanSpec::address("2001:db8:0:1::1".parse()?))?;
+    /// assert!(bouncer.door("2001:db8:0:1::ffff".parse()?).is_err());   // same /64
+    /// assert!(bouncer.door("2001:db8:0:2::1".parse()?).is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn address(addr: IpAddr) -> BanSpec {
         BanSpec::key(BanKey::Address(normalize(addr)))
     }
 
     /// A ban of a prefix.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{BanSpec, Bouncer};
+    /// let bouncer = Bouncer::new();
+    /// bouncer.ban(BanSpec::prefix("203.0.113.0/24".parse()?))?;
+    /// assert!(bouncer.door("203.0.113.77".parse()?).is_err());
+    /// assert!(bouncer.door("203.0.114.1".parse()?).is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn prefix(cidr: Cidr) -> BanSpec {
         BanSpec::key(BanKey::Prefix(cidr))
     }
 
     /// Lasts exactly `duration`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{BanSpec, Bouncer};
+    /// use clock_lib::ManualClock;
+    /// use std::{sync::Arc, time::Duration};
+    /// let clock = Arc::new(ManualClock::new());
+    /// let bouncer = Bouncer::builder().clock(clock.clone()).try_build()?;
+    /// let addr = "198.51.100.9".parse()?;
+    /// bouncer.ban(BanSpec::address(addr).for_duration(Duration::from_secs(60)))?;
+    /// assert!(bouncer.door(addr).is_err());
+    /// clock.advance(Duration::from_secs(61));
+    /// assert!(bouncer.door(addr).is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn for_duration(mut self, duration: Duration) -> BanSpec {
         self.duration = BanDuration::Fixed(duration);
@@ -152,6 +211,20 @@ impl BanSpec {
     }
 
     /// Lasts until lifted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, BanSpec, Bouncer, BouncerError};
+    /// let bouncer = Bouncer::new();
+    /// let addr = "198.51.100.9".parse()?;
+    /// bouncer.ban(BanSpec::address(addr).permanent())?;
+    /// assert_eq!(bouncer.explain(addr).bans[0].until, None);
+    /// // Automated actors other than Sentinel may not ban permanently.
+    /// let refused = bouncer.ban(BanSpec::address("198.51.100.10".parse()?).permanent().by(Actor::Policy(3)));
+    /// assert!(matches!(refused, Err(BouncerError::PermanentNotAllowed)));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn permanent(mut self) -> BanSpec {
         self.duration = BanDuration::Permanent;
@@ -159,6 +232,17 @@ impl BanSpec {
     }
 
     /// Who decided.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, ActorKind, BanSpec, Bouncer};
+    /// let bouncer = Bouncer::new();
+    /// let addr = "198.51.100.9".parse()?;
+    /// bouncer.ban(BanSpec::address(addr).by(Actor::Admin(17)))?;
+    /// assert_eq!(bouncer.explain(addr).bans[0].actor, ActorKind::Admin);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn by(mut self, actor: Actor) -> BanSpec {
         self.actor = actor;
@@ -166,6 +250,17 @@ impl BanSpec {
     }
 
     /// Why.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{BanSpec, Bouncer, Reason};
+    /// let bouncer = Bouncer::new();
+    /// let addr = "198.51.100.9".parse()?;
+    /// bouncer.ban(BanSpec::address(addr).because(Reason::DECOY))?;
+    /// assert_eq!(bouncer.explain(addr).bans[0].reason, Reason::DECOY);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn because(mut self, reason: Reason) -> BanSpec {
         self.reason = reason;
@@ -173,6 +268,17 @@ impl BanSpec {
     }
 
     /// Supporting evidence.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{BanSpec, Bouncer, Evidence, EvidenceValue};
+    /// let spec = BanSpec::address("198.51.100.9".parse()?)
+    ///     .evidence(Evidence::new(&[("failed_logins", EvidenceValue::Number(40))]));
+    /// assert_eq!(spec.evidence.pairs().len(), 1);
+    /// Bouncer::new().ban(spec)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn evidence(mut self, evidence: Evidence<'static>) -> BanSpec {
         self.evidence = evidence;
@@ -222,6 +328,18 @@ pub struct LiftSpec {
 
 impl LiftSpec {
     /// A lift of any key, by [`Actor::App`] for [`Reason::ADMIN`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Cidr, LiftSpec};
+    /// let bouncer = Bouncer::new();
+    /// let prefix: Cidr = "203.0.113.0/24".parse()?;
+    /// bouncer.ban(prefix)?;
+    /// assert_eq!(bouncer.lift(LiftSpec::key(prefix))?.removed, 1);
+    /// assert!(bouncer.door("203.0.113.7".parse()?).is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn key(key: impl Into<BanKey>) -> LiftSpec {
         LiftSpec {
@@ -232,6 +350,19 @@ impl LiftSpec {
     }
 
     /// Who decided.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, Bouncer, LiftSpec};
+    /// let bouncer = Bouncer::new();
+    /// let addr: std::net::IpAddr = "198.51.100.9".parse()?;
+    /// bouncer.ban(addr)?;
+    /// let spec = LiftSpec::key(addr).by(Actor::Admin(17));
+    /// assert_eq!(spec.actor, Actor::Admin(17));
+    /// assert_eq!(bouncer.lift(spec)?.removed, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn by(mut self, actor: Actor) -> LiftSpec {
         self.actor = actor;
@@ -239,6 +370,19 @@ impl LiftSpec {
     }
 
     /// Why.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, LiftSpec, Reason};
+    /// let bouncer = Bouncer::new();
+    /// let addr: std::net::IpAddr = "198.51.100.9".parse()?;
+    /// bouncer.ban(addr)?;
+    /// let spec = LiftSpec::key(addr).because(Reason::custom(900));
+    /// assert_eq!(spec.reason, Reason::custom(900));
+    /// assert_eq!(bouncer.lift(spec)?.removed, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn because(mut self, reason: Reason) -> LiftSpec {
         self.reason = reason;
@@ -266,8 +410,8 @@ impl From<BanKey> for LiftSpec {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lifted {
-    /// Bans removed (0 or 1 at this version; prefix folding arrives with
-    /// escalation).
+    /// Bans removed: 1, or 0 when nothing was banned under the key (bans an
+    /// escalation folded into a parent were removed when the parent was set).
     pub removed: u32,
     /// The id recorded for the lift itself.
     pub tombstone: BanId,
@@ -312,6 +456,23 @@ impl Default for DurationPolicy {
 
 impl DurationPolicy {
     /// The first ban's length (default 10 minutes).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DurationPolicy};
+    /// use std::time::Duration;
+    /// # fn length(b: &bouncer_io::Bouncer, a: std::net::IpAddr) -> Result<u64, Box<dyn std::error::Error>> {
+    /// #     let r = &b.explain(a).bans[0];
+    /// #     Ok(r.until.ok_or("permanent")?.duration_since(r.issued)?.as_secs())
+    /// # }
+    /// let policy = DurationPolicy::default().base(Duration::from_secs(300)).jitter(Duration::ZERO);
+    /// let bouncer = Bouncer::builder().durations(policy).try_build()?;
+    /// let addr = "198.51.100.9".parse()?;
+    /// bouncer.ban(addr)?;
+    /// assert_eq!(length(&bouncer, addr)?, 300);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn base(mut self, d: Duration) -> Self {
         self.base = d;
@@ -319,6 +480,25 @@ impl DurationPolicy {
     }
 
     /// Growth per repeat offence (default 2).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DurationPolicy};
+    /// use std::time::Duration;
+    /// # fn length(b: &bouncer_io::Bouncer, a: std::net::IpAddr) -> Result<u64, Box<dyn std::error::Error>> {
+    /// #     let r = &b.explain(a).bans[0];
+    /// #     Ok(r.until.ok_or("permanent")?.duration_since(r.issued)?.as_secs())
+    /// # }
+    /// let policy = DurationPolicy::default().base(Duration::from_secs(60)).factor(3).jitter(Duration::ZERO);
+    /// let bouncer = Bouncer::builder().durations(policy).try_build()?;
+    /// let addr = "198.51.100.9".parse()?;
+    /// bouncer.ban(addr)?;
+    /// bouncer.lift(addr)?;
+    /// bouncer.ban(addr)?;   // second offence: 60 * 3
+    /// assert_eq!(length(&bouncer, addr)?, 180);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn factor(mut self, f: u32) -> Self {
         self.factor = f;
@@ -326,6 +506,27 @@ impl DurationPolicy {
     }
 
     /// Offences after which the growth stops (default 20).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DurationPolicy};
+    /// use std::time::Duration;
+    /// # fn length(b: &bouncer_io::Bouncer, a: std::net::IpAddr) -> Result<u64, Box<dyn std::error::Error>> {
+    /// #     let r = &b.explain(a).bans[0];
+    /// #     Ok(r.until.ok_or("permanent")?.duration_since(r.issued)?.as_secs())
+    /// # }
+    /// let policy = DurationPolicy::default().base(Duration::from_secs(60)).step_cap(1).jitter(Duration::ZERO);
+    /// let bouncer = Bouncer::builder().durations(policy).try_build()?;
+    /// let addr = "198.51.100.9".parse()?;
+    /// for _ in 0..3 {
+    ///     bouncer.ban(addr)?;
+    ///     bouncer.lift(addr)?;
+    /// }
+    /// bouncer.ban(addr)?;   // fourth offence: growth stopped after one step
+    /// assert_eq!(length(&bouncer, addr)?, 120);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn step_cap(mut self, n: u8) -> Self {
         self.step_cap = n;
@@ -333,6 +534,29 @@ impl DurationPolicy {
     }
 
     /// The longest ban (default 7 days), before jitter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DurationPolicy};
+    /// use std::time::Duration;
+    /// # fn length(b: &bouncer_io::Bouncer, a: std::net::IpAddr) -> Result<u64, Box<dyn std::error::Error>> {
+    /// #     let r = &b.explain(a).bans[0];
+    /// #     Ok(r.until.ok_or("permanent")?.duration_since(r.issued)?.as_secs())
+    /// # }
+    /// let policy = DurationPolicy::default()
+    ///     .base(Duration::from_secs(60))
+    ///     .factor(10)
+    ///     .max(Duration::from_secs(300))
+    ///     .jitter(Duration::ZERO);
+    /// let bouncer = Bouncer::builder().durations(policy).try_build()?;
+    /// let addr = "198.51.100.9".parse()?;
+    /// bouncer.ban(addr)?;
+    /// bouncer.lift(addr)?;
+    /// bouncer.ban(addr)?;   // 600 seconds, capped
+    /// assert_eq!(length(&bouncer, addr)?, 300);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn max(mut self, d: Duration) -> Self {
         self.max = d;
@@ -340,6 +564,23 @@ impl DurationPolicy {
     }
 
     /// Random extra time, uniform in `0..=jitter` (default 60 seconds).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DurationPolicy};
+    /// use std::time::Duration;
+    /// # fn length(b: &bouncer_io::Bouncer, a: std::net::IpAddr) -> Result<u64, Box<dyn std::error::Error>> {
+    /// #     let r = &b.explain(a).bans[0];
+    /// #     Ok(r.until.ok_or("permanent")?.duration_since(r.issued)?.as_secs())
+    /// # }
+    /// let policy = DurationPolicy::default().base(Duration::from_secs(300)).jitter(Duration::from_secs(30));
+    /// let bouncer = Bouncer::builder().durations(policy).try_build()?;
+    /// let addr = "198.51.100.9".parse()?;
+    /// bouncer.ban(addr)?;
+    /// assert!((300..=330).contains(&length(&bouncer, addr)?));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn jitter(mut self, d: Duration) -> Self {
         self.jitter = d;
@@ -349,6 +590,32 @@ impl DurationPolicy {
     /// How fast offender memory forgets: an offence counts half after this
     /// long (default 24 hours). Offences rounded from the decayed score
     /// drive the next ban's length.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DurationPolicy};
+    /// use clock_lib::ManualClock;
+    /// use std::{sync::Arc, time::Duration};
+    /// # fn length(b: &bouncer_io::Bouncer, a: std::net::IpAddr) -> Result<u64, Box<dyn std::error::Error>> {
+    /// #     let r = &b.explain(a).bans[0];
+    /// #     Ok(r.until.ok_or("permanent")?.duration_since(r.issued)?.as_secs())
+    /// # }
+    /// let policy = DurationPolicy::default()
+    ///     .base(Duration::from_secs(60))
+    ///     .jitter(Duration::ZERO)
+    ///     .half_life(Duration::from_secs(600));
+    /// let clock = Arc::new(ManualClock::new());
+    /// let bouncer = Bouncer::builder().durations(policy).clock(clock.clone()).try_build()?;
+    /// let addr = "198.51.100.9".parse()?;
+    /// bouncer.ban(addr)?;
+    /// bouncer.lift(addr)?;
+    /// clock.advance(Duration::from_secs(6_000));   // ten half-lives: the offence is forgotten
+    /// bouncer.ban(addr)?;
+    /// assert_eq!(length(&bouncer, addr)?, 60);
+    /// assert_eq!(bouncer.explain(addr).bans[0].offences, 0);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn half_life(mut self, d: Duration) -> Self {
         self.half_life = d;

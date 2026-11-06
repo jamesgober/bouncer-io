@@ -51,12 +51,31 @@ pub struct AllowList {
 
 impl AllowList {
     /// An empty list.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let list = bouncer_io::AllowList::new();
+    /// assert!(list.is_empty());
+    /// ```
     #[must_use]
     pub fn new() -> AllowList {
         AllowList::default()
     }
 
     /// Adds an immune entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{AllowList, Bouncer, BouncerError};
+    /// let bouncer = Bouncer::builder()
+    ///     .allow(AllowList::new().immune("10.20.0.0/16".parse()?, "own infrastructure"))
+    ///     .try_build()?;
+    /// let refused = bouncer.ban("10.20.1.1".parse::<std::net::IpAddr>()?);
+    /// assert!(matches!(refused, Err(BouncerError::AllowListed { .. })));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn immune(mut self, cidr: Cidr, label: &'static str) -> AllowList {
         self.entries.push((cidr, AllowKind::Immune, label));
@@ -64,6 +83,27 @@ impl AllowList {
     }
 
     /// Adds a budget-exempt entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{AllowList, Bouncer, Budgets, Rate};
+    /// use clock_lib::ManualClock;
+    /// use std::sync::Arc;
+    /// let bouncer = Bouncer::builder()
+    ///     .clock(Arc::new(ManualClock::new()))
+    ///     .budgets(Budgets::off().door_rate(Rate::per_second(1), Rate::per_second(100)))
+    ///     .allow(AllowList::new().exempt_budgets("192.0.2.200".parse()?, "health checks"))
+    ///     .try_build()?;
+    /// let (checker, client) = ("192.0.2.200".parse()?, "192.0.2.7".parse()?);
+    /// assert!(bouncer.door(checker).is_ok() && bouncer.door(checker).is_ok());
+    /// assert!(bouncer.door(client).is_ok());
+    /// assert!(bouncer.door(client).is_err());   // over its rate budget
+    /// // Exempt from budgets, but still bannable.
+    /// bouncer.ban(checker)?;
+    /// assert!(bouncer.door(checker).is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn exempt_budgets(mut self, cidr: Cidr, label: &'static str) -> AllowList {
         self.entries.push((cidr, AllowKind::ExemptBudgets, label));
@@ -71,12 +111,32 @@ impl AllowList {
     }
 
     /// Number of entries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::AllowList;
+    /// let list = AllowList::new()
+    ///     .immune("10.20.0.0/16".parse()?, "own infrastructure")
+    ///     .exempt_budgets("192.0.2.200".parse()?, "health checks");
+    /// assert_eq!(list.len(), 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// `true` when the list has no entries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::AllowList;
+    /// assert!(AllowList::new().is_empty());
+    /// assert!(!AllowList::new().immune("10.20.0.0/16".parse()?, "own infrastructure").is_empty());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

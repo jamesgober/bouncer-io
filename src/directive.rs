@@ -48,18 +48,45 @@ pub enum Actor {
 
 impl Actor {
     /// `true` for every actor except `App` and `Admin`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Actor;
+    /// assert!(Actor::Gate.is_automated());
+    /// assert!(Actor::Policy(4).is_automated());
+    /// assert!(!Actor::App.is_automated());
+    /// assert!(!Actor::Admin(1).is_automated());
+    /// ```
     #[must_use]
     pub const fn is_automated(&self) -> bool {
         !matches!(self, Actor::App | Actor::Admin(_))
     }
 
     /// `true` for `App`, `Admin`, and `Sentinel`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Actor;
+    /// assert!(Actor::Sentinel.may_ban_permanently());
+    /// assert!(!Actor::Gate.may_ban_permanently());
+    /// assert!(!Actor::Local.may_ban_permanently());
+    /// ```
     #[must_use]
     pub const fn may_ban_permanently(&self) -> bool {
         matches!(self, Actor::App | Actor::Admin(_) | Actor::Sentinel)
     }
 
     /// The kind of actor, without its id.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, ActorKind};
+    /// assert_eq!(Actor::Policy(12).kind(), ActorKind::Policy);
+    /// assert_eq!(Actor::Channel(3).kind(), Actor::Channel(9).kind());
+    /// ```
     #[must_use]
     pub const fn kind(&self) -> ActorKind {
         match self {
@@ -184,12 +211,29 @@ impl Reason {
     pub const BUDGET: Reason = Reason(12);
 
     /// A project's own code; values below 1000 are raised to 1000.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Reason;
+    /// assert_eq!(Reason::custom(4001).code(), 4001);
+    /// assert_eq!(Reason::custom(12), Reason::custom(1000));
+    /// assert_eq!(Reason::custom(4001).to_string(), "custom(4001)");
+    /// ```
     #[must_use]
     pub const fn custom(code: u16) -> Reason {
         Reason(if code < 1000 { 1000 } else { code })
     }
 
     /// The numeric code.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Reason;
+    /// assert_eq!(Reason::DECOY.code(), 8);
+    /// assert_eq!(Reason::DECOY.to_string(), "decoy");
+    /// ```
     #[must_use]
     pub const fn code(self) -> u16 {
         self.0
@@ -258,18 +302,45 @@ pub struct Evidence<'a> {
 
 impl<'a> Evidence<'a> {
     /// No evidence.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Evidence;
+    /// assert!(Evidence::none().pairs().is_empty());
+    /// ```
     #[must_use]
     pub const fn none() -> Evidence<'static> {
         Evidence { pairs: &[] }
     }
 
     /// Evidence from borrowed pairs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Evidence, EvidenceValue};
+    /// static PAIRS: [(&str, EvidenceValue<'static>); 1] = [("probes", EvidenceValue::Number(40))];
+    /// let evidence = Evidence::new(&PAIRS);
+    /// assert_eq!(evidence.pairs()[0].0, "probes");
+    /// ```
     #[must_use]
     pub const fn new(pairs: &'a [(&'static str, EvidenceValue<'a>)]) -> Evidence<'a> {
         Evidence { pairs }
     }
 
     /// The pairs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Evidence, EvidenceValue};
+    /// static PAIRS: [(&str, EvidenceValue<'static>); 2] =
+    ///     [("path", EvidenceValue::Text("/.env")), ("decoy", EvidenceValue::Flag(true))];
+    /// let pairs = Evidence::new(&PAIRS).pairs();
+    /// assert_eq!(pairs.len(), 2);
+    /// assert_eq!(pairs[1], ("decoy", EvidenceValue::Flag(true)));
+    /// ```
     #[must_use]
     pub const fn pairs(&self) -> &'a [(&'static str, EvidenceValue<'a>)] {
         self.pairs
@@ -323,6 +394,15 @@ impl BanKeys {
     pub const TENANT: BanKeys = BanKeys(16);
 
     /// `true` when every key of `other` is included.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::BanKeys;
+    /// let keys = BanKeys::SESSION | BanKeys::TENANT;
+    /// assert!(keys.contains(BanKeys::SESSION | BanKeys::TENANT));
+    /// assert!(!keys.contains(BanKeys::SESSION | BanKeys::ACCOUNT)); // every key must be in
+    /// ```
     #[must_use]
     pub const fn contains(self, other: BanKeys) -> bool {
         self.0 & other.0 == other.0
@@ -392,12 +472,42 @@ impl Directive {
     }
 
     /// Bans the target's key for the future (the duration policy).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Directive, RequestId};
+    /// let bouncer = Bouncer::new();
+    /// let addr: std::net::IpAddr = "203.0.113.30".parse()?;
+    /// let conn = bouncer.door(addr)?;
+    /// let applied = bouncer.apply(Directive::ban(addr))?;
+    /// assert!(applied.ban.is_some());
+    /// assert!(bouncer.door(addr).is_err());
+    /// // A ban alone leaves running work alone.
+    /// assert!(conn.request(RequestId(1))?.checkpoint().is_pass());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn ban(target: impl Into<crate::revoke::Target>) -> Directive {
         Directive::new(Action::Ban(crate::bans::BanDuration::Policy), target.into())
     }
 
     /// Revokes what is running.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Directive, RequestId, SessionKey};
+    /// let bouncer = Bouncer::new();
+    /// let session = SessionKey::from_digest([7; 16]);
+    /// let conn = bouncer.door("192.0.2.60".parse()?)?;
+    /// let mut request = conn.request(RequestId(1))?;
+    /// assert!(request.bind_session(session).is_pass());
+    /// let applied = bouncer.apply(Directive::revoke(session))?;
+    /// assert!(applied.revocation.is_some() && applied.ban.is_none());
+    /// assert!(request.checkpoint().is_deny());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn revoke(target: impl Into<crate::revoke::Target>) -> Directive {
         Directive::new(
@@ -408,6 +518,20 @@ impl Directive {
 
     /// Revokes what is running and bans for the future: wipe, eject, and
     /// remember.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Directive, RequestId};
+    /// let bouncer = Bouncer::new();
+    /// let addr: std::net::IpAddr = "203.0.113.31".parse()?;
+    /// let conn = bouncer.door(addr)?;
+    /// let mut request = conn.request(RequestId(1))?;
+    /// bouncer.apply(Directive::revoke_and_ban(addr))?;
+    /// assert!(request.checkpoint().is_deny()); // running work stops
+    /// assert!(bouncer.door(addr).is_err()); // and the source stays out
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn revoke_and_ban(target: impl Into<crate::revoke::Target>) -> Directive {
         Directive::new(
@@ -420,6 +544,23 @@ impl Directive {
     }
 
     /// Divides the key's budgets by `factor` (clamped to 2..=16) for `duration`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Budgets, Directive, Rate};
+    /// use std::time::Duration;
+    /// let bouncer = Bouncer::builder()
+    ///     .budgets(Budgets::off().door_rate(Rate::per_minute(8), Rate::per_minute(1_000)))
+    ///     .try_build()?;
+    /// let addr: std::net::IpAddr = "198.51.100.40".parse()?;
+    /// let applied = bouncer.apply(Directive::throttle(addr, 4, Duration::from_secs(600)))?;
+    /// assert!(applied.throttled);
+    /// // A quarter of the burst of 8 gets in.
+    /// let admitted = (0..8).filter(|_| bouncer.door(addr).is_ok()).count();
+    /// assert_eq!(admitted, 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn throttle(
         target: impl Into<crate::revoke::Target>,
@@ -436,12 +577,39 @@ impl Directive {
     }
 
     /// Lifts bans on the target's key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Directive};
+    /// let bouncer = Bouncer::new();
+    /// let addr: std::net::IpAddr = "198.51.100.41".parse()?;
+    /// bouncer.ban(addr)?;
+    /// let applied = bouncer.apply(Directive::lift(addr))?;
+    /// assert_eq!(applied.lifted.map(|l| l.removed), Some(1));
+    /// assert!(bouncer.door(addr).is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn lift(target: impl Into<crate::revoke::Target>) -> Directive {
         Directive::new(Action::Lift, target.into())
     }
 
     /// Who decided.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, ActorKind, Bouncer, BouncerError, Directive};
+    /// let bouncer = Bouncer::new();
+    /// let addr: std::net::IpAddr = "198.51.100.42".parse()?;
+    /// // A gate may not ban permanently; an administrator may.
+    /// let refused = bouncer.apply(Directive::ban(addr).by(Actor::Gate).permanent());
+    /// assert!(matches!(refused, Err(BouncerError::PermanentNotAllowed)));
+    /// bouncer.apply(Directive::ban(addr).by(Actor::Admin(3)).permanent())?;
+    /// assert_eq!(bouncer.explain(addr).bans[0].actor, ActorKind::Admin);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn by(mut self, actor: Actor) -> Directive {
         self.actor = actor;
@@ -449,6 +617,17 @@ impl Directive {
     }
 
     /// Why.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Directive, Reason};
+    /// let bouncer = Bouncer::new();
+    /// let addr: std::net::IpAddr = "198.51.100.43".parse()?;
+    /// bouncer.apply(Directive::ban(addr).because(Reason::DECOY))?;
+    /// assert_eq!(bouncer.explain(addr).bans[0].reason, Reason::DECOY);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn because(mut self, reason: Reason) -> Directive {
         self.reason = reason;
@@ -457,6 +636,21 @@ impl Directive {
 
     /// How sure, 0 to 100. Below 30 a directive cannot ban by itself; it is
     /// applied as a throttle.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, Bouncer, Directive};
+    /// let bouncer = Bouncer::new();
+    /// let unsure: std::net::IpAddr = "198.51.100.44".parse()?;
+    /// let sure: std::net::IpAddr = "198.51.100.45".parse()?;
+    /// let low = bouncer.apply(Directive::ban(unsure).by(Actor::Sentinel).confidence(10))?;
+    /// assert!(low.downgraded && low.ban.is_none());
+    /// let high = bouncer.apply(Directive::ban(sure).by(Actor::Sentinel).confidence(90))?;
+    /// assert!(high.ban.is_some());
+    /// assert_eq!(Directive::ban(sure).confidence(250).confidence, Some(100));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn confidence(mut self, value: u8) -> Directive {
         self.confidence = Some(value.min(100));
@@ -464,6 +658,23 @@ impl Directive {
     }
 
     /// The ban part lasts exactly `duration`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Directive};
+    /// use clock_lib::ManualClock;
+    /// use std::{sync::Arc, time::Duration};
+    /// let clock = Arc::new(ManualClock::new());
+    /// let bouncer = Bouncer::builder().clock(clock.clone()).try_build()?;
+    /// let addr: std::net::IpAddr = "198.51.100.46".parse()?;
+    /// bouncer.apply(Directive::ban(addr).for_duration(Duration::from_secs(300)))?;
+    /// clock.advance(Duration::from_secs(299));
+    /// assert!(bouncer.door(addr).is_err());
+    /// clock.advance(Duration::from_secs(1));
+    /// assert!(bouncer.door(addr).is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn for_duration(mut self, duration: Duration) -> Directive {
         self.set_duration(crate::bans::BanDuration::Fixed(duration));
@@ -471,6 +682,17 @@ impl Directive {
     }
 
     /// The ban part lasts until lifted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Directive};
+    /// let bouncer = Bouncer::new();
+    /// let addr: std::net::IpAddr = "198.51.100.47".parse()?;
+    /// bouncer.apply(Directive::ban(addr).permanent())?;
+    /// assert_eq!(bouncer.explain(addr).bans[0].until, None);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn permanent(mut self) -> Directive {
         self.set_duration(crate::bans::BanDuration::Permanent);
@@ -491,6 +713,18 @@ impl Directive {
 
     /// Revokes with `RevokeMode::EjectNow`: idle matching connections are
     /// closed too.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Directive};
+    /// // No maintainer thread, so the sweep runs inside `apply`.
+    /// let bouncer = Bouncer::new();
+    /// let idle = bouncer.door("192.0.2.61".parse()?)?;
+    /// let applied = bouncer.apply(Directive::revoke(idle.conn()).eject_now())?;
+    /// assert_eq!(applied.revocation.and_then(|r| r.matched_live), Some(1));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn eject_now(mut self) -> Directive {
         match &mut self.action {
@@ -504,6 +738,19 @@ impl Directive {
 
     /// Revoking a request leaves its connection open (for an administrator
     /// ending one request on a multiplexed connection).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Directive, RequestId};
+    /// let bouncer = Bouncer::new();
+    /// let mut conn = bouncer.door("192.0.2.62".parse()?)?;
+    /// let mut request = conn.request(RequestId(5))?;
+    /// bouncer.apply(Directive::revoke(RequestId(5)).keep_connection())?;
+    /// assert!(request.checkpoint().is_deny());
+    /// assert!(conn.checkpoint().is_pass()); // the connection carries on
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn keep_connection(mut self) -> Directive {
         self.keep_connection = true;
@@ -511,7 +758,25 @@ impl Directive {
     }
 
     /// Which of the ticket's keys a connection or request ban takes (default:
-    /// the source).
+    /// the source; the ticket's session instead when the source is flagged
+    /// as shared). A local heuristic, a peer node, or a policy below
+    /// confidence 70 never bans a shared source this way: it is throttled and
+    /// the receipt says `downgraded`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{AccountKey, BanKeys, Bouncer, Directive, RequestId};
+    /// let bouncer = Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.63".parse()?)?;
+    /// let mut request = conn.request(RequestId(6))?;
+    /// assert!(request.bind_account(AccountKey(77)).is_pass());
+    /// let applied = bouncer.apply(Directive::ban(RequestId(6)).ban_keys(BanKeys::ACCOUNT))?;
+    /// assert_eq!(applied.bans, 1);
+    /// assert!(!bouncer.explain(AccountKey(77)).admitted);
+    /// assert!(bouncer.door("192.0.2.63".parse()?).is_ok()); // the source is not banned
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn ban_keys(mut self, keys: BanKeys) -> Directive {
         self.ban_keys = Some(keys);
@@ -519,6 +784,18 @@ impl Directive {
     }
 
     /// The denial code revoked requests get (default `Forbidden`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DenialCode, Directive, RequestId};
+    /// let bouncer = Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.64".parse()?)?;
+    /// let mut request = conn.request(RequestId(7))?;
+    /// bouncer.apply(Directive::revoke(RequestId(7)).deny_with(DenialCode::NotFound))?;
+    /// assert_eq!(request.checkpoint().denial().map(|d| d.code), Some(DenialCode::NotFound));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn deny_with(mut self, code: crate::verdict::DenialCode) -> Directive {
         self.deny_with = Some(code);
@@ -526,6 +803,34 @@ impl Directive {
     }
 
     /// Supporting evidence, for events.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{signals, Bouncer, Directive, Event, EventSink, Evidence, EvidenceValue};
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// #[derive(Default)]
+    /// struct Kept(Mutex<Vec<u64>>);
+    /// impl EventSink for Kept {
+    ///     fn event(&self, e: &Event<'_>) {
+    ///         if e.path == signals::BAN_ADDED.path() {
+    ///             for (_, value) in e.evidence.pairs() {
+    ///                 if let EvidenceValue::Number(n) = value {
+    ///                     self.0.lock().unwrap().push(*n);
+    ///                 }
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// static PAIRS: [(&str, EvidenceValue<'static>); 1] = [("failed_logins", EvidenceValue::Number(12))];
+    /// let kept = Arc::new(Kept::default());
+    /// let bouncer = Bouncer::builder().event_sink(kept.clone()).try_build()?;
+    /// let addr: std::net::IpAddr = "198.51.100.48".parse()?;
+    /// bouncer.apply(Directive::ban(addr).evidence(Evidence::new(&PAIRS)))?;
+    /// assert_eq!(*kept.0.lock().unwrap(), [12]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn evidence(mut self, evidence: Evidence<'static>) -> Directive {
         self.evidence = evidence;

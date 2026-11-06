@@ -18,7 +18,7 @@
 
 The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every item lists its tier, its grade, the version that brings it, and what it costs. The rustdoc on [docs.rs](https://docs.rs/bouncer-io) becomes the exhaustive reference as each item lands; until then this file is the contract.
 
-> **Status: `0.9.0` (alpha).** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. The net-io feature arrived at 0.8; 0.9 is the pre-1.0 polish.
+> **Status: `0.9.1` (alpha).** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. The net-io feature arrived at 0.8; 0.9 is the pre-1.0 polish.
 
 **Reading the item headers.** *Tier 1* is the simple surface (one-line constructors, no builder), *Tier 2* is configuration, *Tier 3* is the full surface for integrations and other libraries. *P0* is required for the crate's job, *P1* is what users of the best existing tools expect, *P2* is high value for serious deployments, *P3* comes after 1.0. Costs are targets, marked `[est.]` until they are measured at 0.6.
 
@@ -698,7 +698,7 @@ a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
 
 let delta = a.export_delta(Sequence::START)?;
 let report = b.import(&delta, Actor::Channel(1))?;
-assert_eq!(report.applied, 1);
+assert_eq!(report.applied, 2);   // the ban and its offender record
 assert!(b.door("198.51.100.9".parse()?).is_err());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -750,8 +750,8 @@ Tier 2 throughout, except `epoch`, `clock`, and `seed` (Tier 3). Every setter is
 
 | Setter | What it sets | Default | Errors at `try_build` | Grade | Ver |
 |---|---|---|---|---|---|
-| `tickets` | registry capacity; one cell per connection and one per in-flight request; 128 B per cell | 65,536 (8 MiB) | `Config(TooSmall/TooLarge)` | P0 | 0.3 |
-| `shards` | registry shards, rounded up to a power of two | one per core, at most 256 | `Config(..)` | P0 | 0.3 |
+| `tickets` | registry capacity; one cell per connection and one per in-flight request; 128 B per cell; rounded up to a multiple of the shard count | 65,536 (8 MiB) | `Config(TooSmall/TooLarge)` | P0 | 0.3 |
+| `shards` | registry shards, rounded down to a power of two and to at most the ticket count | one per core, at most 256 | `Config(..)` for 0 or more than 256 | P0 | 0.3 |
 | `ban_capacity` | dynamic ban table entries | 1,048,576 (about 45 MiB [est.]) | `Config(..)` | P0 | 0.3 |
 | `revocation_capacity` | revocation table entries | 65,536 | `Config(..)` | P0 | 0.4 |
 | `ipv4_lengths` | automatic key lengths for IPv4; must include 32 | `[32, 24]` | `Config(InvalidLength)` | P0 | 0.3 |
@@ -770,7 +770,7 @@ Tier 2 throughout, except `epoch`, `clock`, and `seed` (Tier 3). Every setter is
 | `epoch` | an epoch word owned by the security core, shared with other modules | bouncer's own | none | P1 | 0.4 |
 | `clock` | the time source; `ManualClock` in tests | the system clock | none | P0 | 0.3 |
 | `seed` | fixed seeds for hashing, jitter, and references, for tests and simulation only | random from the operating system | none | P1 | 0.3 |
-| `max_unchecked` | how long a ticket may go without a checkpoint before the maintainer checks it on its behalf | 60 s | `Config(..)` | P1 | 0.4 |
+| `max_unchecked` | how long a ticket may go without a checkpoint before the maintainer checks it on its behalf (by the first run after one at least this old; the maintainer runs at least every 10 s) | 60 s | `Config(..)` | P1 | 0.4 |
 | `maintainer` | spawn one maintenance thread that parks until work is due (no idle wake-ups) | `false` | `Spawn(kind)` | P1 | 0.4 |
 | `persistence` | where bans and offender memory survive restarts | none (memory only) | `Persist(..)` when the load fails and the policy is `Refuse` | P1 | 0.5 |
 | `mac_key` | key for the keyed BLAKE3 MAC over snapshot and journal (from the integrator's key store) | none (CRC32C only) | none | P1 | 0.5 |
@@ -781,7 +781,7 @@ Tier 2 throughout, except `epoch`, `clock`, and `seed` (Tier 3). Every setter is
 | `strict_revokes_unauthenticated` | whether entering `Posture::Strict` revokes every ticket with no bound session | `false` | none | P2 | 0.5 |
 | `max_wall_jump` | a wall-clock jump between save and load larger than this is reported | 1 hour | none | P1 | 0.5 |
 | `strict_wall_jump` | keep bans across such a jump instead of letting them expire | `false` | none | P1 | 0.5 |
-| `revocation_rate_limit` | revocations per second accepted from each automated actor before further ones are observed only (a revocation storm defence) | 10,000 | `Config(TooSmall)` for 0 | P1 | 0.4 |
+| `revocation_rate_limit` | revocations per second from automated actors, one limit for them all, before the excess is reported as a storm in an Observe event; every revocation still applies (D-054) | 10,000 | `Config(TooSmall)` for 0 | P1 | 0.4 |
 
 ```rust
 use bouncer_io::{Bouncer, DurationPolicy, Enforcement, FilePersistence, StrikeKind};
@@ -1603,7 +1603,7 @@ impl From<IpAddr> for BanSpec; impl From<Cidr> for BanSpec; impl From<BanKey> fo
 
 Tier 1 · P0 · 0.3
 
-Describes a ban. The defaults are the duration policy, `Actor::App`, and `Reason::ADMIN`. `permanent` is refused at `ban` time for `Actor::Local`, `Actor::Policy`, and `Actor::Channel` (`PermanentNotAllowed`); administrators, the application, sentinel, and definitive strikes (a decoy touch) may ban permanently.
+Describes a ban. The defaults are the duration policy, `Actor::App`, and `Reason::ADMIN`. `permanent` is refused at `ban` time for `Actor::Local`, `Actor::Policy`, `Actor::Gate`, and `Actor::Channel` (`PermanentNotAllowed`); administrators, the application, and sentinel may ban permanently. A decoy touch bans at once whatever the mode, for the duration policy's length, not permanently.
 
 ### `BanDuration`
 
@@ -1647,7 +1647,7 @@ Tier 2 · P0 · 0.3
 
 ```rust
 #[non_exhaustive] #[derive(Clone, Copy, Debug)]
-pub struct DurationPolicy { /* base, factor, step_cap, max, jitter */ }
+pub struct DurationPolicy { /* base, factor, step_cap, max, jitter, half_life */ }
 impl DurationPolicy {
     pub fn base(self, d: Duration) -> Self;     // default 10 minutes
     pub fn factor(self, f: u32) -> Self;        // default 2
@@ -1718,7 +1718,7 @@ Tier 1 · P0 (`exempt_budgets` P1) · 0.3 / 0.4 · compiled in milliseconds; one
 ### `Directive`
 
 ```rust
-#[non_exhaustive] #[derive(Clone, Debug)]
+#[non_exhaustive] #[derive(Clone, Copy, Debug)]
 pub struct Directive { pub action: Action, pub target: Target, pub actor: Actor, pub reason: Reason, pub confidence: Option<u8>, /* options */ }
 impl Directive {
     pub fn ban(key: impl Into<Target>) -> Directive;
@@ -1748,7 +1748,7 @@ A decision made elsewhere, carried to [`Bouncer::apply`](#apply). Reads as a sen
 |---|---|---|
 | `eject_now` | revoke with `RevokeMode::EjectNow` | `AtCheckpoint` |
 | `keep_connection` | revoking a request leaves its connection open (for an administrator ending one request on a multiplexed connection) | the connection is ejected with the request |
-| `ban_keys` | which of the ticket's keys `revoke_and_ban` bans when the target is a connection or request | the source at the automatic prefix; the session instead when the source is flagged shared |
+| `ban_keys` | which of the ticket's keys `ban` and `revoke_and_ban` ban when the target is a connection or request | the source at the automatic prefix; the session instead when the source is flagged shared. A local heuristic, a peer node, or a policy below confidence 70 never bans a shared source this way, even when it names it: the source is throttled and `downgraded` is set |
 | `deny_with` | the denial code the revoked request gets | `Forbidden` |
 | `for_duration`, `permanent` | the ban part's duration | the duration policy |
 | `confidence` | below 30 (under the Medium band) a directive cannot ban by itself; it is applied as a throttle and an event records why | absent: treated as Medium for explicit actors |
@@ -1825,7 +1825,7 @@ Who acted; recorded on every ban and event.
 | `Sentinel` | sentinel-sec | always | yes | never |
 | `Gate` | the authentication and authorization gates | always | no | never |
 | `Channel(node)` | another node or the back-channel | always, import rate limited | no | never |
-| `Local` | bouncer's own strike thresholds | observe by default, enforce per category | no (except a decoy touch) | never |
+| `Local` | bouncer's own strike thresholds | observe by default, enforce per category | no | never |
 
 ### `Reason`
 
@@ -1874,7 +1874,7 @@ let evidence = Evidence::new(&PAIRS);
 ### `Applied`
 
 ```rust
-#[non_exhaustive] #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Applied { pub ban: Option<BanId>, pub bans: u32, pub revocation: Option<Revocation>, pub lifted: Option<Lifted>, pub throttled: bool, pub downgraded: bool }
 ```
 
@@ -1898,7 +1898,7 @@ pub enum StrikeKind {
 
 Tier 1 · P0 · 0.4
 
-What each layer reports: the transport (handshake, PROXY, slow peer), the TLS adapter, protocol engines (malformed traffic), customs-sec (contract violations), the gates (failed logins, authorization denials, reuse of a revoked session token). `DecoyTouched` (a decoy from sentinel-sec) is definitive: it revokes and bans at once, whatever the mode.
+What each layer reports: the transport (handshake, PROXY, slow peer), the TLS adapter, protocol engines (malformed traffic), customs-sec (contract violations), the gates (failed logins, authorization denials, reuse of a revoked session token). `DecoyTouched` (a decoy from sentinel-sec) is definitive: it revokes and bans at once, whatever the mode. Behind a shared address it bans the session and account and throttles the address, as a threshold does.
 
 ### `StrikeOutcome`
 
@@ -2287,7 +2287,7 @@ Tier 2 · P2 · 0.5 · set with `BouncerBuilder::node`; 0 is not a valid node id
 ### `Delta` and `Sequence`
 
 ```rust
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delta { /* encoded records, at most 16 MiB */ }
 impl Delta { pub fn as_bytes(&self) -> &[u8]; pub fn from_bytes(bytes: &[u8]) -> Result<Delta, BouncerError>; pub fn last(&self) -> Sequence; }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

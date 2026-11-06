@@ -129,18 +129,42 @@ impl SignalId {
     }
 
     /// The readable path of the signal.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::signals;
+    /// assert_eq!(signals::BAN_ADDED.path(), "bouncer.ban.added");
+    /// assert_eq!(signals::REVOKE_APPLIED.path(), "bouncer.revoke.applied");
+    /// ```
     #[must_use]
     pub const fn path(&self) -> &'static str {
         catalog(self.id).0
     }
 
     /// The signal's category.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Category, signals};
+    /// assert_eq!(signals::DOOR_REFUSED_BAN.category(), Category::Access);
+    /// assert_eq!(signals::BAN_TABLE_FULL.category(), Category::Abuse);
+    /// ```
     #[must_use]
     pub const fn category(&self) -> Category {
         catalog(self.id).1
     }
 
     /// The catalog's default severity, 0 to 10.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::signals;
+    /// assert!(signals::BAN_TABLE_FULL.severity() > signals::BAN_LIFTED.severity());
+    /// assert!((0.0..=10.0).contains(&signals::EGRESS_BLOCKED.severity()));
+    /// ```
     #[must_use]
     pub const fn severity(&self) -> f32 {
         catalog(self.id).2

@@ -66,6 +66,20 @@ impl Default for EscalationPolicy {
 
 impl EscalationPolicy {
     /// Distinct IPv4 children that escalate a parent (default 8).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, EscalationPolicy};
+    /// let bouncer = Bouncer::builder()
+    ///     .escalation(EscalationPolicy::default().ipv4_threshold(2))
+    ///     .try_build()?;
+    /// bouncer.ban("198.51.100.1".parse::<std::net::IpAddr>()?)?;
+    /// assert!(bouncer.door("198.51.100.200".parse()?).is_ok());
+    /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;
+    /// assert!(bouncer.door("198.51.100.200".parse()?).is_err());   // the /24 is banned
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn ipv4_threshold(mut self, children: u16) -> Self {
         self.ipv4_threshold = children;
@@ -73,6 +87,19 @@ impl EscalationPolicy {
     }
 
     /// Distinct IPv6 children that escalate a parent (default 4).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, EscalationPolicy};
+    /// let bouncer = Bouncer::builder()
+    ///     .escalation(EscalationPolicy::default().ipv6_threshold(2))
+    ///     .try_build()?;
+    /// bouncer.ban("2001:db8:0:1::1".parse::<std::net::IpAddr>()?)?;
+    /// bouncer.ban("2001:db8:0:2::1".parse::<std::net::IpAddr>()?)?;
+    /// assert!(bouncer.door("2001:db8:0:3::1".parse()?).is_err());   // the /56 is banned
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn ipv6_threshold(mut self, children: u16) -> Self {
         self.ipv6_threshold = children;
@@ -80,6 +107,24 @@ impl EscalationPolicy {
     }
 
     /// The window the children must be banned within (default 1 hour).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, EscalationPolicy};
+    /// use clock_lib::ManualClock;
+    /// use std::{sync::Arc, time::Duration};
+    /// let clock = Arc::new(ManualClock::new());
+    /// let bouncer = Bouncer::builder()
+    ///     .clock(clock.clone())
+    ///     .escalation(EscalationPolicy::default().ipv4_threshold(2).window(Duration::from_secs(60)))
+    ///     .try_build()?;
+    /// bouncer.ban("198.51.100.1".parse::<std::net::IpAddr>()?)?;
+    /// clock.advance(Duration::from_secs(120));
+    /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;
+    /// assert!(bouncer.door("198.51.100.200".parse()?).is_ok());   // too far apart to escalate
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn window(mut self, d: Duration) -> Self {
         self.window = d;
@@ -88,6 +133,24 @@ impl EscalationPolicy {
 
     /// The parent's duration: the longest remaining child times this
     /// (default 2), capped by the duration policy's maximum.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DurationPolicy, EscalationPolicy, Filter, Page};
+    /// use std::time::Duration;
+    /// let bouncer = Bouncer::builder()
+    ///     .durations(DurationPolicy::default().base(Duration::from_secs(600)).jitter(Duration::ZERO))
+    ///     .escalation(EscalationPolicy::default().ipv4_threshold(2).factor(3))
+    ///     .try_build()?;
+    /// bouncer.ban("198.51.100.1".parse::<std::net::IpAddr>()?)?;
+    /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;
+    /// let listing = bouncer.list(&Filter::all(), Page::first(10));
+    /// let parent = &listing.items[0];   // the children are folded into it
+    /// assert_eq!(parent.key.to_string(), "198.51.100.0/24");
+    /// assert_eq!(parent.until.ok_or("permanent")?.duration_since(parent.issued)?, Duration::from_secs(1_800));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn factor(mut self, f: u32) -> Self {
         self.factor = f;
@@ -95,6 +158,19 @@ impl EscalationPolicy {
     }
 
     /// The widest IPv4 prefix escalation reaches (default /24).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, EscalationPolicy};
+    /// let bouncer = Bouncer::builder()
+    ///     .escalation(EscalationPolicy::default().ipv4_threshold(2).widest_ipv4(32))
+    ///     .try_build()?;
+    /// bouncer.ban("198.51.100.1".parse::<std::net::IpAddr>()?)?;
+    /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;
+    /// assert!(bouncer.door("198.51.100.200".parse()?).is_ok());   // IPv4 bans stay at /32
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn widest_ipv4(mut self, len: u8) -> Self {
         self.widest_ipv4 = len;
@@ -102,6 +178,19 @@ impl EscalationPolicy {
     }
 
     /// The widest IPv6 prefix escalation reaches (default /48).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, EscalationPolicy};
+    /// let bouncer = Bouncer::builder()
+    ///     .escalation(EscalationPolicy::default().ipv6_threshold(2).widest_ipv6(64))
+    ///     .try_build()?;
+    /// bouncer.ban("2001:db8:0:1::1".parse::<std::net::IpAddr>()?)?;
+    /// bouncer.ban("2001:db8:0:2::1".parse::<std::net::IpAddr>()?)?;
+    /// assert!(bouncer.door("2001:db8:0:3::1".parse()?).is_ok());   // IPv6 bans stay at /64
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn widest_ipv6(mut self, len: u8) -> Self {
         self.widest_ipv6 = len;
@@ -110,6 +199,19 @@ impl EscalationPolicy {
 
     /// Children one parent may hold before inserting another forces
     /// escalation (default 64).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, EscalationPolicy};
+    /// let bouncer = Bouncer::builder()
+    ///     .escalation(EscalationPolicy::default().max_children_per_parent(1))
+    ///     .try_build()?;
+    /// bouncer.ban("198.51.100.1".parse::<std::net::IpAddr>()?)?;
+    /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;   // a second child forces escalation
+    /// assert!(bouncer.door("198.51.100.200".parse()?).is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn max_children_per_parent(mut self, n: u16) -> Self {
         self.max_children = n;
@@ -117,6 +219,18 @@ impl EscalationPolicy {
     }
 
     /// No escalation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, EscalationPolicy};
+    /// let bouncer = Bouncer::builder().escalation(EscalationPolicy::default().off()).try_build()?;
+    /// for i in 1..=16u8 {
+    ///     bouncer.ban(std::net::IpAddr::from([198, 51, 100, i]))?;
+    /// }
+    /// assert!(bouncer.door("198.51.100.200".parse()?).is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn off(mut self) -> Self {
         self.on = false;

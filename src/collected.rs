@@ -53,6 +53,15 @@ impl Default for Collected {
 
 impl Collected {
     /// 16 KiB preallocated, growing up to 1 MiB.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let reply = bouncer_io::Collected::new();
+    /// assert_eq!(reply.capacity(), 16 * 1024);
+    /// assert_eq!(reply.limit(), 1024 * 1024);
+    /// assert!(reply.is_empty());
+    /// ```
     #[must_use]
     pub fn new() -> Collected {
         Collected {
@@ -68,6 +77,16 @@ impl Collected {
     /// # Errors
     ///
     /// [`BouncerError::Config`] when `capacity` exceeds `limit`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Collected;
+    /// let reply = Collected::with_capacity(4096, 64 * 1024)?;
+    /// assert_eq!((reply.capacity(), reply.limit()), (4096, 64 * 1024));
+    /// assert!(Collected::with_capacity(8, 4).is_err());
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     pub fn with_capacity(capacity: usize, limit: usize) -> Result<Collected, BouncerError> {
         if capacity > limit {
             return Err(ConfigError::new(
@@ -85,30 +104,78 @@ impl Collected {
     }
 
     /// Bytes collected.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut reply = bouncer_io::Collected::new();
+    /// reply.extend_from_slice(b"abc")?;
+    /// assert_eq!(reply.len(), 3);
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// `true` when nothing is collected.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut reply = bouncer_io::Collected::new();
+    /// assert!(reply.is_empty());
+    /// reply.extend_from_slice(b"x")?;
+    /// assert!(!reply.is_empty());
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Bytes reserved now.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut reply = bouncer_io::Collected::with_capacity(4, 64)?;
+    /// assert_eq!(reply.capacity(), 4);
+    /// reply.extend_from_slice(b"hello")?;
+    /// // Growth doubles, up to the limit.
+    /// assert_eq!(reply.capacity(), 8);
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.buf.len()
     }
 
     /// The most this buffer may grow to.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut reply = bouncer_io::Collected::with_capacity(4, 8)?;
+    /// assert_eq!(reply.limit(), 8);
+    /// assert!(reply.extend_from_slice(&[0; 9]).is_err());
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     #[must_use]
     pub fn limit(&self) -> usize {
         self.limit
     }
 
     /// The collected bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut reply = bouncer_io::Collected::new();
+    /// reply.extend_from_slice(b"{\"ok\":true}")?;
+    /// assert_eq!(reply.as_slice(), b"{\"ok\":true}");
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         &self.buf[..self.len]
@@ -146,6 +213,19 @@ impl Collected {
     /// # Errors
     ///
     /// [`BouncerError::CollectedFull`] past the limit; nothing is appended.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{BouncerError, Collected};
+    /// let mut reply = Collected::with_capacity(4, 8)?;
+    /// reply.extend_from_slice(b"abcdef")?;
+    /// assert_eq!(reply.as_slice(), b"abcdef");
+    /// let full = reply.extend_from_slice(b"xyz");
+    /// assert!(matches!(full, Err(BouncerError::CollectedFull { .. })));
+    /// assert_eq!(reply.as_slice(), b"abcdef");
+    /// # Ok::<(), BouncerError>(())
+    /// ```
     pub fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), BouncerError> {
         self.reserve(bytes.len())?;
         self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
@@ -182,6 +262,18 @@ impl Collected {
     /// # Errors
     ///
     /// [`BouncerError::InvalidCommit`] when `written` is more than `spare` gave.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{BouncerError, Collected};
+    /// let mut reply = Collected::new();
+    /// reply.spare(8)?[..2].copy_from_slice(b"hi");
+    /// reply.commit(2)?;
+    /// assert_eq!(reply.as_slice(), b"hi");
+    /// assert!(matches!(reply.commit(1), Err(BouncerError::InvalidCommit)));
+    /// # Ok::<(), BouncerError>(())
+    /// ```
     pub fn commit(&mut self, written: usize) -> Result<(), BouncerError> {
         if written > self.spare {
             return Err(BouncerError::InvalidCommit);
@@ -192,6 +284,16 @@ impl Collected {
     }
 
     /// Keeps the first `len` bytes and wipes the rest of what was collected.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut reply = bouncer_io::Collected::new();
+    /// reply.extend_from_slice(b"hello world")?;
+    /// reply.truncate(5);
+    /// assert_eq!(reply.as_slice(), b"hello");
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     pub fn truncate(&mut self, len: usize) {
         if len < self.len {
             crypt_io::wipe(&mut self.buf[len..self.len]);
@@ -201,6 +303,18 @@ impl Collected {
     }
 
     /// Wipes what was collected and keeps the capacity, for reuse.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut reply = bouncer_io::Collected::with_capacity(4, 64)?;
+    /// reply.extend_from_slice(b"secret")?;
+    /// let capacity = reply.capacity();
+    /// reply.clear();
+    /// assert!(reply.as_slice().is_empty());
+    /// assert_eq!(reply.capacity(), capacity);
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     pub fn clear(&mut self) {
         crypt_io::wipe(&mut self.buf[..self.len]);
         self.len = 0;
@@ -208,6 +322,17 @@ impl Collected {
     }
 
     /// Wipes the whole capacity.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut reply = bouncer_io::Collected::new();
+    /// reply.extend_from_slice(b"secret")?;
+    /// reply.wipe();
+    /// assert_eq!(reply.len(), 0);
+    /// assert_eq!(reply.capacity(), 16 * 1024);
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     pub fn wipe(&mut self) {
         crypt_io::wipe(&mut self.buf);
         self.len = 0;

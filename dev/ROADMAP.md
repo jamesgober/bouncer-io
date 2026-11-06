@@ -191,6 +191,15 @@ Exit:
 
 ## v0.9.x - Beta and release candidates
 Items: used end to end by the web stack and one non-HTTP service (a database network layer or the back-channel); API review against the simple-API rule; `cargo-semver-checks` in CI; release candidates `0.9.x`, only after the pre-1.0 polish exits.
+Status at 0.9.1:
+
+| Item | Status |
+|---|---|
+| API review against the simple-API rule | Done (D-124): every Tier 1 call takes one or two arguments; every public method has its own example; the review's comparison of each documented default with the code found D-123 (three routes by which a weak word banned a shared address), fixed test-first, and 17 doc errors, corrected |
+| `cargo-semver-checks` in CI | Done: against the latest release on crates.io |
+| Release candidates | Wait for James's decision on the three performance targets (`docs/READINESS-1.0.md`) |
+| Used end to end by the web stack and one non-HTTP service | Not started: work in those repositories, on a release candidate |
+
 Exit:
 - [ ] No API change needed by either consumer for two release candidates.
 

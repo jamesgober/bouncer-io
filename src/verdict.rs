@@ -29,18 +29,58 @@ pub enum Verdict {
 
 impl Verdict {
     /// `true` for `Pass`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Reason, RequestId};
+    /// let bouncer = Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let mut request = conn.request(RequestId(1))?;
+    /// assert!(request.checkpoint().is_pass());
+    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// assert!(!request.checkpoint().is_pass());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn is_pass(&self) -> bool {
         matches!(self, Verdict::Pass)
     }
 
     /// `true` for `Deny`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Reason, RequestId};
+    /// let bouncer = Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let mut request = conn.request(RequestId(1))?;
+    /// assert!(!request.checkpoint().is_deny());
+    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// assert!(request.checkpoint().is_deny());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn is_deny(&self) -> bool {
         matches!(self, Verdict::Deny(_))
     }
 
     /// The denial, for `Deny`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DenialCode, Reason, RequestId};
+    /// let bouncer = Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let mut request = conn.request(RequestId(1))?;
+    /// assert!(request.checkpoint().denial().is_none());
+    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// let verdict = request.checkpoint();
+    /// assert_eq!(verdict.denial().map(|d| d.code), Some(DenialCode::Forbidden));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn denial(&self) -> Option<&Denial> {
         match self {
@@ -123,6 +163,15 @@ pub enum DenialCode {
 
 impl DenialCode {
     /// The number a transport carries: 1 `Unavailable` to 5 `Forbidden`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::DenialCode;
+    /// assert_eq!(DenialCode::Unavailable.number(), 1);
+    /// assert_eq!(DenialCode::TooManyRequests.number(), 3);
+    /// assert_eq!(DenialCode::Forbidden.number(), 5);
+    /// ```
     #[must_use]
     pub const fn number(self) -> u16 {
         match self {
@@ -156,6 +205,16 @@ impl DenialCode {
     }
 
     /// The code an HTTP status stands for, if it is one of the five.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::DenialCode;
+    /// assert_eq!(DenialCode::from_http_status(403), Some(DenialCode::Forbidden));
+    /// assert_eq!(DenialCode::from_http_status(500), None);
+    /// let code = DenialCode::NotFound;
+    /// assert_eq!(DenialCode::from_http_status(code.http_status()), Some(code));
+    /// ```
     #[must_use]
     pub const fn from_http_status(status: u16) -> Option<DenialCode> {
         match status {
@@ -213,6 +272,20 @@ impl Reference {
     }
 
     /// The raw value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Reason, RequestId};
+    /// let bouncer = Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let mut request = conn.request(RequestId(1))?;
+    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// let verdict = request.checkpoint();
+    /// let reference = verdict.denial().ok_or("not denied")?.reference;
+    /// assert_eq!(format!("{:016x}", reference.get()), reference.to_string());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
@@ -261,12 +334,40 @@ impl Default for DenialTable {
 
 impl DenialTable {
     /// The default table.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DenialTable, Reason, RequestId};
+    /// let bouncer = Bouncer::builder().denials(DenialTable::new()).try_build()?;
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let mut request = conn.request(RequestId(1))?;
+    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// let verdict = request.checkpoint();
+    /// let d = verdict.denial().ok_or("not denied")?;
+    /// assert_eq!((d.message, d.app_code), ("Forbidden.", 0));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn new() -> DenialTable {
         DenialTable::default()
     }
 
     /// The message for one code (at most 256 bytes, checked at build).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DenialCode, DenialTable, Reason, RequestId};
+    /// let table = DenialTable::new().message(DenialCode::Forbidden, "Request refused.");
+    /// let bouncer = Bouncer::builder().denials(table).try_build()?;
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let mut request = conn.request(RequestId(1))?;
+    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// let verdict = request.checkpoint();
+    /// assert_eq!(verdict.denial().map(|d| d.message), Some("Request refused."));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn message(mut self, code: DenialCode, message: &'static str) -> DenialTable {
         self.entries[Self::slot(code)].0 = message;
@@ -274,6 +375,20 @@ impl DenialTable {
     }
 
     /// The application code for one code.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DenialCode, DenialTable, Reason, RequestId};
+    /// let table = DenialTable::new().app_code(DenialCode::Forbidden, 4031);
+    /// let bouncer = Bouncer::builder().denials(table).try_build()?;
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let mut request = conn.request(RequestId(1))?;
+    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// let verdict = request.checkpoint();
+    /// assert_eq!(verdict.denial().map(|d| d.app_code), Some(4031));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn app_code(mut self, code: DenialCode, app_code: u16) -> DenialTable {
         self.entries[Self::slot(code)].1 = app_code;
