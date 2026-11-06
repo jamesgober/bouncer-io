@@ -708,10 +708,7 @@ impl Shared {
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let anchored = state
-            .anchor
-            .as_mut()
-            .map_or(Ok(None), |a| a.read());
+        let anchored = state.anchor.as_mut().map_or(Ok(None), |a| a.read());
         // A new epoch never falls below the anchor's.
         let floor = anchored.as_ref().ok().copied().flatten();
         let loaded = (|| -> Result<Option<_>, PersistError> {

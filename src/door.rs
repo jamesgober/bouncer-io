@@ -34,7 +34,7 @@ use crate::{
 pub enum Refusal {
     /// A ban covers the address. `reference` finds it in events and
     /// `explain`. A reference of zero means a ban slot was being rewritten for
-    /// longer than the bound and the door failed closed.
+    /// longer than the read bound (20 ms) and the door failed closed.
     Banned {
         /// The ban's reference.
         reference: Reference,

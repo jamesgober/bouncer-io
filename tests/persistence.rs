@@ -11,9 +11,9 @@ use std::{
 };
 
 use bouncer_io::{
-    AccountKey, Actor, BanKey, BanSpec, Bouncer, BouncerError, Cidr, DurationPolicy,
-    FileAnchor, FilePersistence, FingerprintKey, LoadFailure, PersistError, Persistence,
-    SessionKey, StoreVersion, VersionAnchor,
+    AccountKey, Actor, BanKey, BanSpec, Bouncer, BouncerError, Cidr, DurationPolicy, FileAnchor,
+    FilePersistence, FingerprintKey, LoadFailure, PersistError, Persistence, SessionKey,
+    StoreVersion, VersionAnchor,
 };
 use clock_lib::ManualClock;
 

@@ -696,7 +696,8 @@ pub(crate) enum Lookup {
     Banned(u64),
     /// An administrator prefix, by its ban's reference.
     Admin(u64),
-    /// A writer held a slot past the spin bound; the caller fails closed.
+    /// A writer held a slot past the read bound (D-132); the caller fails
+    /// closed.
     Busy,
 }
 
@@ -821,13 +822,12 @@ pub(crate) struct Guards<'a> {
 impl BanMemory {
     pub(crate) fn new(
         capacity: u32,
-        key: HashKey,
+        (key, references): (HashKey, HashKey),
         v4_lengths: &[u8],
         v6_lengths: &[u8],
         policy: DurationPolicy,
         escalation: EscalationPolicy,
         rng_seed: u64,
-        references: HashKey,
     ) -> BanMemory {
         let mut auto_v4 = 0u64;
         for &l in v4_lengths {
@@ -848,10 +848,7 @@ impl BanMemory {
             HashKey::new(rng.next_u64(), rng.next_u64()),
             HashKey::new(rng.next_u64(), rng.next_u64()),
         );
-        let filter = filter::Filter::new(
-            capacity,
-            HashKey::new(rng.next_u64(), rng.next_u64()),
-        );
+        let filter = filter::Filter::new(capacity, HashKey::new(rng.next_u64(), rng.next_u64()));
         BanMemory {
             filter,
             anchor_v4: v4_lengths.iter().copied().min().unwrap_or(0),
@@ -1567,7 +1564,11 @@ impl BanMemory {
         match key.kind {
             table::KIND_V4 => {
                 let a = self.anchor_v4.min(key.len);
-                let m = if a == 0 { 0 } else { u64::from(u32::MAX << (32 - u32::from(a))) };
+                let m = if a == 0 {
+                    0
+                } else {
+                    u64::from(u32::MAX << (32 - u32::from(a)))
+                };
                 Some(TableKey {
                     kind: key.kind,
                     len: a,
@@ -1578,7 +1579,11 @@ impl BanMemory {
             table::KIND_V6 => {
                 let a = self.anchor_v6.min(key.len);
                 let bits = (u128::from(key.k0) << 64) | u128::from(key.k1);
-                let m = if a == 0 { 0 } else { bits & (u128::MAX << (128 - u32::from(a))) };
+                let m = if a == 0 {
+                    0
+                } else {
+                    bits & (u128::MAX << (128 - u32::from(a)))
+                };
                 Some(TableKey {
                     kind: key.kind,
                     len: a,
@@ -1679,13 +1684,11 @@ impl BanMemory {
             }
         }
         if self.admin_count.load(Ordering::Acquire) > 0 {
-            match self
-                .with_admin(|set| {
-                    set.find_map(addr, |e| {
-                        (e.until == 0 || u64::from(e.until) > now_secs).then_some(e.reference)
-                    })
+            match self.with_admin(|set| {
+                set.find_map(addr, |e| {
+                    (e.until == 0 || u64::from(e.until) > now_secs).then_some(e.reference)
                 })
-            {
+            }) {
                 Some(Some(reference)) => return Lookup::Admin(reference),
                 Some(None) => {}
                 None => busy = true,
@@ -2072,13 +2075,12 @@ mod tests {
     fn mem(capacity: u32) -> BanMemory {
         BanMemory::new(
             capacity,
-            HashKey::new(5, 6),
+            (HashKey::new(5, 6), HashKey::new(7, 8)),
             &[32, 24],
             &[64, 56, 48],
             DurationPolicy::default().jitter(Duration::ZERO),
             EscalationPolicy::default().off(),
             9,
-            HashKey::new(7, 8),
         )
     }
 
@@ -2143,8 +2145,12 @@ mod tests {
         };
         for n in 0..10_000 {
             for a in [v4(n), v6(n)] {
-                m.ban(&BanSpec::address(a).permanent(), &s.guards(), Now::default())
-                    .unwrap();
+                m.ban(
+                    &BanSpec::address(a).permanent(),
+                    &s.guards(),
+                    Now::default(),
+                )
+                .unwrap();
             }
         }
         for n in 0..8_000 {
@@ -2351,10 +2357,7 @@ mod tests {
             "the /48's group overflowed"
         );
         for &a in v4.iter().chain(&v6) {
-            assert!(
-                m.lookup_addr(a, 0).banned(),
-                "{a} banned"
-            );
+            assert!(m.lookup_addr(a, 0).banned(), "{a} banned");
         }
         // Neighbours outside the bans are clear.
         assert_eq!(m.lookup_addr(ip("198.51.101.1"), 0), Lookup::Clear);
@@ -2378,10 +2381,7 @@ mod tests {
             Now::default(),
         )
         .unwrap();
-        assert!(
-            v4.iter()
-                .all(|&a| m.lookup_addr(a, 0).banned())
-        );
+        assert!(v4.iter().all(|&a| m.lookup_addr(a, 0).banned()));
     }
 
     #[test]
@@ -2446,10 +2446,7 @@ mod tests {
         assert!(m.take_reseeds() >= 1);
         assert_eq!(m.table.with(Table::anchors), (Some(24), Some(48)));
         for &a in v4.iter().chain(&v6) {
-            assert!(
-                m.lookup_addr(a, 0).banned(),
-                "{a} after reseed"
-            );
+            assert!(m.lookup_addr(a, 0).banned(), "{a} after reseed");
         }
         assert_eq!(m.lookup_addr(ip("203.0.114.1"), 0), Lookup::Clear);
     }

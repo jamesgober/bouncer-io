@@ -74,11 +74,18 @@ pub(crate) const MAX_PROBE: usize = crate::MAX_PROBE as usize;
 /// whose sequences cross it.
 pub(crate) const ANCHOR_GROUPS: usize = 4;
 
-/// Spins a reader allows a writer that holds a slot before it gives up.
+/// Spins a reader allows a writer that holds a slot before it starts
+/// yielding.
 #[cfg(not(bouncer_loom))]
 const READ_SPINS: u32 = 256;
 #[cfg(bouncer_loom)]
 const READ_SPINS: u32 = 2;
+/// How long a reader then yields to a writer that holds a slot before it
+/// fails closed. A write takes a few instructions; holding a slot longer
+/// means the writer was preempted inside one, and a preempted thread waits
+/// up to a scheduler quantum (about 16 ms on Windows) to run again.
+#[cfg(not(bouncer_loom))]
+const HELD_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// A table key: kind, prefix length (0 for identity kinds), and 128 bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -296,25 +303,54 @@ impl Slot {
     }
 
     /// A consistent snapshot, or `None` when a writer held the slot for longer
-    /// than the spin bound.
+    /// than the spins and then [`HELD_WAIT`].
     #[inline]
     fn read(&self) -> Option<Raw> {
         for _ in 0..READ_SPINS {
-            let m1 = self.meta.load(Ordering::Acquire);
-            if m1 & 1 == 0 {
-                let raw = Raw {
-                    meta: m1,
-                    word: self.word.load(Ordering::Relaxed),
-                    times: self.times.load(Ordering::Relaxed),
-                    id: self.id.load(Ordering::Relaxed),
-                };
-                fence(Ordering::Acquire);
-                if self.meta.load(Ordering::Relaxed) == m1 {
-                    return Some(raw);
-                }
+            if let Some(raw) = self.try_read() {
+                return Some(raw);
             }
             spin();
         }
+        self.read_held()
+    }
+
+    /// One attempt at a consistent snapshot.
+    #[inline]
+    fn try_read(&self) -> Option<Raw> {
+        let m1 = self.meta.load(Ordering::Acquire);
+        if m1 & 1 != 0 {
+            return None;
+        }
+        let raw = Raw {
+            meta: m1,
+            word: self.word.load(Ordering::Relaxed),
+            times: self.times.load(Ordering::Relaxed),
+            id: self.id.load(Ordering::Relaxed),
+        };
+        fence(Ordering::Acquire);
+        (self.meta.load(Ordering::Relaxed) == m1).then_some(raw)
+    }
+
+    /// The writer still holds the slot after the spins: it was preempted
+    /// inside its write. Yield to it, and fail closed only once it has held
+    /// the slot for [`HELD_WAIT`].
+    #[cold]
+    fn read_held(&self) -> Option<Raw> {
+        #[cfg(not(bouncer_loom))]
+        {
+            let started = std::time::Instant::now();
+            loop {
+                std::thread::yield_now();
+                if let Some(raw) = self.try_read() {
+                    return Some(raw);
+                }
+                if started.elapsed() >= HELD_WAIT {
+                    return None;
+                }
+            }
+        }
+        #[cfg(bouncer_loom)]
         None
     }
 
@@ -1313,6 +1349,35 @@ mod tests {
             Table::new(cap, HashKey::new(11, 22)),
             TableWriter::default(),
         )
+    }
+
+    #[test]
+    fn test_a_slot_held_by_a_stalled_writer_is_waited_for() {
+        // A writer preempted inside its few-instruction write holds the slot
+        // for a scheduler quantum, not a few nanoseconds. Readers wait it out
+        // instead of failing closed: a busy revocation probe revokes the
+        // whole connection of an unrelated ticket.
+        let slot = std::sync::Arc::new(Slot::new());
+        let meta = u64::from(CODE_V4 + 32) << CODE_SHIFT;
+        slot.write(&Raw {
+            meta,
+            word: 1,
+            times: 1,
+            id: 1,
+        });
+        let v = slot.meta.load(Ordering::Relaxed) & VERSION_MASK;
+        slot.meta.store(meta | (v + 1), Ordering::Release);
+        let s = std::sync::Arc::clone(&slot);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            s.word.store(2, Ordering::Relaxed);
+            s.times.store(2, Ordering::Relaxed);
+            s.id.store(2, Ordering::Relaxed);
+            s.meta.store(meta | (v + 2), Ordering::Release);
+        });
+        let r = slot.read().expect("the reader waited for the writer");
+        assert_eq!([r.word, r.times, r.id], [2, 2, 2]);
+        writer.join().unwrap();
     }
 
     #[test]

@@ -219,7 +219,9 @@ mod tests {
     #[test]
     fn test_filter_rebuild_keeps_what_remains_and_drops_the_rest() {
         let f = Filter::new(4096, HashKey::new(3, 4));
-        let keys: Vec<_> = (0..4096u64).map(|n| (k(24, n << 8), k(32, (n << 8) | 1))).collect();
+        let keys: Vec<_> = (0..4096u64)
+            .map(|n| (k(24, n << 8), k(32, (n << 8) | 1)))
+            .collect();
         for (a, key) in &keys {
             f.add(a, key);
         }
@@ -232,13 +234,16 @@ mod tests {
         for (a, key) in kept {
             assert_eq!(f.maybe(a, &[*key]), 1, "a kept key reads maybe");
         }
-        let gone = keys[100..].iter().filter(|(a, key)| f.maybe(a, &[*key]) != 0).count();
+        let gone = keys[100..]
+            .iter()
+            .filter(|(a, key)| f.maybe(a, &[*key]) != 0)
+            .count();
         assert!(gone < 400, "removed keys still maybe: {gone}");
         // Adds after a rebuild land in the new buffer.
-        let (a, key) = (k(24, 0xdead_00), k(32, 0xdead_01));
+        let (a, key) = (k(24, 0x00de_ad00), k(32, 0x00de_ad01));
         f.add(&a, &key);
         assert_eq!(f.maybe(&a, &[key]), 1);
-        assert_eq!(f.maybe(&a, &[k(24, 0xdead_00), key]) & 2, 2);
+        assert_eq!(f.maybe(&a, &[k(24, 0x00de_ad00), key]) & 2, 2);
     }
 
     #[test]
