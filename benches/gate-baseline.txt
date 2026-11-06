@@ -1,6 +1,6 @@
-gate_ban_insert 58592566
-gate_bind_session 7454027
+gate_ban_insert 59499629
+gate_bind_session 6430943
 gate_checkpoint 90016
-gate_door_admitted 11666398
-gate_door_banned 8513718
-gate_request_cycle 3871759
+gate_door_admitted 10335899
+gate_door_banned 9882604
+gate_request_cycle 3860018

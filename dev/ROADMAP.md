@@ -197,8 +197,19 @@ Status at 0.9.1:
 |---|---|
 | API review against the simple-API rule | Done (D-124): every Tier 1 call takes one or two arguments; every public method has its own example; the review's comparison of each documented default with the code found D-123 (three routes by which a weak word banned a shared address), fixed test-first, and 17 doc errors, corrected |
 | `cargo-semver-checks` in CI | Done: against the latest release on crates.io |
-| Release candidates | Wait for James's decision on the three performance targets (`docs/READINESS-1.0.md`) |
+| Release candidates | Unblocked: James decided the targets on 2026-11-06 (D-125) |
 | Used end to end by the web stack and one non-HTTP service | Not started: work in those repositories, on a release candidate |
+
+Status at 0.9.2 (the improvement pass James asked for with the targets):
+
+| Item | Status |
+|---|---|
+| Refusal path for administrator-covered peers | Done (D-127): no hash and no automatic-length probe unless a length may hold a ban; `door_at` for those peers -28% (A/B) |
+| A filter in front of the ban table | Done (D-126): `door_at` 12 to 21% faster than 0.9.1, banned peers about 8% slower (recorded in the gate's baseline); memory per ban 39.6 B |
+| Persistence rollback | Done (D-128): `VersionAnchor`, test-first |
+| D-105's 19-bit slot version | Measured and kept (D-130): 40-byte slots leave the door unchanged and take memory per ban to 48.8 B, past NFR-6's target |
+| The door's p99 and the ticket cycle on a quiet machine | Not possible during the pass (every core busy with other work); NFR-10 is met under that load; NFR-2 and NFR-3 wait for a quiet hour (`docs/READINESS-1.0.md`) |
+| Found on the way | The loom models' main-thread gap (D-129); a wall-clock bound that a busy machine broke (D-131) |
 
 Exit:
 - [ ] No API change needed by either consumer for two release candidates.

@@ -19,32 +19,21 @@
 
 <br>
 
-Where bouncer-io stands after the pre-1.0 polish (0.9.0): what is done, what is still open and why, what each open item costs, and a recommendation. Written for the go/no-go on the beta and on 1.0. Decision numbers refer to the decision log in [`dev/PLAN.md`](../dev/PLAN.md).
+Where bouncer-io stands after the pre-1.0 polish (0.9.0 to 0.9.2): what is done, what is still open and why, what each open item costs, and a recommendation. Written for the go/no-go on 1.0. Decision numbers refer to the decision log in [`dev/PLAN.md`](../dev/PLAN.md).
 
 ## Recommendation
 
-Go to the beta (0.9.x release candidates) once you have decided the three performance targets below. Do not tag 1.0 until the per-call latency has been measured on an idle machine and the audit in `dev/DIRECTIVES.md` section 3 has passed.
+Go to the release candidates now: the three performance targets are decided (D-125) and met as far as a busy machine can show. Do not tag 1.0 until the per-call latency and the ticket cycle have been measured on an idle machine and the audit in `dev/DIRECTIVES.md` section 3 has passed.
 
-The library does what the plan says it does, and the 0.9 review found and fixed real defects in it (below). What is not met is three performance targets that were estimates written before anything could be measured. Each has been measured now, and each has a proposed replacement grounded in those measurements. Accepting them is your call: they are the product's promises.
+## The targets you decided (D-125)
 
-## Decisions for you
+On 2026-11-06 you accepted the recommended targets and asked for the door to be improved where needed. 0.9.2 is that pass. Every figure below was taken with every core of the machine busy with other work, so the absolute numbers are upper bounds; the ratios compare like with like within one run.
 
-| # | Target as written | Measured at 0.9 | Proposed (decision) |
-|---|---|---|---|
-| 1 | NFR-10: the door 20% faster than the same-job composition, admitted and random peers (D-081) | Against that composition: admitted 16.3% faster, random peers at parity, peers near the bans 27.6% faster. Against a composition doing the same rate work (it checks one rate; the door checks two): 27.2%, 15.4%, and 42.2% faster. At 32 threads the door does 2.9 times the composition's work | With the same rate work, at least 20% faster for admitted peers and peers near the bans and at least 15% for random peers; against D-081's composition, at least 15% faster for admitted peers and within 2% for random peers; at 32 threads, at least twice the throughput (D-120) |
-| 2 | NFR-2: the door at most 100 ns p99 per call | 111 ns median, 462 ns p99 per call for a cold random peer at best, on a machine busy with other work; warm, 95.5 ns | At most 150 ns median and 500 ns p99 per call for a cold random peer, measured on an idle machine (D-121) |
-| 3 | NFR-3: a ticket at most 40 ns median with 32 threads | 42.4 ns at one thread, flat to 8, 57.9 ns at 32 (two threads per core) | Within 1.5 times the one-thread cost at 32 threads and under 60 ns median (D-121) |
-
-My recommendation is to accept all three. Why 20% against D-081's composition is not reachable without giving something up:
-
-- **Two rate checks against one.** The door always checks a rate per address and per prefix. The prefix check is what stops IPv6 rotation inside a /48, and it is about a quarter of the door's work.
-- **The ticket's floor.** A ticket costs six locked operations, about 23 ns on this machine. Removing more of them means one of three things:
-  - unsafe code;
-  - a lifetime on `Ticket`, which breaks moving tickets into async tasks;
-  - a per-thread cache of free cells, which makes the registry refuse while it still has room.
-- **The benchmark's random set.** A quarter of its peers are IPv4 addresses covered by the fixture's administrator /8 bans, so they take the refusal path. That path costs more in the door because it computes a lookup reference for the administrator and checks every automatic length first.
-
-Keeping 20% against D-081's composition would mean accepting one of those three costs. I do not recommend it.
+| Target | Measured at 0.9.2 | Status |
+|---|---|---|
+| NFR-10: at least 20% faster than the same-rate-work composition for admitted, random, and near-the-bans peers; at least twice its throughput at 32 threads | 35.7%, 56.7%, and 59.8% faster by within-run ratio; 35.7%, 31.5%, and 54.5% faster by the estimate from 0.9's idle ratios; 4.3 times the throughput at 32 threads. Against D-081's composition (one rate check): 23.9%, 34.5%, and 40.2% faster by within-run ratio; 26.0%, 18.7%, and 42.9% by the estimate | Met. The 15% floor for random peers is not needed |
+| NFR-2: at most 150 ns median and 500 ns p99 per call, cold random peer, idle machine | Not measurable during this pass: the Linux machine's load average was near 500 on 32 cores and the per-call figures (p50 283 to 304 ns, p99 1.6 to 1.8 microseconds) measure queueing. At 0.9, with every core busy but far less load, the best run gave p50 111 ns and p99 462 ns, and 0.9.2's door is 12 to 21% faster than 0.9.1's | Open: one quiet hour |
+| NFR-3: ticket cycle under 60 ns median at 32 threads, within 1.5 times its one-thread cost | 62.8 ns at 32 threads and 60.0 at one (1.05 times), under full load; 57.9 and 42.4 ns on an idle core at 0.9, and the ticket's code is unchanged since | Ratio met. The 60 ns figure was met at 0.9 on an idle core; confirm it on the idle machine |
 
 ## Done
 
@@ -68,29 +57,35 @@ Keeping 20% against D-081's composition would mean accepting one of those three 
   - **Five smaller fixes** (D-119): a cleanup race with proxied requests; a client behind a PROXY listener could tell a ban from a spent budget; Unix-socket peers were refused when loopback was trusted; a custom clock under net-io; a reseed counter race.
 - **Review**: every threat (27) and edge case (71) was checked against the tests by a reviewer reading without the design's reasoning. The 11 found weak or missing are covered now (D-122).
 - **API review** (0.9.1, D-124): every Tier 1 call takes one or two arguments, every public method has its own example, and `cargo-semver-checks` runs in CI. Checking each documented default against the code found three routes by which a weak word could still ban a shared (NAT) address: a directive aimed at one of its connections, a decoy touch, and another node's automated ban. All three are fixed test-first (D-123).
-- **Concurrency**: loom models L-1 to L-10. Every protocol change of 0.8 and 0.9 has a model that fails when the change is undone.
+- **The 0.9.2 pass** (D-126 to D-131):
+  - **The door's filter** (D-126): a blocked Bloom filter in front of the ban table, so most peers with no ban never read it. `door_at` 12 to 21% faster than 0.9.1, judgement against 1,000,000 bans 18 to 32% faster; banned peers about 8% slower, which is the trade.
+  - **Administrator-covered peers** (D-127): refused without a hash or an automatic-length probe, so which ban answers is unchanged.
+  - **Persistence rollback detected** (D-128): with a `VersionAnchor` kept outside the store, an older backup put back or a journal cut is refused at load. The tests fail with the check removed, and 200 kills during writes gave no false refusal.
+  - **The loom models had gaps** (D-129): in six models and two of the crate's own, the main thread acted right after spawning, and loom never ran the other side first. All are rewritten with every side spawned and pass.
+  - **The 64-bit slot version** (D-130): measured. The door is unchanged, but memory per ban rises to 48.8 B, past NFR-6's 48 B target. Kept as D-105 left it.
+- **Concurrency**: loom models L-1 to L-11, each participant spawned. Every protocol change of 0.8 and 0.9 has a model that fails when the change is undone.
 - **Fuzzing and soak**: 24 hours each at 0.7 with no findings. Two hours of fuzzing on the 0.8 code with no findings. 24 hours each on the final 0.9 code (2026-11-04 to 2026-11-05) with no findings: the five fuzz targets ran 9.5 billion inputs between them with no crash and no artifact; the soak made 8.1 billion connections (540 million refused as banned, 50.8 million revocations, none missed) with live heap between 31.914 and 31.923 MB from the first hour to the last.
 
 ## Open, with reason and cost
 
 | Item | Why it stays | Cost of leaving it | Cost of closing it |
 |---|---|---|---|
-| Per-call latency on an idle machine | Every core of the measurement machine was busy with other work during 0.9 | The p99 figures above are upper bounds, not the real numbers | One quiet hour on the reference machine |
-| net-io on Windows can drop the denial after a revocation | net-io closes abortively after a denial (to cut the connection at once); on Windows a pending send is discarded (4 in 50 loopback runs; never on Linux) | A Windows client sees a reset instead of the 403 now and then; nothing of the response leaks either way | A graceful close after a denial in net-io (its change, not bouncer's) |
-| `NetIoEjector` aborts instead of flushing | net-io can close a connection by id only abortively | A denial on an ejected connection is not delivered; the connection is cut | A flush-then-close by id in net-io |
+| Per-call latency and the ticket cycle on an idle machine | Every core of the measurement machine was busy with other work through 0.9 and 0.9.2 (other sessions' soak and fuzz runs) | NFR-2 is not yet shown on an idle machine; the other figures are upper bounds | One quiet hour on the reference machine |
+| net-io on Windows can drop the denial after a revocation | net-io closes abortively after a denial (to cut the connection at once); on Windows a pending send is discarded (4 in 50 loopback runs; never on Linux) | A Windows client sees a reset instead of the 403 now and then; nothing of the response leaks either way | net-io 0.8 (its D-182, built, not yet published): a bounded soft close after a denial, capped in number so a denial storm cannot hold slots. bouncer adopts it when it publishes |
+| `NetIoEjector` aborts instead of flushing | net-io can close a connection by id only abortively | A denial on an ejected connection is not delivered; the connection is cut | net-io 0.8's `close_after_flush` (the same release) |
 | serve-net's envelope has no gate tag | serve-net's change | Each integration keeps a small map from connection id to tag (the example shows it) | An accessor in serve-net (a small additive release) |
-| 19-bit slot version in the ban table (D-105) | Halved the slot size | A reader stalled for tens of milliseconds while one slot is rewritten 2^18 times could keep a torn read | 8 more bytes per ban |
+| 19-bit slot version in the ban table (D-105) | Halved the slot size; closing it was measured at 0.9.2 (D-130) | A reader stalled for tens of milliseconds while one slot is rewritten 2^18 times could keep a torn read | 9.2 more bytes per ban (39.6 to 48.8 B, past NFR-6's 48 B target); the door unchanged |
 | Long keys stored as 64-bit fingerprints (D-105) | Halved the slot size | About 2^-64 per stored long key per lookup of a false match (choosing one needs the table key) | 8 more bytes per long key |
 | Prefix strike bans count many people's strikes (D-108) | The defence against attackers rotating through a /48 | A /24 or /48 with many independent bad actors can be banned as a whole (never over an address flagged as shared) | Turning escalation off, which reopens the rotation attack |
 | A shared address gets its prefix's door budget (D-109) | Keeps one person behind a NAT from getting everyone behind it refused | A shared address can admit more than one client's budget, up to its prefix's | None that keeps the NAT case working |
 | Revocation costs 134 ns instead of 101 (D-116) | The second slot write is what makes births sound | About 33 ns per revocation (a cold path; 100,000 a second costs 3 ms of CPU) | An epoch protocol change at every one of six bump sites |
 | Concurrency keys share a count when 44 bits match (D-117) | Key and count in one word is what makes takeovers sound | Two clients could share a concurrency budget: stricter, never looser; choosing such keys needs the budget key | A second word and a two-word protocol, the design that leaked |
 | Old ban tables kept by threads after a reseed (D-119) | Freeing them would cost an atomic on every lookup | A thread that read a table later reseeded keeps it until its next lookup in a reseeded table or its exit (tens of MB at a million bans) | An atomic per lookup |
-| Persistence rollback | Not covered by the design (`docs/SECURITY.md`) | A store restored from an older backup brings back lifted bans and forgets newer ones | A monotonic store version, checked at load |
+| Persistence rollback without an anchor | `version_anchor` is optional: only the deployment knows a place a restore does not reach (D-128) | Without one, an older store loads silently, as before | Configure a `VersionAnchor` on another volume or machine, or in a database row |
 
 ## What 1.0 needs, in order
 
-1. Your decision on the three targets.
-2. The per-call latency measured on an idle machine against the decided targets.
-3. The beta: the release candidates used end to end by the web stack and one non-HTTP service, with no API change needed for two of them (ROADMAP).
-4. The full audit of `dev/DIRECTIVES.md` section 3.
+1. The per-call latency (NFR-2) and the ticket cycle (NFR-3) measured on an idle machine. Tighten NFR-2 to the measured value plus a stated margin if it comes in well under (D-125).
+2. The beta: the release candidates used end to end by the web stack and one non-HTTP service, with no API change needed for two of them (ROADMAP).
+3. The full audit of `dev/DIRECTIVES.md` section 3.
+4. Your go.

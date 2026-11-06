@@ -1635,16 +1635,19 @@ mod loom_tests {
                 id: 2,
             };
             slot.write(&old);
+            // Both sides spawned, so loom also runs the writer first (D-129).
             let s = slot.clone();
             let writer = loom::thread::spawn(move || s.write(&new));
-            if let Some(r) = slot.read() {
+            let s = slot.clone();
+            let reader = loom::thread::spawn(move || s.read());
+            writer.join().unwrap();
+            if let Some(r) = reader.join().unwrap() {
                 let words = [r.word, r.times, r.id];
                 assert!(
                     words == [1, 1, 1] || words == [2, 2, 2],
                     "torn read {words:?}"
                 );
             }
-            writer.join().unwrap();
         });
     }
 }

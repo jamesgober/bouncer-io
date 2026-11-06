@@ -1659,43 +1659,11 @@ impl BanMemory {
         // Nothing banned at any automatic length: no table to read. The
         // filter keeps only the lengths that may hold one of the address's
         // keys (most addresses keep none).
-        let anchor = Self::key_at(
-            &host,
-            match host.family() {
-                Family::V4 => self.anchor_v4,
-                Family::V6 => self.anchor_v6,
-            },
-        );
-        let mut keys = [anchor; PROBE_BATCH];
-        for (k, &len) in keys.iter_mut().zip(&lengths[..count]) {
-            *k = Self::key_at(&host, len);
-        }
-        if count > 0 && !overflow {
-            let mut maybe = self.filter.maybe(&anchor, &keys[..count]);
-            let mut kept = 0;
-            while maybe != 0 {
-                let i = maybe.trailing_zeros() as usize;
-                lengths[kept] = lengths[i];
-                keys[kept] = keys[i];
-                kept += 1;
-                maybe &= maybe - 1;
-            }
-            count = kept;
-        }
-        let hit = (count > 0)
-            .then(|| {
-                self.table.with(|table| {
-                    Self::probe_lengths(
-                        table,
-                        &host,
-                        &lengths[..count],
-                        &keys[..count],
-                        &anchor,
-                        now_secs,
-                    )
-                })
-            })
-            .flatten();
+        let hit = if count > 0 {
+            self.probe_filtered(&host, &mut lengths, count, !overflow, now_secs)
+        } else {
+            None
+        };
         match hit {
             Some(Lookup::Busy) => busy = true,
             Some(found) => return found,
@@ -1724,6 +1692,55 @@ impl BanMemory {
             }
         }
         if busy { Lookup::Busy } else { Lookup::Clear }
+    }
+
+    /// The table probe of the first `count` of `lengths`, after the filter
+    /// (when `filter`) has dropped the lengths that cannot hold a ban.
+    #[inline]
+    fn probe_filtered(
+        &self,
+        host: &Cidr,
+        lengths: &mut [u8; PROBE_BATCH],
+        mut count: usize,
+        filter: bool,
+        now_secs: u64,
+    ) -> Option<Lookup> {
+        let anchor = Self::key_at(
+            host,
+            match host.family() {
+                Family::V4 => self.anchor_v4,
+                Family::V6 => self.anchor_v6,
+            },
+        );
+        let mut keys = [anchor; PROBE_BATCH];
+        for (k, &len) in keys.iter_mut().zip(&lengths[..count]) {
+            *k = Self::key_at(host, len);
+        }
+        if filter {
+            let mut maybe = self.filter.maybe(&anchor, &keys[..count]);
+            let mut kept = 0;
+            while maybe != 0 {
+                let i = maybe.trailing_zeros() as usize;
+                lengths[kept] = lengths[i];
+                keys[kept] = keys[i];
+                kept += 1;
+                maybe &= maybe - 1;
+            }
+            count = kept;
+            if count == 0 {
+                return None;
+            }
+        }
+        self.table.with(|table| {
+            Self::probe_lengths(
+                table,
+                host,
+                &lengths[..count],
+                &keys[..count],
+                &anchor,
+                now_secs,
+            )
+        })
     }
 
     /// Probes the address's prefix at each of `lengths` (ascending). Every

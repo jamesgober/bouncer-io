@@ -2,7 +2,7 @@
 //! L-1 epoch ordering, L-4 bind against revoke, L-5 release against revoke,
 //! L-6 concurrency counters, L-7 a request issued while its connection is
 //! released, L-8 the door against `revoke_and_ban`, L-9 a revocation against
-//! epoch moves from elsewhere, L-10 the door filter against bans and its own
+//! epoch moves from elsewhere, L-11 the door filter against bans and its own
 //! rebuilds. Built only under `--cfg bouncer_loom`.
 
 use loom::{
@@ -372,13 +372,13 @@ fn v4(len: u8, word: u64) -> TableKey {
     }
 }
 
-/// L-10a: a door that reads the epoch a `revoke_and_ban` moved sees the
+/// L-11a: a door that reads the epoch a `revoke_and_ban` moved sees the
 /// ban's filter bits, even when the filter switched buffers just before
 /// (the writer adds the key, then moves the epoch, as `revoke_and_ban`
 /// does). A door that reads the old epoch is reached by the revocation
 /// instead (L-8).
 #[test]
-fn loom_l10_filter_never_hides_a_ban_the_epoch_announced() {
+fn loom_l11_filter_never_hides_a_ban_the_epoch_announced() {
     loom::model(|| {
         let epoch = Arc::new(RevocationEpoch::new());
         let filter = Arc::new(Filter::new(1, HashKey::new(1, 2)));
@@ -402,11 +402,11 @@ fn loom_l10_filter_never_hides_a_ban_the_epoch_announced() {
     });
 }
 
-/// L-10b: a reader stalled while the filter is rebuilt twice (its buffer
+/// L-11b: a reader stalled while the filter is rebuilt twice (its buffer
 /// cleared and filled again) never answers "no" for a key the table holds
 /// throughout: the buffer's generation word sends it to the table.
 #[test]
-fn loom_l10_filter_rebuilds_never_hide_a_held_key() {
+fn loom_l11_filter_rebuilds_never_hide_a_held_key() {
     loom::model(|| {
         let filter = Arc::new(Filter::new(1, HashKey::new(3, 4)));
         let (anchor, k) = (v4(24, 0xc000_0200), v4(32, 0xc000_0201));
