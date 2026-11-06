@@ -79,6 +79,19 @@ jobs:
       - name: Deny
         run: cargo deny check
 
+  semver:
+    name: SemVer (against the latest release on crates.io)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # From 0.9.x on, a patch release that breaks the API fails here: the
+      # beta's exit is two release candidates with no API change.
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: all-features
+
   gate:
     name: Instruction-count gate (Callgrind)
     runs-on: ubuntu-latest

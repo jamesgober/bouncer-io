@@ -18,7 +18,9 @@ use crate::{
 /// What a layer reports.
 ///
 /// `DecoyTouched` (a decoy from sentinel-sec) is definitive: it revokes and
-/// bans at once, whatever the enforcement mode.
+/// bans at once, whatever the enforcement mode. Behind a shared address it
+/// bans the session and account and throttles the address, as a threshold
+/// does.
 ///
 /// # Examples
 ///
@@ -208,6 +210,20 @@ impl Default for StrikeRules {
 impl StrikeRules {
     /// Sets the weight, threshold, and window of one kind (`Custom` kinds
     /// share one rule).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, StrikeKind, StrikeOutcome, StrikeRules};
+    /// use std::time::Duration;
+    /// let rules = StrikeRules::default().rule(StrikeKind::LoginFailed, 1, 2, Duration::from_secs(300));
+    /// let bouncer = Bouncer::builder().strikes(rules).try_build()?;
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// assert_eq!(conn.strike(StrikeKind::LoginFailed), StrikeOutcome::Counted);
+    /// // The second reaches the threshold of 2 (observed: nothing is banned).
+    /// assert!(matches!(conn.strike(StrikeKind::LoginFailed), StrikeOutcome::ThresholdObserved { .. }));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn rule(
         mut self,
@@ -225,6 +241,27 @@ impl StrikeRules {
 
     /// The duration policy of bans set by this kind's threshold (default:
     /// the bouncer's duration policy).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, DurationPolicy, Enforcement, StrikeKind, StrikeRules};
+    /// use std::time::Duration;
+    /// let short = DurationPolicy::default().base(Duration::from_secs(120)).jitter(Duration::ZERO);
+    /// let rules = StrikeRules::default()
+    ///     .rule(StrikeKind::Malformed, 1, 1, Duration::from_secs(60))
+    ///     .duration(StrikeKind::Malformed, short);
+    /// let bouncer = Bouncer::builder()
+    ///     .strikes(rules)
+    ///     .enforcement(Enforcement::enforce_all())
+    ///     .try_build()?;
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let _ = conn.strike(StrikeKind::Malformed);
+    /// let ban = &bouncer.explain("192.0.2.5".parse::<std::net::IpAddr>()?).bans[0];
+    /// let until = ban.until.ok_or("permanent")?;
+    /// assert_eq!(until.duration_since(ban.issued)?, Duration::from_secs(120));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn duration(mut self, kind: StrikeKind, policy: DurationPolicy) -> StrikeRules {
         self.rules[kind.index()].durations = Some(policy);
@@ -279,12 +316,31 @@ pub struct Enforcement {
 
 impl Enforcement {
     /// Every kind observes (the default).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Enforcement, Mode, Posture, StrikeKind};
+    /// let e = Enforcement::observe_all();
+    /// assert_eq!(e.mode(StrikeKind::Malformed, Posture::Normal), Mode::Observe);
+    /// assert_eq!(e.mode(StrikeKind::Malformed, Posture::Strict), Mode::Observe);
+    /// assert_eq!(e, Enforcement::default());
+    /// ```
     #[must_use]
     pub fn observe_all() -> Enforcement {
         Enforcement::default()
     }
 
     /// Every kind enforces.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Enforcement, Mode, Posture, StrikeKind};
+    /// let e = Enforcement::enforce_all();
+    /// assert_eq!(e.mode(StrikeKind::LoginFailed, Posture::Normal), Mode::Enforce);
+    /// assert_eq!(e.mode(StrikeKind::Custom(7), Posture::Normal), Mode::Enforce);
+    /// ```
     #[must_use]
     pub fn enforce_all() -> Enforcement {
         Enforcement {
@@ -294,6 +350,15 @@ impl Enforcement {
     }
 
     /// One kind enforces.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Enforcement, Mode, Posture, StrikeKind};
+    /// let e = Enforcement::observe_all().enforce(StrikeKind::ProxyViolation);
+    /// assert_eq!(e.mode(StrikeKind::ProxyViolation, Posture::Normal), Mode::Enforce);
+    /// assert_eq!(e.mode(StrikeKind::Malformed, Posture::Normal), Mode::Observe);
+    /// ```
     #[must_use]
     pub fn enforce(mut self, kind: StrikeKind) -> Enforcement {
         self.enforce |= 1 << kind.index();
@@ -301,6 +366,15 @@ impl Enforcement {
     }
 
     /// One kind observes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Enforcement, Mode, Posture, StrikeKind};
+    /// let e = Enforcement::enforce_all().observe(StrikeKind::LoginFailed);
+    /// assert_eq!(e.mode(StrikeKind::LoginFailed, Posture::Normal), Mode::Observe);
+    /// assert_eq!(e.mode(StrikeKind::Malformed, Posture::Normal), Mode::Enforce);
+    /// ```
     #[must_use]
     pub fn observe(mut self, kind: StrikeKind) -> Enforcement {
         self.enforce &= !(1 << kind.index());
@@ -308,6 +382,16 @@ impl Enforcement {
     }
 
     /// Kinds that enforce under the strict posture.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Enforcement, Mode, Posture, StrikeKind};
+    /// let e = Enforcement::observe_all().strict(&[StrikeKind::Malformed, StrikeKind::SlowPeer]);
+    /// assert_eq!(e.mode(StrikeKind::SlowPeer, Posture::Normal), Mode::Observe);
+    /// assert_eq!(e.mode(StrikeKind::SlowPeer, Posture::Strict), Mode::Enforce);
+    /// assert_eq!(e.mode(StrikeKind::TlsAlert, Posture::Strict), Mode::Observe);
+    /// ```
     #[must_use]
     pub fn strict(mut self, kinds: &[StrikeKind]) -> Enforcement {
         for k in kinds {
@@ -317,6 +401,16 @@ impl Enforcement {
     }
 
     /// The mode of a kind under a posture.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Enforcement, Mode, Posture, StrikeKind};
+    /// let e = Enforcement::observe_all().enforce(StrikeKind::DecoyTouched).strict(&[StrikeKind::Malformed]);
+    /// assert_eq!(e.mode(StrikeKind::DecoyTouched, Posture::Normal), Mode::Enforce);
+    /// assert_eq!(e.mode(StrikeKind::Malformed, Posture::Normal), Mode::Observe);
+    /// assert_eq!(e.mode(StrikeKind::Malformed, Posture::Strict), Mode::Enforce);
+    /// ```
     #[must_use]
     pub fn mode(&self, kind: StrikeKind, posture: Posture) -> Mode {
         let bit = 1 << kind.index();
@@ -475,6 +569,20 @@ fn source_of(addr: IpAddr) -> Cidr {
     }
 }
 
+/// Throttles a shared address (likely a NAT) for one base ban length, where
+/// a ban would refuse everyone behind it.
+fn throttle_shared(
+    shared: &crate::bouncer::Shared,
+    src: IpAddr,
+    policy: Option<DurationPolicy>,
+    now: u64,
+) {
+    let secs = policy.unwrap_or_default().base_secs().max(1);
+    shared
+        .budgets
+        .throttle(&source_of(src), 4, now.saturating_add(secs), now);
+}
+
 /// Records a strike against a ticket's keys (`Ticket::strike`).
 pub(crate) fn strike(
     shard: &crate::registry::Shard,
@@ -537,10 +645,19 @@ pub(crate) fn strike(
     };
     let policy = shared.strikes.durations(kind);
     if kind == StrikeKind::DecoyTouched {
-        // Definitive: revoke and ban the keys, whatever the mode.
+        // Definitive: revoke and ban the keys, whatever the mode. A shared
+        // address (likely a NAT) is throttled, not banned, as at a threshold.
+        let now = shared.now().secs();
+        let source = match subject.source {
+            Some(src) if shared.sources.is_shared(src, now) => {
+                throttle_shared(shared, src, policy, now);
+                None
+            }
+            other => other,
+        };
         let mut first = None;
         let keys = [
-            subject.source.map(BanKey::Address),
+            source.map(BanKey::Address),
             subject.session.map(BanKey::Session),
             subject.account.map(BanKey::Account),
         ];
@@ -641,16 +758,7 @@ pub(crate) fn strike(
     if let BanKey::Address(src) = would_ban {
         if shared.sources.is_shared(src, now) {
             // Likely a NAT: throttle the address, ban the identities.
-            let secs = policy.unwrap_or_default().base_secs().max(1);
-            let client = match crate::keys::Cidr::host(src).family() {
-                crate::keys::Family::V4 => crate::keys::Cidr::host(src),
-                crate::keys::Family::V6 => crate::keys::Cidr::host(src)
-                    .parent(64)
-                    .unwrap_or(crate::keys::Cidr::host(src)),
-            };
-            shared
-                .budgets
-                .throttle(&client, 4, now.saturating_add(secs), now);
+            throttle_shared(shared, src, policy, now);
             let mut banned = false;
             for key in [
                 subject.session.map(BanKey::Session),

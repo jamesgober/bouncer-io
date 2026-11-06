@@ -73,7 +73,7 @@ impl fmt::Display for BanRecord {
     }
 }
 
-/// A key's offence history (arrives with offender memory).
+/// A key's offence history, from offender memory.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OffenderRecord {
@@ -219,12 +219,36 @@ pub struct Filter {
 
 impl Filter {
     /// Every ban.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{BanSpec, Bouncer, Filter, Page, SessionKey};
+    /// let bouncer = Bouncer::new();
+    /// bouncer.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
+    /// bouncer.ban(BanSpec::key(SessionKey::from_digest([3; 16])))?;
+    /// assert_eq!(bouncer.list(&Filter::all(), Page::first(10)).total, 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn all() -> Filter {
         Filter::default()
     }
 
     /// Address and prefix bans of one family.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Family, Filter, Page};
+    /// let bouncer = Bouncer::new();
+    /// bouncer.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
+    /// bouncer.ban("2001:db8:7::/48".parse::<bouncer_io::Cidr>()?)?;
+    /// let listing = bouncer.list(&Filter::all().family(Family::V6), Page::first(10));
+    /// assert_eq!(listing.total, 1);
+    /// assert_eq!(listing.items[0].key.to_string(), "2001:db8:7::/48");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn family(mut self, family: Family) -> Filter {
         self.family = Some(family);
@@ -232,6 +256,19 @@ impl Filter {
     }
 
     /// Address and prefix bans inside `prefix`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Filter, Page};
+    /// let bouncer = Bouncer::new();
+    /// for addr in ["198.51.100.1", "198.51.100.2", "203.0.113.1"] {
+    ///     bouncer.ban(addr.parse::<std::net::IpAddr>()?)?;
+    /// }
+    /// let listing = bouncer.list(&Filter::all().within("198.51.100.0/24".parse()?), Page::first(10));
+    /// assert_eq!(listing.total, 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn within(mut self, prefix: Cidr) -> Filter {
         self.within = Some(prefix);
@@ -239,6 +276,20 @@ impl Filter {
     }
 
     /// Bans issued by this kind of actor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, BanSpec, Bouncer, Filter, Page};
+    /// let bouncer = Bouncer::new();
+    /// bouncer.ban(BanSpec::address("198.51.100.1".parse()?).by(Actor::Admin(17)))?;
+    /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;   // Actor::App
+    /// // The kind is matched, not the administrator's id.
+    /// let listing = bouncer.list(&Filter::all().by(Actor::Admin(0)), Page::first(10));
+    /// assert_eq!(listing.total, 1);
+    /// assert_eq!(listing.items[0].key.to_string(), "198.51.100.1");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn by(mut self, actor: Actor) -> Filter {
         self.actor = Some(actor.kind());
@@ -246,6 +297,18 @@ impl Filter {
     }
 
     /// Bans with this reason.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{BanSpec, Bouncer, Filter, Page, Reason};
+    /// let bouncer = Bouncer::new();
+    /// bouncer.ban(BanSpec::address("198.51.100.1".parse()?).because(Reason::DECOY))?;
+    /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;   // Reason::ADMIN
+    /// let listing = bouncer.list(&Filter::all().because(Reason::DECOY), Page::first(10));
+    /// assert_eq!(listing.total, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn because(mut self, reason: Reason) -> Filter {
         self.reason = Some(reason);
@@ -253,6 +316,22 @@ impl Filter {
     }
 
     /// Timed bans ending before `at`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{BanSpec, Bouncer, Filter, Page};
+    /// use std::time::{Duration, SystemTime};
+    /// let bouncer = Bouncer::new();
+    /// bouncer.ban(BanSpec::address("198.51.100.1".parse()?).for_duration(Duration::from_secs(60)))?;
+    /// bouncer.ban(BanSpec::address("198.51.100.2".parse()?).for_duration(Duration::from_secs(86_400)))?;
+    /// bouncer.ban(BanSpec::address("198.51.100.3".parse()?).permanent())?;
+    /// let soon = SystemTime::now() + Duration::from_secs(3_600);
+    /// let listing = bouncer.list(&Filter::all().expiring_before(soon), Page::first(10));
+    /// assert_eq!(listing.total, 1);
+    /// assert_eq!(listing.items[0].key.to_string(), "198.51.100.1");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn expiring_before(mut self, at: SystemTime) -> Filter {
         self.expiring_before = Some(at);
@@ -260,6 +339,19 @@ impl Filter {
     }
 
     /// Permanent bans only.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{BanSpec, Bouncer, Filter, Page};
+    /// let bouncer = Bouncer::new();
+    /// bouncer.ban(BanSpec::address("198.51.100.1".parse()?).permanent())?;
+    /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;
+    /// let listing = bouncer.list(&Filter::all().permanent_only(), Page::first(10));
+    /// assert_eq!(listing.total, 1);
+    /// assert_eq!(listing.items[0].until, None);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn permanent_only(mut self) -> Filter {
         self.permanent_only = true;
@@ -313,6 +405,21 @@ pub struct Page {
 
 impl Page {
     /// The first page, `limit` items (1 to 1,000).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Filter, Page};
+    /// let bouncer = Bouncer::new();
+    /// for i in 1..=3u8 {
+    ///     bouncer.ban(std::net::IpAddr::from([198, 51, 100, i]))?;
+    /// }
+    /// let listing = bouncer.list(&Filter::all(), Page::first(2));
+    /// assert_eq!(listing.items.len(), 2);
+    /// assert!(listing.next.is_some());
+    /// assert_eq!(Page::first(0).limit(), 1);   // clamped
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn first(limit: u16) -> Page {
         Page {
@@ -322,6 +429,13 @@ impl Page {
     }
 
     /// Items per page.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let page = bouncer_io::Page::first(25);
+    /// assert_eq!(page.limit(), 25);
+    /// ```
     #[must_use]
     pub const fn limit(&self) -> u16 {
         self.limit
@@ -396,6 +510,21 @@ pub struct Health {
 impl Health {
     /// `false` when a table is above 90% load, the maintainer stopped, or the
     /// last persistence write failed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Bouncer;
+    /// let bouncer = Bouncer::builder().tickets(10).shards(1).try_build()?;
+    /// let mut held = Vec::new();
+    /// for i in 1..=10u8 {
+    ///     held.push(bouncer.door(std::net::IpAddr::from([198, 51, i, 1]))?);
+    /// }
+    /// let health = bouncer.health();
+    /// assert_eq!(health.tickets_live, 10);
+    /// assert!(!health.is_ok());   // the registry is above 90% load
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn is_ok(&self) -> bool {
         let tickets = if self.tickets_capacity == 0 {
@@ -442,6 +571,17 @@ impl Bouncer {
     /// Counter totals, summed over every shard.
     ///
     /// With the `metrics` feature only.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let bouncer = bouncer_io::Bouncer::new();
+    /// bouncer.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
+    /// let m = bouncer.metrics();
+    /// assert_eq!(m.bans_added, 1);
+    /// assert_eq!(m.bans_active, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[cfg(feature = "metrics")]
     #[must_use]
     pub fn metrics(&self) -> crate::metrics::MetricsSnapshot {
@@ -664,6 +804,20 @@ impl Bouncer {
 
     /// Table loads, registry use, detached tickets, the journal backlog, the
     /// last persistence failure, and the maintainer's state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, MaintainerState};
+    /// let bouncer = Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.1".parse()?)?;
+    /// let health = bouncer.health();
+    /// assert_eq!(health.tickets_live, 1);
+    /// assert_eq!(health.maintainer, MaintainerState::NotStarted);
+    /// drop(conn);
+    /// assert_eq!(bouncer.health().tickets_live, 0);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn health(&self) -> Health {
         let shared = self.shared();

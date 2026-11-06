@@ -53,11 +53,40 @@ pub struct ConnectionGate {
 
 impl ConnectionGate {
     /// The connection ticket, to open request tickets or bind identities.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, RequestId};
+    /// use net_io::{AdmitStage, ConnectionInfo, Gate};
+    ///
+    /// let bouncer = Bouncer::new();
+    /// let info = ConnectionInfo::for_testing("192.0.2.40:5000".parse()?);
+    /// let mut admitted = bouncer.admit(&info, AdmitStage::Accept).map_err(|_| "refused")?;
+    /// let mut request = admitted.ticket.ticket().request(RequestId(1))?;
+    /// assert!(request.checkpoint().is_pass());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn ticket(&mut self) -> &mut Ticket {
         &mut self.ticket
     }
 
     /// The connection's tag (also net-io's `GateTag` for it).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Bouncer;
+    /// use net_io::{AdmitStage, ConnectionInfo, Gate};
+    ///
+    /// let bouncer = Bouncer::new();
+    /// let info = ConnectionInfo::for_testing("192.0.2.40:5000".parse()?);
+    /// let mut admitted = bouncer.admit(&info, AdmitStage::Accept).map_err(|_| "refused")?;
+    /// let tag = admitted.ticket.tag();
+    /// assert_eq!(tag, admitted.ticket.ticket().tag());
+    /// assert!(bouncer.egress(tag).is_pass());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn tag(&self) -> TicketTag {
         self.tag
@@ -212,6 +241,13 @@ pub struct NetIoEjector {
 
 impl NetIoEjector {
     /// An ejector not yet attached to a server.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let ejector = bouncer_io::NetIoEjector::new();
+    /// assert_eq!(format!("{ejector:?}"), "NetIoEjector { attached: false }");
+    /// ```
     #[must_use]
     pub fn new() -> NetIoEjector {
         NetIoEjector::default()
@@ -219,6 +255,26 @@ impl NetIoEjector {
 
     /// Attaches the server whose connections it closes. `false` when one
     /// was already attached (the first stays).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use bouncer_io::{Bouncer, NetIoEjector};
+    /// use net_io::{ListenerSpec, ServerBuilder};
+    ///
+    /// let ejector = Arc::new(NetIoEjector::new());
+    /// let bouncer = Bouncer::builder().ejector(ejector.clone()).try_build()?;
+    /// let server = ServerBuilder::new()
+    ///     .listener(ListenerSpec::tcp("127.0.0.1:0"))
+    ///     .handler(|_conn: &mut net_io::TcpConnection| Ok(()))
+    ///     .gate(bouncer.clone())
+    ///     .build()?;
+    /// assert!(ejector.attach(server.handle()));
+    /// assert!(!ejector.attach(server.handle()));   // the first stays
+    /// assert_eq!(format!("{ejector:?}"), "NetIoEjector { attached: true }");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn attach(&self, server: ServerHandle) -> bool {
         self.server.set(server).is_ok()
     }

@@ -11,6 +11,21 @@
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-06
+
+### Security
+
+- No weak word bans an address flagged as shared (likely a NAT) any more, by any route (D-123). A directive from a local heuristic, a peer node, or a policy below confidence 70 aimed at a connection or request behind a shared address used to ban the address; it now bans the ticket's session (the documented default) and throttles the address. A decoy touch behind a shared address used to ban everyone behind it; it now bans the session and account and throttles the address, as a strike threshold does. An imported ban set by another node's local heuristics is refused when it covers a client that is shared here.
+
+### Added
+
+- Every public method has a runnable example (181 new; 301 doc tests).
+- CI runs `cargo-semver-checks` against the latest release.
+
+### Fixed
+
+- Documentation that said something other than the code: the revocation rate limit applies every revocation and reports the excess (it said the excess was only observed); `shards` refuses 0 and more than 256; `tickets` rounds up to a multiple of the shard count; a decoy ban lasts the duration policy's length, not forever, and `Actor::Gate` cannot ban permanently; `Budgets::capacity` keeps at least 1,024 keys; `max_unchecked` is measured from the maintenance run that recorded the epoch; `ban_keys` applies to `ban` too; `Lifted::removed`, `FilePersistence::open`, the `DurationPolicy` fields, the import example's count, and three derive lists.
+
 ## [0.9.0] - 2026-11-05
 
 ### Security
@@ -353,7 +368,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/jamesgober/bouncer-io/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/jamesgober/bouncer-io/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/bouncer-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/bouncer-io/compare/v0.6.0...v0.7.0

@@ -22,12 +22,34 @@ pub struct Now(u64);
 
 impl Now {
     /// A time this many nanoseconds after the bouncer started.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Now;
+    /// let t = Now::from_nanos(1_500_000_000);
+    /// assert_eq!(t.as_nanos(), 1_500_000_000);
+    /// assert!(t > Now::from_nanos(1_000_000_000));
+    /// ```
     #[must_use]
     pub const fn from_nanos(nanos: u64) -> Now {
         Now(nanos)
     }
 
     /// Nanoseconds since the bouncer started.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Bouncer;
+    /// use clock_lib::ManualClock;
+    /// use std::{sync::Arc, time::Duration};
+    /// let clock = Arc::new(ManualClock::new());
+    /// let bouncer = Bouncer::builder().clock(clock.clone()).try_build()?;
+    /// clock.advance(Duration::from_millis(3));
+    /// assert_eq!(bouncer.now().as_nanos(), 3_000_000);
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     #[must_use]
     pub const fn as_nanos(self) -> u64 {
         self.0

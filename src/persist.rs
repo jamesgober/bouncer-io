@@ -172,7 +172,19 @@ impl FilePersistence {
     /// # Errors
     ///
     /// `Io(NotFound)` when the directory does not exist; `Io(InvalidInput)`
-    /// for an empty name or one with a path separator.
+    /// for an empty name, `.` or `..`, or one with a path separator.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{FilePersistence, PersistError};
+    /// use std::io::ErrorKind;
+    /// let dir = std::env::temp_dir();
+    /// assert!(FilePersistence::open(&dir, "bans").is_ok());   // no file is created yet
+    /// assert_eq!(FilePersistence::open(&dir, "a/b").err(), Some(PersistError::Io(ErrorKind::InvalidInput)));
+    /// let missing = dir.join("bouncer-io-no-such-directory");
+    /// assert_eq!(FilePersistence::open(&missing, "bans").err(), Some(PersistError::Io(ErrorKind::NotFound)));
+    /// ```
     pub fn open(dir: &Path, name: &str) -> Result<FilePersistence, PersistError> {
         if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." {
             return Err(PersistError::Io(std::io::ErrorKind::InvalidInput));

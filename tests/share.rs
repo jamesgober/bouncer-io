@@ -383,3 +383,47 @@ fn test_no_channel_bans_a_whole_address_family() {
     assert!(report.applied >= 1, "{report:?}");
     assert!(b.door(ip("192.0.2.1")).is_err());
 }
+
+#[test]
+fn test_an_imported_local_ban_never_takes_an_address_shared_here() {
+    // T-5 across nodes: node 1's own heuristics saw one client at an address
+    // that node 2 has seen hundreds behind (likely a NAT). Node 1's automated
+    // ban does not refuse them all at node 2; an administrator's still does.
+    let clock = Arc::new(ManualClock::new());
+    let a = node(1, &clock);
+    let b = node(2, &clock);
+    let nat = ip("100.64.0.77");
+    let conn = b.door(nat).unwrap();
+    for s in 0..500u32 {
+        let mut r = conn.request(RequestId(u128::from(s))).unwrap();
+        let mut d = [0u8; 16];
+        d[..4].copy_from_slice(&s.to_be_bytes());
+        assert!(r.bind_session(SessionKey::from_digest(d)).is_pass());
+    }
+    assert!(b.explain(nat).shared_source);
+
+    a.ban(
+        BanSpec::address(nat)
+            .by(Actor::Local)
+            .because(Reason::STRIKE_THRESHOLD),
+    )
+    .unwrap();
+    assert!(a.door(nat).is_err(), "node 1 holds its own ban");
+    let report = b
+        .import(&a.export_delta(Sequence::START).unwrap(), Actor::Channel(1))
+        .unwrap();
+    assert!(report.rejected >= 1, "{report:?}");
+    assert!(
+        b.door(nat).is_ok(),
+        "node 2 does not refuse the shared address"
+    );
+
+    // An administrator's ban of the same address is imported.
+    let a = node(3, &clock);
+    a.ban(BanSpec::address(nat).by(Actor::Admin(1))).unwrap();
+    let report = b
+        .import(&a.export_delta(Sequence::START).unwrap(), Actor::Channel(3))
+        .unwrap();
+    assert_eq!(report.rejected, 0, "{report:?}");
+    assert!(b.door(nat).is_err());
+}

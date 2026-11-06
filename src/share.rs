@@ -53,18 +53,46 @@ impl Sequence {
     pub const START: Sequence = Sequence(0);
 
     /// The position after this one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Sequence;
+    /// assert_eq!(Sequence::START.next().get(), 1);
+    /// assert_eq!(Sequence::from_raw(u64::MAX).next().get(), u64::MAX);   // saturates
+    /// ```
     #[must_use]
     pub const fn next(self) -> Sequence {
         Sequence(self.0.saturating_add(1))
     }
 
     /// The raw position, for storing between runs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, NodeId, Sequence};
+    /// let node = Bouncer::builder().node(NodeId(1)).try_build()?;
+    /// node.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
+    /// let stored = node.export_delta(Sequence::START)?.last().get();   // kept between runs
+    /// assert_eq!(Sequence::from_raw(stored), node.export_delta(Sequence::START)?.last());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
 
     /// A position from a stored raw value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Sequence;
+    /// let since = Sequence::from_raw(41);
+    /// assert_eq!(since.get(), 41);
+    /// assert!(since > Sequence::START);
+    /// ```
     #[must_use]
     pub const fn from_raw(raw: u64) -> Sequence {
         Sequence(raw)
@@ -109,12 +137,38 @@ pub struct Delta {
 
 impl Delta {
     /// The encoded bytes, to send.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, Bouncer, Delta, NodeId, Sequence};
+    /// let a = Bouncer::builder().node(NodeId(1)).try_build()?;
+    /// let b = Bouncer::builder().node(NodeId(2)).try_build()?;
+    /// a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
+    /// let wire: Vec<u8> = a.export_delta(Sequence::START)?.as_bytes().to_vec();
+    /// let _ = b.import(&Delta::from_bytes(&wire)?, Actor::Channel(1))?;
+    /// assert!(b.door("198.51.100.9".parse()?).is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
     /// The last log position this delta carries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, NodeId, Sequence};
+    /// let a = Bouncer::builder().node(NodeId(1)).try_build()?;
+    /// a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
+    /// let first = a.export_delta(Sequence::START)?;
+    /// a.ban("198.51.100.10".parse::<std::net::IpAddr>()?)?;
+    /// let next = a.export_delta(first.last())?;   // only what came after
+    /// assert!(next.last() > first.last());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn last(&self) -> Sequence {
         self.last
@@ -125,6 +179,20 @@ impl Delta {
     /// # Errors
     ///
     /// `Import(Corrupt | TooLarge | UnsupportedFormat)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, BouncerError, Delta, ImportError, NodeId, Sequence};
+    /// let a = Bouncer::builder().node(NodeId(1)).try_build()?;
+    /// a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
+    /// let mut wire = a.export_delta(Sequence::START)?.as_bytes().to_vec();
+    /// assert!(Delta::from_bytes(&wire).is_ok());
+    /// let end = wire.len() - 1;
+    /// wire[end] ^= 1;   // a damaged checksum
+    /// assert!(matches!(Delta::from_bytes(&wire), Err(BouncerError::Import(ImportError::Corrupt { .. }))));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn from_bytes(bytes: &[u8]) -> Result<Delta, BouncerError> {
         let d = Delta::check(bytes)?;
         Ok(d)

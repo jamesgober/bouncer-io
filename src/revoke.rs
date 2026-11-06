@@ -70,6 +70,13 @@ impl core::fmt::Debug for RevocationEpoch {
 
 impl RevocationEpoch {
     /// A new epoch at zero.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::RevocationEpoch;
+    /// assert_eq!(RevocationEpoch::new().current(), 0);
+    /// ```
     #[must_use]
     pub fn new() -> RevocationEpoch {
         RevocationEpoch {
@@ -78,6 +85,18 @@ impl RevocationEpoch {
     }
 
     /// The current value (an Acquire load).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{AccountKey, Bouncer, Reason, RevocationEpoch};
+    /// use std::sync::Arc;
+    /// let epoch = Arc::new(RevocationEpoch::new());
+    /// let bouncer = Bouncer::builder().epoch(epoch.clone()).try_build()?;
+    /// let receipt = bouncer.revoke(AccountKey(3), Reason::LOGOUT_EVERYWHERE)?;
+    /// assert_eq!(epoch.current(), receipt.epoch); // the shared word carries the revocation
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     #[must_use]
     pub fn current(&self) -> u64 {
         self.load()

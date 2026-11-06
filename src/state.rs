@@ -930,6 +930,21 @@ impl Bouncer {
     /// # Errors
     ///
     /// `NodeIdUnset` without [`BouncerBuilder::node`](crate::BouncerBuilder::node).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, Bouncer, NodeId, Sequence};
+    /// let a = Bouncer::builder().node(NodeId(1)).try_build()?;
+    /// let b = Bouncer::builder().node(NodeId(2)).try_build()?;
+    /// a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
+    /// let delta = a.export_delta(Sequence::START)?;
+    /// b.import(&delta, Actor::Channel(1))?;
+    /// assert!(b.door("198.51.100.9".parse()?).is_err());
+    /// // The next export starts where this one ended: nothing new since.
+    /// assert_eq!(b.import(&a.export_delta(delta.last())?, Actor::Channel(1))?.applied, 0);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn export_delta(&self, since: Sequence) -> Result<Delta, BouncerError> {
         let shared = self.shared();
         let node = shared.node.ok_or(BouncerError::NodeIdUnset)?;
@@ -945,6 +960,18 @@ impl Bouncer {
     /// # Errors
     ///
     /// `NodeIdUnset` without [`BouncerBuilder::node`](crate::BouncerBuilder::node).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, Bouncer, NodeId};
+    /// let a = Bouncer::builder().node(NodeId(1)).try_build()?;
+    /// a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
+    /// let joining = Bouncer::builder().node(NodeId(2)).try_build()?;
+    /// assert!(joining.import(&a.export_snapshot()?, Actor::Channel(1))?.applied >= 1);
+    /// assert!(joining.door("198.51.100.9".parse()?).is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn export_snapshot(&self) -> Result<Delta, BouncerError> {
         let shared = self.shared();
         let node = shared.node.ok_or(BouncerError::NodeIdUnset)?;
@@ -975,6 +1002,20 @@ impl Bouncer {
     /// `Import(RateLimited)` when a channel sends too many records per
     /// second. Refused records (allow-listed keys, clock skew, foreign
     /// lifts) are counted in `rejected` and reported as events.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, Bouncer, NodeId, Sequence};
+    /// let a = Bouncer::builder().node(NodeId(1)).try_build()?;
+    /// let b = Bouncer::builder().node(NodeId(2)).try_build()?;
+    /// a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
+    /// let delta = a.export_delta(Sequence::START)?;
+    /// assert_eq!(b.import(&delta, Actor::Channel(1))?.applied, 2);      // the ban and its offender record
+    /// assert_eq!(b.import(&delta, Actor::Channel(1))?.duplicates, 2);   // delivered again: skipped
+    /// assert_eq!(b.import(&delta, Actor::Channel(9))?.rejected, 2);     // not node 9's own records
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn import(&self, delta: &Delta, from: Actor) -> Result<ImportReport, BouncerError> {
         let shared = self.shared();
         let ledger = shared.ledger.as_ref().ok_or(BouncerError::NodeIdUnset)?;
@@ -1072,6 +1113,21 @@ impl Bouncer {
                                     ActorKind::from_code(c.actor),
                                     c.until == 0,
                                 ))
+                        {
+                            report.rejected += 1;
+                            self.reject(ImportError::NotAllowed);
+                            break 'rec;
+                        }
+                        // Another node's heuristics may have seen one client
+                        // at an address this node has seen many behind
+                        // (likely a NAT): their word alone does not ban it
+                        // here, as it would not at a strike threshold here.
+                        if !trusted
+                            && matches!(
+                                ActorKind::from_code(c.actor),
+                                ActorKind::Local | ActorKind::Channel
+                            )
+                            && shared.covers_shared_client(&key, now.secs())
                         {
                             report.rejected += 1;
                             self.reject(ImportError::NotAllowed);

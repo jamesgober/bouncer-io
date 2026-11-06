@@ -29,6 +29,14 @@ pub enum Family {
 
 impl Family {
     /// The longest prefix length of the family: 32 or 128.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Family;
+    /// assert_eq!(Family::V4.max_len(), 32);
+    /// assert_eq!(Family::V6.max_len(), 128);
+    /// ```
     #[must_use]
     pub const fn max_len(self) -> u8 {
         match self {
@@ -241,12 +249,31 @@ impl Cidr {
     }
 
     /// The address family.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Cidr, Family};
+    /// assert_eq!("203.0.113.0/24".parse::<Cidr>()?.family(), Family::V4);
+    /// assert_eq!("::ffff:203.0.113.9".parse::<Cidr>()?.family(), Family::V4);   // normalized
+    /// assert_eq!("2001:db8::/32".parse::<Cidr>()?.family(), Family::V6);
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     #[must_use]
     pub fn family(&self) -> Family {
         self.family
     }
 
     /// The prefix length.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Cidr;
+    /// assert_eq!("2001:db8::/48".parse::<Cidr>()?.len(), 48);
+    /// assert_eq!("203.0.113.7".parse::<Cidr>()?.len(), 32);   // a bare address is a host prefix
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
     #[must_use]
     #[allow(clippy::len_without_is_empty)] // a prefix length, not a collection
     pub fn len(&self) -> u8 {
@@ -254,6 +281,14 @@ impl Cidr {
     }
 
     /// The network address (host bits cleared).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let c: bouncer_io::Cidr = "203.0.113.77/24".parse()?;
+    /// assert_eq!(c.network(), "203.0.113.0".parse::<std::net::IpAddr>()?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn network(&self) -> IpAddr {
         match self.family {

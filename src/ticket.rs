@@ -135,6 +135,16 @@ pub struct TicketId(u64);
 
 impl TicketId {
     /// The raw value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let bouncer = bouncer_io::Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let id = conn.id();
+    /// assert_eq!(format!("{:016x}", id.get()), id.to_string());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
@@ -169,6 +179,17 @@ pub struct TicketTag(u64);
 
 impl TicketTag {
     /// The raw value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, TicketTag};
+    /// let bouncer = Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let raw = conn.tag().get();   // what the transport stores
+    /// assert_eq!(TicketTag::from_raw(raw), conn.tag());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
@@ -176,6 +197,17 @@ impl TicketTag {
 
     /// A tag from a raw value. Any value is accepted; an unknown one is
     /// denied by every check that takes it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, TicketTag};
+    /// let bouncer = Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// assert!(bouncer.egress(TicketTag::from_raw(conn.tag().get())).is_pass());
+    /// assert!(bouncer.egress(TicketTag::from_raw(u64::MAX)).is_deny());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub const fn from_raw(raw: u64) -> TicketTag {
         TicketTag(raw)
@@ -327,18 +359,51 @@ impl Ticket {
     }
 
     /// The ticket's identity, for logs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let bouncer = bouncer_io::Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let request = conn.request(bouncer_io::RequestId(1))?;
+    /// assert_ne!(conn.id(), request.id());
+    /// assert_eq!(conn.id(), conn.id());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn id(&self) -> TicketId {
         TicketId(self.tag().0)
     }
 
     /// Connection or request.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, RequestId, TicketKind};
+    /// let bouncer = Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// assert_eq!(conn.kind(), TicketKind::Connection);
+    /// assert_eq!(conn.request(RequestId(1))?.kind(), TicketKind::Request);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn kind(&self) -> TicketKind {
         self.kind
     }
 
     /// The connection id (a request ticket carries its connection's).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let bouncer = bouncer_io::Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let request = conn.request(bouncer_io::RequestId(1))?;
+    /// assert_eq!(request.conn(), conn.conn());
+    /// assert_ne!(bouncer.door("192.0.2.5".parse()?)?.conn(), conn.conn());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn conn(&self) -> ConnId {
         ConnId(self.cell().conn.load(Ordering::Relaxed))
@@ -346,12 +411,33 @@ impl Ticket {
 
     /// The source address; `None` on a trusted proxy hop until the real
     /// client is bound.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let bouncer = bouncer_io::Bouncer::new();
+    /// let peer = "192.0.2.5".parse()?;
+    /// let conn = bouncer.door(peer)?;
+    /// assert_eq!(conn.source(), Some(peer));
+    /// assert_eq!(conn.request(bouncer_io::RequestId(1))?.source(), Some(peer));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn source(&self) -> Option<IpAddr> {
         source_of(self.cell())
     }
 
     /// How the source address was learned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Provenance};
+    /// let bouncer = Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// assert_eq!(conn.provenance(), Provenance::Socket);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn provenance(&self) -> Provenance {
         let st = self.cell().state.load(Ordering::Acquire);
@@ -361,6 +447,18 @@ impl Ticket {
     /// The tag naming this ticket as a number, without giving it up. A
     /// protocol engine passes a request's tag to the transport so the egress
     /// check judges exactly that request.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let bouncer = bouncer_io::Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let tag = conn.tag();
+    /// assert!(bouncer.egress(tag).is_pass());
+    /// drop(conn);   // the handle still owned the ticket; dropping it releases it
+    /// assert!(bouncer.egress(tag).is_deny());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn tag(&self) -> TicketTag {
         TicketTag::new(self.index, self.generation)
@@ -1139,6 +1237,31 @@ impl Ticket {
 
     /// As [`deny_and_eject`](Self::deny_and_eject), with a formatter for a
     /// protocol other than the builder's.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, Collected, Denial, DenialFormat, FormatError, RequestId};
+    /// use std::io::Write;
+    ///
+    /// struct StatusOnly;
+    /// impl DenialFormat for StatusOnly {
+    ///     fn format(&self, d: &Denial, out: &mut Collected) -> Result<(), FormatError> {
+    ///         write!(out, "{}", d.code.http_status()).map_err(|_| FormatError::TooLarge)
+    ///     }
+    /// }
+    ///
+    /// let bouncer = Bouncer::new();
+    /// let conn = bouncer.door("192.0.2.5".parse()?)?;
+    /// let mut request = conn.request(RequestId(1))?;
+    /// let mut reply = Collected::new();
+    /// reply.extend_from_slice(b"half a report")?;
+    /// let out = request.deny_and_eject_with(&mut reply, &StatusOnly);
+    /// assert!(out.wiped && out.formatted);
+    /// assert_eq!(reply.as_slice(), b"403");
+    /// assert!(request.checkpoint().is_deny());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn deny_and_eject_with(
         &mut self,
         collected: &mut Collected,
