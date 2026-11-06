@@ -208,7 +208,7 @@ What did it:
 
 What it costs: a banned peer pays the filter before the probe, about 8% (7 ns) in this run, and 1.16 times 0.9.1's instructions (the gate's baseline records it, D-126).
 
-Instructions per operation (Callgrind, `benches/gate.rs`, 0.9.2 against 0.9.1): door admitted 1,034 against 1,167 (-11.4%); door banned 988 against 852 (+16.1%); ban insert 5,950 against 5,859 (+1.6%); session bind, request cycle, and checkpoint unchanged (the old baseline had a session bind at 745, 14% above what 0.9.1 counts, and is rewritten with the rest).
+Instructions per operation (Callgrind, `benches/gate.rs`, 0.9.2 against 0.9.1): door admitted 1,034 against 1,167 (-11.4%); door banned 988 against 852 (+16.1%); ban insert 5,950 against 5,859 (+1.6%); session bind, request cycle, and checkpoint unchanged.
 
 The door against both compositions, within-run ratios (door/composition), median of six processes, under the load above:
 
@@ -245,7 +245,7 @@ NFR-10 (PLAN D-125, decided by James on 2026-11-06): the door at least 20% faste
 
 ## The regression gate
 
-Time on a shared machine cannot gate a 5% regression, so CI counts instructions instead: `benches/gate.rs` runs each hot path (door admitted and banned, the request cycle, the checkpoint, a session bind, a ban insert) in its own function under Callgrind, and `scripts/gate.py` compares each function's inclusive count with `benches/gate-baseline.txt`. More than 5% over fails the build. The counts repeat run to run (fixed seeds, fixed inputs).
+Time on a shared machine cannot gate a 5% regression, so CI counts instructions instead: `benches/gate.rs` runs each hot path (door admitted and banned, the request cycle, the checkpoint, a session bind, a ban insert) in its own function under Callgrind, and `scripts/gate.py` compares each function's inclusive count with `benches/gate-baseline.txt`. More than 5% over fails the build. The counts repeat run to run (fixed seeds, fixed inputs). They are CI's counts: a session bind reads the clock, which on CI's Linux runs about 100 instructions in user space (the vDSO), and under WSL2 is a system call that Callgrind barely counts, so a baseline written there is 101 instructions per bind too low.
 
 <br>
 
