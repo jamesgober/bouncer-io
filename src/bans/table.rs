@@ -80,12 +80,22 @@ pub(crate) const ANCHOR_GROUPS: usize = 4;
 const READ_SPINS: u32 = 256;
 #[cfg(bouncer_loom)]
 const READ_SPINS: u32 = 2;
-/// How long a reader then yields to a writer that holds a slot before it
-/// fails closed. A write takes a few instructions; holding a slot longer
-/// means the writer was preempted inside one, and a preempted thread waits
-/// up to a scheduler quantum (about 16 ms on Windows) to run again.
+/// How long a reader then waits for a writer that holds a slot before it
+/// fails closed. A write is a few stores that cannot fail, so a slot held
+/// longer means its writer was preempted inside one and has not been run
+/// again. On a machine with many runnable threads per core that takes far
+/// more than a scheduler quantum (a 2 ms sleep measured past 20 ms under a
+/// load of 500 on 32 cores), and every reader that gives up fails closed for
+/// nothing. Only a machine that cannot run a thread for this long reaches it.
 #[cfg(not(bouncer_loom))]
-const HELD_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+const HELD_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long a reader yields before it sleeps instead. A yield can leave the
+/// preempted writer waiting behind the readers (a writer of lower priority
+/// never runs while they yield); a sleep always gives it the core.
+#[cfg(not(bouncer_loom))]
+const HELD_YIELD: std::time::Duration = std::time::Duration::from_millis(1);
+#[cfg(not(bouncer_loom))]
+const HELD_NAP: std::time::Duration = std::time::Duration::from_micros(200);
 
 /// A table key: kind, prefix length (0 for identity kinds), and 128 bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -333,19 +343,24 @@ impl Slot {
     }
 
     /// The writer still holds the slot after the spins: it was preempted
-    /// inside its write. Yield to it, and fail closed only once it has held
-    /// the slot for [`HELD_WAIT`].
+    /// inside its write. Yield to it, then sleep, and fail closed only once
+    /// it has held the slot for [`HELD_WAIT`].
     #[cold]
     fn read_held(&self) -> Option<Raw> {
         #[cfg(not(bouncer_loom))]
         {
             let started = std::time::Instant::now();
             loop {
-                std::thread::yield_now();
+                let waited = started.elapsed();
+                if waited < HELD_YIELD {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(HELD_NAP);
+                }
                 if let Some(raw) = self.try_read() {
                     return Some(raw);
                 }
-                if started.elapsed() >= HELD_WAIT {
+                if waited >= HELD_WAIT {
                     return None;
                 }
             }
@@ -1354,9 +1369,9 @@ mod tests {
     #[test]
     fn test_a_slot_held_by_a_stalled_writer_is_waited_for() {
         // A writer preempted inside its few-instruction write holds the slot
-        // for a scheduler quantum, not a few nanoseconds. Readers wait it out
-        // instead of failing closed: a busy revocation probe revokes the
-        // whole connection of an unrelated ticket.
+        // until the scheduler runs it again, not a few nanoseconds. Readers
+        // wait it out instead of failing closed: a busy revocation probe
+        // revokes the whole connection of an unrelated ticket.
         let slot = std::sync::Arc::new(Slot::new());
         let meta = u64::from(CODE_V4 + 32) << CODE_SHIFT;
         slot.write(&Raw {
@@ -1378,6 +1393,16 @@ mod tests {
         let r = slot.read().expect("the reader waited for the writer");
         assert_eq!([r.word, r.times, r.id], [2, 2, 2]);
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn test_a_slot_never_released_fails_the_reader_closed() {
+        let slot = Slot::new();
+        let m = slot.meta.load(Ordering::Relaxed);
+        slot.meta.store(m + 1, Ordering::Release);
+        let started = std::time::Instant::now();
+        assert!(slot.read().is_none(), "a held slot never reads as free");
+        assert!(started.elapsed() >= HELD_WAIT);
     }
 
     #[test]

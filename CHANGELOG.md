@@ -30,7 +30,7 @@
 
 ### Fixed
 
-- A writer preempted inside a slot write no longer gets unrelated requests revoked (D-132). Readers gave up on a held slot after about 4 microseconds and failed closed, and a revocation probe that fails closed revokes the whole connection; on a busy machine that revoked requests nobody had revoked (2 of 40 stress runs on 0.9.1). Readers now yield to the writer for up to 20 ms first.
+- A writer preempted inside a slot write no longer gets unrelated requests revoked (D-132). Readers gave up on a held slot after about 4 microseconds and failed closed, and a revocation probe that fails closed revokes the whole connection; on a busy machine that revoked requests nobody had revoked (2 of 40 stress runs on 0.9.1). Readers now wait for the writer to run again, yielding and then sleeping, for up to one second first.
 - Every loom model spawns each participant (D-129). Models whose main thread acted right after a spawn never explored the other side running first; they pass with every schedule explored.
 - `test_full_tracker_forgets_oldest_in_constant_time` bounds time by a ratio within the run, not by five seconds of wall clock, which a busy machine exceeded (D-131).
 
