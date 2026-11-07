@@ -208,7 +208,7 @@ Status at 0.9.2 (the improvement pass James asked for with the targets):
 | A filter in front of the ban table | Done (D-126): `door_at` 12 to 21% faster than 0.9.1, banned peers about 8% slower (recorded in the gate's baseline); memory per ban 39.6 B |
 | Persistence rollback | Done (D-128): `VersionAnchor`, test-first |
 | D-105's 19-bit slot version | Measured and kept (D-130): 40-byte slots leave the door unchanged and take memory per ban to 48.8 B, past NFR-6's target |
-| The door's p99 and the ticket cycle on a quiet machine | Not possible during the pass (every core busy with other work); NFR-10 is met under that load; NFR-2 and NFR-3 wait for a quiet hour (`docs/READINESS-1.0.md`) |
+| The door's p99 on a quiet machine | The quietest window of the pass was a load of 43 to 69 on 32 cores: NFR-3 met there (48.7 ns at 32 threads, 1.05 times one thread) and NFR-10 met; NFR-2 estimated met (p50 180 to 191 ns, p99 890 to 953 ns at that load, about 75 and 340 ns scaled to 0.9's quieter run) and waits for an idle machine (`docs/READINESS-1.0.md`) |
 | Found on the way | The loom models' main-thread gap (D-129); a wall-clock bound that a busy machine broke (D-131) |
 
 Exit:

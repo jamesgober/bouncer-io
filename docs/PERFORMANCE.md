@@ -97,8 +97,8 @@ A checkpoint is as cheap as reading a flag (PLAN 11: within 10% of an `AtomicBoo
 | checkpoint slow path under 150 ns with 7 keys | p50 64.4 ns, p99 96.2 ns | met |
 | before commit under 5 ns | 0.2 ns | met |
 | transport egress under 3 ns | 1.3 ns | met |
-| door, 1,000,000 bans and 10,000 administrator prefixes: at most 150 ns median and 500 ns p99 per call for a cold random peer, on an idle machine (NFR-2, D-125) | per call with a nanosecond timer (Linux, `examples/door_p99.rs`, 1,000,000 distinct cold peers): at 0.9, p50 111 ns and p99 462 ns at best, on a host whose every core was busy; at 0.9.2 not measurable (a load average near 500 on 32 cores); warm, 0.9.2's `door_at` is 12 to 21% faster than 0.9.1's | to be measured on an idle machine |
-| ticket issue and release under 60 ns median at 32 threads, within 1.5 times one thread (NFR-3, D-125) | 42.4 ns at one thread on an idle core, 57.9 ns median at 32 (D-113, 0.9); 60.0 and 62.8 ns under full load at 0.9.2 (1.05 times), the ticket's code unchanged | met at 0.9 on an idle core; to be confirmed |
+| door, 1,000,000 bans and 10,000 administrator prefixes: at most 150 ns median and 500 ns p99 per call for a cold random peer, on an idle machine (NFR-2, D-125) | per call with a nanosecond timer (Linux, `examples/door_p99.rs`, 1,000,000 distinct cold peers): at 0.9, p50 111 ns and p99 462 ns at best, on a host whose every core was busy; at 0.9.2, at a load of 50 to 69 on 32 cores (2026-11-07), p50 180 to 191 ns and p99 890 to 953 ns, against 254 to 297 and 1,048 to 1,305 for 0.9.1 in the same window; scaled by that ratio to 0.9's run, an estimate of about 75 ns p50 and 340 ns p99 | estimated met; to be measured on an idle machine |
+| ticket issue and release under 60 ns median at 32 threads, within 1.5 times one thread (NFR-3, D-125) | 42.4 ns at one thread on an idle core, 57.9 ns median at 32 (D-113, 0.9); 60.0 and 62.8 ns under full load at 0.9.2 (1.05 times); 46.6 ns at one thread and 48.7 ns median at 32 (1.05 times) at a load of 43 on 32 cores (2026-11-07) | met |
 | bind under 30 ns each | about 27 ns (request and session bind 68.0, request alone 41.0) | met |
 | revoke under 1 µs | 134 ns (account, 0.9: a second slot write, D-116) | met |
 | ban insert under 500 ns | median 453 ns while the table fills to 1.2 million (fastest round 331) | met |
@@ -206,7 +206,18 @@ What did it:
 - **Administrator prefixes carry their reference** (D-127), computed when the set is built, so an administrator-covered peer is refused without a SipHash and, with the filter, without probing the automatic lengths.
 - **A reference hashes one word** (D-127): two SipHash rounds fewer per refusal.
 
-What it costs: a banned peer pays the filter before the probe, about 8% (7 ns) in this run, and 1.16 times 0.9.1's instructions (the gate's baseline records it, D-126).
+What it costs: a banned peer pays the filter before the probe, about 8% (7 ns) in this run, and 1.16 times 0.9.1's instructions (the gate's baseline records it, D-126). Cold, the cost is larger: a cold banned peer misses the cache twice, in the filter's block and then in the table's group.
+
+Per call with cold peers (`examples/door_p99.rs`, 1,000,000 distinct peers, pinned to one core, three runs alternating 0.9.1 and 0.9.2 on Linux at a load of 50 to 69 on 32 cores, 2026-11-07):
+
+| Case | 0.9.1 | 0.9.2 |
+|---|---:|---:|
+| admitted, p50 | 254 to 297 ns | 180 to 191 ns |
+| admitted, p99 | 1,048 to 1,305 ns | 890 to 953 ns |
+| banned, p50 | 296 to 351 ns | 466 to 477 ns |
+| banned, p99 | 847 to 947 ns | 1,112 to 1,135 ns |
+
+An admitted peer gets 33% faster at the median; a banned peer is refused 45% slower, still well under a microsecond at the median. Refusals are the rare case and the cheap one beside anything a server does with a connection it admits.
 
 Instructions per operation (Callgrind, `benches/gate.rs`, 0.9.2 against 0.9.1): door admitted 1,034 against 1,167 (-11.4%); door banned 988 against 852 (+16.1%); ban insert 5,950 against 5,859 (+1.6%); session bind, request cycle, and checkpoint unchanged.
 
@@ -241,7 +252,7 @@ The door with both rate tiers and 1,000,000 bans against the composition with it
 
 ## The NFR-10 target
 
-NFR-10 (PLAN D-125, decided by James on 2026-11-06): the door at least 20% faster than the same-rate-work composition for admitted peers, random peers, and peers near the bans, and at least twice its throughput at 32 threads. D-081's composition (one rate check) stays published, labelled. At 0.9.2, under full load from other work: 35.7%, 56.7%, and 59.8% faster by within-run ratio, and 35.7%, 31.5%, and 54.5% faster by the estimate from 0.9's idle ratios (above); 4.3 times the composition's throughput at 32 threads (133.5 M door checks a second against 31.3 M). Met; to be confirmed on an idle machine.
+NFR-10 (PLAN D-125, decided by James on 2026-11-06): the door at least 20% faster than the same-rate-work composition for admitted peers, random peers, and peers near the bans, and at least twice its throughput at 32 threads. D-081's composition (one rate check) stays published, labelled. At 0.9.2, under full load from other work: 35.7%, 56.7%, and 59.8% faster by within-run ratio, and 35.7%, 31.5%, and 54.5% faster by the estimate from 0.9's idle ratios (above); 4.3 times the composition's throughput at 32 threads (133.5 M door checks a second against 31.3 M). At a load of 43 on 32 cores (2026-11-07, `benches/threads.rs`, batch medians): admitted peers at one thread 159.1 ns against the composition's 200.4 (20.6% faster), and 6.3 times its throughput at 32 threads (25.7 M against 4.1 M a second, on Linux; the figures above are from another run and another load, so compare each pair within itself). Met; to be confirmed on an idle machine.
 
 ## The regression gate
 

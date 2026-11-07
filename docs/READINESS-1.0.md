@@ -23,7 +23,7 @@ Where bouncer-io stands after the pre-1.0 polish (0.9.0 to 0.9.2): what is done,
 
 ## Recommendation
 
-Go to the release candidates now: the three performance targets are decided (D-125) and met as far as a busy machine can show. Do not tag 1.0 until the per-call latency and the ticket cycle have been measured on an idle machine and the audit in `dev/DIRECTIVES.md` section 3 has passed.
+Go to the release candidates now: the three performance targets are decided (D-125) and met as far as a busy machine can show. The ticket cycle is met (NFR-3); do not tag 1.0 until the per-call latency has been measured on an idle machine and the audit in `dev/DIRECTIVES.md` section 3 has passed.
 
 ## The targets you decided (D-125)
 
@@ -32,8 +32,8 @@ On 2026-11-06 you accepted the recommended targets and asked for the door to be 
 | Target | Measured at 0.9.2 | Status |
 |---|---|---|
 | NFR-10: at least 20% faster than the same-rate-work composition for admitted, random, and near-the-bans peers; at least twice its throughput at 32 threads | 35.7%, 56.7%, and 59.8% faster by within-run ratio; 35.7%, 31.5%, and 54.5% faster by the estimate from 0.9's idle ratios; 4.3 times the throughput at 32 threads. Against D-081's composition (one rate check): 23.9%, 34.5%, and 40.2% faster by within-run ratio; 26.0%, 18.7%, and 42.9% by the estimate | Met. The 15% floor for random peers is not needed |
-| NFR-2: at most 150 ns median and 500 ns p99 per call, cold random peer, idle machine | Not measurable during this pass: the Linux machine's load average was near 500 on 32 cores and the per-call figures (p50 283 to 304 ns, p99 1.6 to 1.8 microseconds) measure queueing. At 0.9, with every core busy but far less load, the best run gave p50 111 ns and p99 462 ns, and 0.9.2's door is 12 to 21% faster than 0.9.1's | Open: one quiet hour |
-| NFR-3: ticket cycle under 60 ns median at 32 threads, within 1.5 times its one-thread cost | 62.8 ns at 32 threads and 60.0 at one (1.05 times), under full load; 57.9 and 42.4 ns on an idle core at 0.9, and the ticket's code is unchanged since | Ratio met. The 60 ns figure was met at 0.9 on an idle core; confirm it on the idle machine |
+| NFR-2: at most 150 ns median and 500 ns p99 per call, cold random peer, idle machine | At a load of 50 to 69 on 32 cores (the quietest window of the pass, with another project's soak and fuzzers still running): p50 180 to 191 ns and p99 890 to 953 ns, against 254 to 297 and 1,048 to 1,305 ns for 0.9.1 alternating in the same window. At 0.9, on a quieter machine, the best run gave p50 111 ns and p99 462 ns; scaled by today's ratio, 0.9.2 would give about 75 ns and 340 ns there (an estimate). A cold banned peer is refused at p50 466 to 477 ns (0.9.1: 296 to 351), two cache misses instead of one | Estimated met. Open: the measurement on an idle machine |
+| NFR-3: ticket cycle under 60 ns median at 32 threads, within 1.5 times its one-thread cost | 48.7 ns median at 32 threads and 46.6 at one (1.05 times) at a load of 43 on 32 cores; 62.8 and 60.0 ns under full load | Met |
 
 ## Done
 
@@ -70,7 +70,7 @@ On 2026-11-06 you accepted the recommended targets and asked for the door to be 
 
 | Item | Why it stays | Cost of leaving it | Cost of closing it |
 |---|---|---|---|
-| Per-call latency and the ticket cycle on an idle machine | Every core of the measurement machine was busy with other work through 0.9 and 0.9.2 (other sessions' soak and fuzz runs) | NFR-2 is not yet shown on an idle machine; the other figures are upper bounds | One quiet hour on the reference machine |
+| Per-call latency on an idle machine | Every core of the measurement machine was busy with other work through 0.9 and 0.9.2 (other sessions' soak and fuzz runs); the quietest window, a load of 43 to 69 on 32 cores, met NFR-3 and gave NFR-2 only as an estimate | NFR-2 is not yet shown on an idle machine; the other figures are upper bounds | One quiet hour on the reference machine |
 | net-io on Windows can drop the denial after a revocation | net-io closes abortively after a denial (to cut the connection at once); on Windows a pending send is discarded (4 in 50 loopback runs; never on Linux) | A Windows client sees a reset instead of the 403 now and then; nothing of the response leaks either way | net-io 0.8 (its D-182, built, not yet published): a bounded soft close after a denial, capped in number so a denial storm cannot hold slots. bouncer adopts it when it publishes |
 | `NetIoEjector` aborts instead of flushing | net-io can close a connection by id only abortively | A denial on an ejected connection is not delivered; the connection is cut | net-io 0.8's `close_after_flush` (the same release) |
 | serve-net's envelope has no gate tag | serve-net's change | Each integration keeps a small map from connection id to tag (the example shows it) | An accessor in serve-net (a small additive release) |
@@ -85,7 +85,7 @@ On 2026-11-06 you accepted the recommended targets and asked for the door to be 
 
 ## What 1.0 needs, in order
 
-1. The per-call latency (NFR-2) and the ticket cycle (NFR-3) measured on an idle machine. Tighten NFR-2 to the measured value plus a stated margin if it comes in well under (D-125).
+1. The per-call latency (NFR-2) measured on an idle machine. Tighten NFR-2 to the measured value plus a stated margin if it comes in well under (D-125).
 2. The beta: the release candidates used end to end by the web stack and one non-HTTP service, with no API change needed for two of them (ROADMAP).
 3. The full audit of `dev/DIRECTIVES.md` section 3.
 4. Your go.
