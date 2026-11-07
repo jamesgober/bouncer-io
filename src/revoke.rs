@@ -544,7 +544,8 @@ impl Revocations {
         match self.table.find(key, 0) {
             Probe::Hit(e) if e.id > since => Some(Hit::from_entry(&e)),
             Probe::Hit(_) => None,
-            // A slot rewritten for longer than the spin bound: fail closed.
+            // A slot held by its writer past the read bound (D-132): fail
+            // closed.
             Probe::Busy => Some(Hit {
                 code: DenialCode::Unavailable,
                 keep_connection: false,

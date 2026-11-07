@@ -31,6 +31,14 @@ impl HashKey {
         self.hash3_rounds::<1, 3>(a, b, c)
     }
 
+    /// SipHash-1-3 over one word.
+    #[inline]
+    pub(crate) fn hash1(&self, a: u64) -> u64 {
+        let mut s = State::new(self.k0, self.k1);
+        s.word::<1>(a);
+        s.finish::<1, 3>(8)
+    }
+
     /// A keyed multiply mix of two words: two folded multiplies.
     #[inline]
     pub(crate) fn mix2(&self, a: u64, b: u64) -> u64 {
@@ -55,6 +63,13 @@ impl HashKey {
 
 /// An odd constant (the 64-bit golden ratio) folded into the second key word.
 const MIX_C: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// One folded multiply of `x` by an odd constant: an unkeyed mix of a word
+/// that is already keyed (the door filter's per-key bits).
+#[inline]
+pub(crate) fn remix(x: u64) -> u64 {
+    fold(x, MIX_C)
+}
 
 /// The high and low words of a 128-bit product, folded together.
 #[inline]

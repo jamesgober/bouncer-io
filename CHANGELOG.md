@@ -11,6 +11,29 @@
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-11-06
+
+### Security
+
+- Persistence rollback is detected (D-128). With a `VersionAnchor` kept outside the store, a store put back from an older backup, or a journal cut after a whole batch, is refused at load (`PersistError::RolledBack`, `persist.rolled_back`) instead of bringing back lifted bans and losing newer ones. `FileAnchor` keeps the version in one small file; `BouncerBuilder::version_anchor` sets it. Without an anchor, nothing changes.
+
+### Added
+
+- `VersionAnchor`, `StoreVersion`, `FileAnchor`, `BouncerBuilder::version_anchor`, `PersistError::RolledBack`, and `signals::PERSIST_ROLLED_BACK`.
+
+### Changed
+
+- The door checks a blocked Bloom filter before the ban table (D-126), so most peers with no ban at any of their lengths never read the table, and the table probes only the lengths that may hold one. Alternating on one pinned core against 0.9.1: `door_at` 12 to 28% faster for admitted and random peers; banned peers about 15 ns slower, since they pay the filter first. Memory per ban 37.7 to 39.6 B.
+- A peer covered by an administrator prefix is refused without hashing a reference (computed when the set is built) and without probing the automatic lengths unless the filter says one may hold a ban (D-127): about 28% faster. Which ban answers is unchanged.
+- References are keyed SipHash-1-3 of the ban id alone. They were never stable across seeds, and are not now.
+- NFR-2, NFR-3, and NFR-10 are the targets James decided on 2026-11-06 (D-125).
+
+### Fixed
+
+- A writer preempted inside a slot write no longer gets unrelated requests revoked (D-132). Readers gave up on a held slot after about 4 microseconds and failed closed, and a revocation probe that fails closed revokes the whole connection; on a busy machine that revoked requests nobody had revoked (2 of 40 stress runs on 0.9.1). Readers now wait for the writer to run again, yielding and then sleeping, for up to one second first.
+- Every loom model spawns each participant (D-129). Models whose main thread acted right after a spawn never explored the other side running first; they pass with every schedule explored.
+- `test_full_tracker_forgets_oldest_in_constant_time` bounds time by a ratio within the run, not by five seconds of wall clock, which a busy machine exceeded (D-131).
+
 ## [0.9.1] - 2026-11-06
 
 ### Security
@@ -368,7 +391,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/jamesgober/bouncer-io/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/jamesgober/bouncer-io/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/jamesgober/bouncer-io/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/bouncer-io/compare/v0.7.0...v0.8.0

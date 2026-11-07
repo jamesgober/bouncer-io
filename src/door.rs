@@ -34,7 +34,7 @@ use crate::{
 pub enum Refusal {
     /// A ban covers the address. `reference` finds it in events and
     /// `explain`. A reference of zero means a ban slot was being rewritten for
-    /// longer than the bound and the door failed closed.
+    /// longer than the read bound (one second) and the door failed closed.
     Banned {
         /// The ban's reference.
         reference: Reference,
@@ -220,6 +220,9 @@ impl Shared {
             Lookup::Banned(id) => Judgement::Refuse(Refusal::Banned {
                 reference: self.reference(id),
             }),
+            Lookup::Admin(reference) => Judgement::Refuse(Refusal::Banned {
+                reference: Reference::new(reference),
+            }),
             Lookup::Busy => Judgement::Refuse(Refusal::Banned {
                 reference: Reference::new(0),
             }),
@@ -228,7 +231,7 @@ impl Shared {
 
     /// The stable reference of a ban.
     pub(crate) fn reference(&self, id: u64) -> Reference {
-        Reference::new(self.references.hash3(id, 0, 0) | 1)
+        Reference::new(crate::bans::reference_of(&self.references, id))
     }
 }
 

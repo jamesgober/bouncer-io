@@ -429,19 +429,30 @@ mod tests {
     fn test_full_tracker_forgets_oldest_in_constant_time() {
         let policy = EscalationPolicy::default();
         let mut t = Tracker::default();
-        let started = std::time::Instant::now();
-        // Three times the bound, one child per /24: every note is a new parent.
-        for i in 0..(3 * MAX_PARENTS as u32) {
-            let child = v4(0x0a00_0001 | (i << 8));
-            let parent = child.parent(24).unwrap();
-            assert!(t.note(&policy, parent, child, 0).is_none());
+        // Three times the bound, one child per /24: every note is a new
+        // parent. The first third fills the tracker; each note after it
+        // forgets one. Forgetting by a scan would make those notes thousands
+        // of times slower than the filling ones; the bound is a ratio, so a
+        // busy machine slows both sides alike.
+        let mut took = [std::time::Duration::ZERO; 3];
+        for (third, spent) in took.iter_mut().enumerate() {
+            let started = std::time::Instant::now();
+            for j in 0..MAX_PARENTS as u32 {
+                let i = third as u32 * MAX_PARENTS as u32 + j;
+                let child = v4(0x0a00_0001 | (i << 8));
+                let parent = child.parent(24).unwrap();
+                assert!(t.note(&policy, parent, child, 0).is_none());
+            }
+            *spent = started.elapsed();
         }
         assert!(t.parents.len() <= MAX_PARENTS);
         assert!(t.order.len() <= 2 * MAX_PARENTS);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "{:?}",
-            started.elapsed()
+            took[1].max(took[2]) < took[0] * 20,
+            "filling {:?}, forgetting {:?} and {:?}",
+            took[0],
+            took[1],
+            took[2]
         );
         // The newest parents are kept, so an attack in progress still escalates.
         let last = 3 * MAX_PARENTS as u32 - 1;
