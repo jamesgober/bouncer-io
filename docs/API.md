@@ -18,7 +18,7 @@
 
 The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every item lists its tier, its grade, the version that brings it, and what it costs. The rustdoc on [docs.rs](https://docs.rs/bouncer-io) becomes the exhaustive reference as each item lands; until then this file is the contract.
 
-> **Status: `0.9.1` (alpha).** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. The net-io feature arrived at 0.8; 0.9 is the pre-1.0 polish.
+> **Status: `0.9.2` (alpha).** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. The net-io feature arrived at 0.8; 0.9 is the pre-1.0 polish.
 
 **Reading the item headers.** *Tier 1* is the simple surface (one-line constructors, no builder), *Tier 2* is configuration, *Tier 3* is the full surface for integrations and other libraries. *P0* is required for the crate's job, *P1* is what users of the best existing tools expect, *P2* is high value for serious deployments, *P3* comes after 1.0. Costs are targets, marked `[est.]` until they are measured at 0.6.
 
@@ -70,7 +70,7 @@ The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every 
 - [Events](#events)
   - [`EventSink` and `NoSink`](#eventsink-and-nosink) · [`Event`](#event) · [`SignalId`, `Category`, `Subject`](#signalid-category-subject) · [Signal catalog](#signal-catalog)
 - [Persistence](#persistence)
-  - [`Persistence`](#persistence-1) · [`FilePersistence`](#filepersistence) · [`LoadFailure`](#loadfailure) · [`PersistError`](#persisterror)
+  - [`Persistence`](#persistence-1) · [`FilePersistence`](#filepersistence) · [`VersionAnchor`](#versionanchor) · [`LoadFailure`](#loadfailure) · [`PersistError`](#persisterror)
 - [Sharing across nodes](#sharing-across-nodes)
   - [`NodeId`](#nodeid) · [`Delta` and `Sequence`](#delta-and-sequence) · [`ImportReport`](#importreport) · [Merge rules](#merge-rules)
 - [Posture, time, maintenance, health](#posture-time-maintenance-health)
@@ -734,6 +734,7 @@ impl BouncerBuilder {
     pub fn maintainer(self, spawn: bool) -> Self;
     pub fn persistence(self, store: Box<dyn Persistence>) -> Self;
     pub fn mac_key(self, key: [u8; 32]) -> Self;
+    pub fn version_anchor(self, anchor: Box<dyn VersionAnchor>) -> Self;
     pub fn on_load_failure(self, policy: LoadFailure) -> Self;
     pub fn node(self, id: NodeId) -> Self;
     pub fn strict_budget_divisor(self, divisor: u8) -> Self;
@@ -774,7 +775,8 @@ Tier 2 throughout, except `epoch`, `clock`, and `seed` (Tier 3). Every setter is
 | `maintainer` | spawn one maintenance thread that parks until work is due (no idle wake-ups) | `false` | `Spawn(kind)` | P1 | 0.4 |
 | `persistence` | where bans and offender memory survive restarts | none (memory only) | `Persist(..)` when the load fails and the policy is `Refuse` | P1 | 0.5 |
 | `mac_key` | key for the keyed BLAKE3 MAC over snapshot and journal (from the integrator's key store) | none (CRC32C only) | none | P1 | 0.5 |
-| `on_load_failure` | what to do when persisted state is corrupt | `LoadFailure::Refuse` | none | P1 | 0.5 |
+| `version_anchor` | where the store's latest version is kept, apart from the store, so a store restored from an older backup or with its journal cut is refused at load | none (a rollback is not detected) | none | P1 | 0.9.2 |
+| `on_load_failure` | what to do when persisted state is corrupt, tampered with, or rolled back | `LoadFailure::Refuse` | none | P1 | 0.5 |
 | `node` | this node's id, stamped on every record it exports | unset (sharing disabled) | `Config(..)` for id 0 | P2 | 0.5 |
 | `max_clock_skew` | imported records stamped further in the future than this are refused | 5 minutes | `Config(..)` | P2 | 0.5 |
 | `strict_budget_divisor` | how much `Posture::Strict` divides the door budgets by | 2 | `Config(InvalidFactor)` for 0 | P2 | 0.5 |
@@ -2200,6 +2202,7 @@ pub mod signals { pub const DOOR_REFUSED_BAN: SignalId; /* one constant per row 
 | 50 | `PERSIST_FAILED` | `bouncer.persist.failed` | integrity | 6.0 | write or load failure |
 | 51 | `IMPORT_REJECTED` | `bouncer.import.rejected` | integrity | 5.0 | a delta or one of its records was refused |
 | 52 | `PERSIST_WALL_JUMP` | `bouncer.persist.wall_jump` | integrity | 5.0 | the wall clock moved backwards, or forwards past `max_wall_jump`, between save and load |
+| 53 | `PERSIST_ROLLED_BACK` | `bouncer.persist.rolled_back` | integrity | 8.0 | the store is older than its `VersionAnchor` says was written: restored from a backup, or its journal cut (arrives at 0.9.2) |
 | 60 | `TABLE_RESEEDED` | `bouncer.table.reseeded` | abuse | 6.0 | a probe sequence passed its bound; the table was rebuilt with a new seed (arrives at 0.6) |
 
 Ids never change meaning; a changed detection bumps the revision.
@@ -2240,6 +2243,31 @@ Tier 2 · P1 · 0.5
 
 Crash-safe files: the snapshot is written to `name.tmp`, synced, renamed over `name`, and the directory is synced on Unix; Windows rename replaces the target. Tested by killing the process at random points during writes on Linux, macOS, and Windows.
 
+### `VersionAnchor`
+
+```rust
+#[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct StoreVersion { pub epoch: u64, pub batches: u64 }
+impl StoreVersion {
+    pub const fn new(epoch: u64, batches: u64) -> StoreVersion;
+    pub const fn to_bytes(self) -> [u8; 16];
+    pub const fn from_bytes(bytes: [u8; 16]) -> StoreVersion;
+}
+
+pub trait VersionAnchor: Send {
+    fn read(&mut self) -> Result<Option<StoreVersion>, PersistError>;
+    fn write(&mut self, version: StoreVersion) -> Result<(), PersistError>;
+}
+
+pub struct FileAnchor { /* path */ }
+impl FileAnchor { pub fn open(path: &Path) -> FileAnchor; }
+impl VersionAnchor for FileAnchor;
+```
+
+Tier 3 · P1 · 0.9.2 · off the hot path: one small write after each synced journal batch (at most one a second) and each new snapshot
+
+A store's version is its snapshot's epoch and the journal batches written since; every compaction moves to a higher epoch. bouncer writes the version to the anchor after the store has made it durable, so the anchor is never ahead of the store, and checks it at load. A store with a lower version (put back from an older backup, a journal cut after a whole batch, or a missing store) is refused with `PersistError::RolledBack` under `LoadFailure::Refuse`; under `LoadFailure::LoadEmpty` memory starts empty and the next snapshot moves past the anchor. Either way `persist.rolled_back` is reported. An anchor that holds nothing yet (the first start with one) takes the store as it is. Keep the anchor where a restore of the store does not reach: another volume, another machine, a database row, or a hardware counter. `FileAnchor` keeps it in one 24-byte file (magic, version, CRC32C), written to `path.tmp`, synced, and renamed. After a deliberate restore, delete the anchor. Tested by restoring an older store, cutting the journal, and killing the writer at random points (a kill never leaves the anchor ahead).
+
 ### `LoadFailure`
 
 ```rust
@@ -2249,13 +2277,13 @@ pub enum LoadFailure { #[default] Refuse, LoadEmpty }
 
 Tier 2 · P1 · 0.5
 
-`Refuse` (fail closed): a corrupt or tampered snapshot makes `try_build` return `Persist(..)` and the service does not start without its bans. `LoadEmpty` starts with empty memory and reports the failure. A torn journal tail (the last record cut short by a crash) is not a failure: replay stops there and the event says how much was lost.
+`Refuse` (fail closed): a corrupt, tampered, or rolled-back snapshot makes `try_build` return `Persist(..)` and the service does not start without its bans. `LoadEmpty` starts with empty memory and reports the failure. A torn journal tail (the last record cut short by a crash) is not a failure: replay stops there and the event says how much was lost.
 
 ### `PersistError`
 
 ```rust
 #[non_exhaustive] #[derive(Debug)]
-pub enum PersistError { Io(std::io::ErrorKind), Corrupt { offset: u64 }, Truncated, UnsupportedFormat(u16), TooLarge, Mac }
+pub enum PersistError { Io(std::io::ErrorKind), Corrupt { offset: u64 }, Truncated, UnsupportedFormat(u16), TooLarge, Mac, RolledBack { store: StoreVersion, anchor: StoreVersion } }
 ```
 
 Tier 2 · P1 · 0.5
@@ -2268,6 +2296,7 @@ Tier 2 · P1 · 0.5
 | `UnsupportedFormat(v)` | written by a newer version | upgrade, or export from the newer node |
 | `TooLarge` | bigger than the configured tables | raise `ban_capacity` |
 | `Mac` | the MAC does not match: tampered, or the wrong key | treat as an incident; check the key |
+| `RolledBack { store, anchor }` | the store is older than the version last written | treat as an incident; restore the current store, or delete the anchor if the restore was deliberate |
 
 ---
 

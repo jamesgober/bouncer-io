@@ -103,9 +103,19 @@ fn test_hammering_one_shard_while_banning_and_lifting() {
             }
         }));
     }
+    // Both sides must make progress: run for half a second and until each
+    // has done 100 rounds. A busy machine stretches the time, not the count.
     let started = Instant::now();
     let mut ops = 0u32;
-    while started.elapsed() < Duration::from_millis(500) {
+    while started.elapsed() < Duration::from_millis(500)
+        || ops <= 100
+        || checks.load(Ordering::Relaxed) <= 100
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "no progress in two minutes: {ops} bans, {} checks",
+            checks.load(Ordering::Relaxed)
+        );
         let addr = IpAddr::from([198, 51, (ops >> 8) as u8, ops as u8]);
         b.ban(addr).unwrap();
         assert!(b.door(addr).is_err(), "refused once ban returns");

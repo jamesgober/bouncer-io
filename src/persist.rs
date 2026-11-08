@@ -13,8 +13,8 @@
 //! journal batch's MAC covers the previous MAC and the batch, so batches
 //! cannot be altered, reordered, dropped from the middle, or spliced in from
 //! another file without the key. Cutting the journal after a whole batch,
-//! or putting back an older snapshot and journal together, is not detected:
-//! that needs a counter kept outside the files (see `docs/SECURITY.md`). A
+//! or putting back an older snapshot and journal together, is detected with
+//! a [`VersionAnchor`] kept outside the files, and not without one. A
 //! batch from another epoch (left by a crash during compaction)
 //! is ignored. Writing happens off the hot path: changes queue in memory
 //! and the maintainer writes and syncs them about every second.
@@ -135,6 +135,228 @@ pub enum LoadFailure {
     Refuse,
     /// Start with empty memory and report the failure.
     LoadEmpty,
+}
+
+/// How far a store has been written: its snapshot's epoch and the journal
+/// batches written since. Every compaction moves to a higher epoch and every
+/// synced batch adds one, so a store put back from an older backup, or a
+/// journal cut after a whole batch, has a lower version than the last one
+/// written. Versions order by epoch, then batches.
+///
+/// # Examples
+///
+/// ```
+/// use bouncer_io::StoreVersion;
+/// let v = StoreVersion::new(7, 3);
+/// assert!(v < StoreVersion::new(7, 4) && v < StoreVersion::new(8, 0));
+/// assert_eq!(StoreVersion::from_bytes(v.to_bytes()), v);
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct StoreVersion {
+    /// The snapshot's epoch.
+    pub epoch: u64,
+    /// Journal batches written in that epoch.
+    pub batches: u64,
+}
+
+impl StoreVersion {
+    /// A version.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let v = bouncer_io::StoreVersion::new(7, 3);
+    /// assert_eq!((v.epoch, v.batches), (7, 3));
+    /// ```
+    #[must_use]
+    pub const fn new(epoch: u64, batches: u64) -> StoreVersion {
+        StoreVersion { epoch, batches }
+    }
+
+    /// The version as 16 bytes (little-endian epoch, then batches), for an
+    /// anchor to keep.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let bytes = bouncer_io::StoreVersion::new(1, 2).to_bytes();
+    /// assert_eq!((bytes[0], bytes[8]), (1, 2));
+    /// ```
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 16] {
+        let e = self.epoch.to_le_bytes();
+        let b = self.batches.to_le_bytes();
+        let mut out = [0u8; 16];
+        let mut i = 0;
+        while i < 8 {
+            out[i] = e[i];
+            out[8 + i] = b[i];
+            i += 1;
+        }
+        out
+    }
+
+    /// The version [`to_bytes`](Self::to_bytes) wrote.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::StoreVersion;
+    /// assert_eq!(StoreVersion::from_bytes([0; 16]), StoreVersion::new(0, 0));
+    /// ```
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> StoreVersion {
+        let mut e = [0u8; 8];
+        let mut b = [0u8; 8];
+        let mut i = 0;
+        while i < 8 {
+            e[i] = bytes[i];
+            b[i] = bytes[8 + i];
+            i += 1;
+        }
+        StoreVersion {
+            epoch: u64::from_le_bytes(e),
+            batches: u64::from_le_bytes(b),
+        }
+    }
+}
+
+/// Keeps the latest [`StoreVersion`] somewhere a restore of the store does
+/// not reach: another disk or machine, a database row, a hardware counter.
+///
+/// bouncer writes the version after every synced journal batch and every
+/// new snapshot, and checks it at load. A store whose version is lower was
+/// put back from an older backup or had its journal cut, and would bring
+/// back lifted bans and forget newer ones: it is refused (or, with
+/// [`LoadFailure::LoadEmpty`], memory starts empty), and
+/// `persist.rolled_back` is reported. An anchor that holds nothing (the
+/// first start with it) takes the store as it is. One anchor serves one
+/// store. After a deliberate restore, clear the anchor.
+///
+/// # Examples
+///
+/// ```
+/// use bouncer_io::{PersistError, StoreVersion, VersionAnchor};
+///
+/// /// Keeps the version in memory (tests).
+/// #[derive(Default)]
+/// struct InMemory(Option<StoreVersion>);
+///
+/// impl VersionAnchor for InMemory {
+///     fn read(&mut self) -> Result<Option<StoreVersion>, PersistError> { Ok(self.0) }
+///     fn write(&mut self, version: StoreVersion) -> Result<(), PersistError> {
+///         self.0 = Some(version);
+///         Ok(())
+///     }
+/// }
+/// let mut anchor = InMemory::default();
+/// anchor.write(StoreVersion::new(1, 0))?;
+/// assert_eq!(anchor.read()?, Some(StoreVersion::new(1, 0)));
+/// # Ok::<(), PersistError>(())
+/// ```
+pub trait VersionAnchor: Send {
+    /// The latest version written, or `None` when there is none yet.
+    ///
+    /// # Errors
+    ///
+    /// `Io` when the anchor's store fails; `Corrupt` when what it holds is
+    /// damaged.
+    fn read(&mut self) -> Result<Option<StoreVersion>, PersistError>;
+
+    /// Records `version` durably. Called only after the store has made that
+    /// version durable, so the anchor is never ahead of the store.
+    ///
+    /// # Errors
+    ///
+    /// `Io` when the anchor's store fails.
+    fn write(&mut self, version: StoreVersion) -> Result<(), PersistError>;
+}
+
+/// The anchor's file: magic, the version, and a CRC32C.
+const ANCHOR_MAGIC: [u8; 4] = *b"BNCV";
+const ANCHOR_LEN: usize = 4 + 16 + 4;
+
+/// A [`VersionAnchor`] in one small file, written to `path.tmp`, synced,
+/// and renamed over `path`. Keep it off the volume and out of the backups
+/// that hold the store, or a restore puts back the anchor too.
+///
+/// # Examples
+///
+/// ```
+/// use bouncer_io::{FileAnchor, StoreVersion, VersionAnchor};
+/// let path = std::env::temp_dir().join(format!("bouncer-io-doc-anchor-{}", std::process::id()));
+/// let mut anchor = FileAnchor::open(&path);
+/// anchor.write(StoreVersion::new(3, 1))?;
+/// assert_eq!(FileAnchor::open(&path).read()?, Some(StoreVersion::new(3, 1)));
+/// # std::fs::remove_file(&path).ok();
+/// # Ok::<(), bouncer_io::PersistError>(())
+/// ```
+#[derive(Debug)]
+pub struct FileAnchor {
+    path: PathBuf,
+    tmp: PathBuf,
+}
+
+impl FileAnchor {
+    /// The anchor at `path` (created on the first write).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{FileAnchor, VersionAnchor};
+    /// let mut anchor = FileAnchor::open(&std::env::temp_dir().join("bouncer-io-no-such-anchor"));
+    /// assert_eq!(anchor.read()?, None);
+    /// # Ok::<(), bouncer_io::PersistError>(())
+    /// ```
+    #[must_use]
+    pub fn open(path: &Path) -> FileAnchor {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        FileAnchor {
+            path: path.to_path_buf(),
+            tmp: PathBuf::from(tmp),
+        }
+    }
+}
+
+impl VersionAnchor for FileAnchor {
+    fn read(&mut self) -> Result<Option<StoreVersion>, PersistError> {
+        let Some(bytes) = FilePersistence::read(&self.path)? else {
+            return Ok(None);
+        };
+        if bytes.len() != ANCHOR_LEN || bytes[..4] != ANCHOR_MAGIC {
+            return Err(PersistError::Corrupt { offset: 0 });
+        }
+        let crc = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        if codec::crc32c(&bytes[..20]) != crc {
+            return Err(PersistError::Corrupt { offset: 20 });
+        }
+        let mut v = [0u8; 16];
+        v.copy_from_slice(&bytes[4..20]);
+        Ok(Some(StoreVersion::from_bytes(v)))
+    }
+
+    fn write(&mut self, version: StoreVersion) -> Result<(), PersistError> {
+        let mut out = Vec::with_capacity(ANCHOR_LEN);
+        out.extend_from_slice(&ANCHOR_MAGIC);
+        out.extend_from_slice(&version.to_bytes());
+        let crc = codec::crc32c(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        {
+            let mut f = File::create(&self.tmp).map_err(|e| io(&e))?;
+            f.write_all(&out).map_err(|e| io(&e))?;
+            f.sync_all().map_err(|e| io(&e))?;
+        }
+        std::fs::rename(&self.tmp, &self.path).map_err(|e| io(&e))?;
+        #[cfg(unix)]
+        if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            File::open(dir)
+                .and_then(|d| d.sync_all())
+                .map_err(|e| io(&e))?;
+        }
+        Ok(())
+    }
 }
 
 /// Crash-safe files: `name` (the snapshot) and `name.journal` in a
@@ -463,6 +685,8 @@ pub(crate) struct Replay {
     pub(crate) last_wall: Option<u64>,
     /// Bytes of valid batches of this epoch.
     pub(crate) bytes: u64,
+    /// Valid batches of this epoch.
+    pub(crate) batches: u64,
 }
 
 /// Replays the batches of `epoch` in order, from the snapshot's chain.
@@ -535,6 +759,7 @@ pub(crate) fn replay(
         out.records.extend(batch);
         out.last_wall = Some(wall);
         out.bytes += total as u64;
+        out.batches += 1;
         pos += total;
     }
     out.lost = (journal.len() - pos) as u64;
@@ -548,6 +773,24 @@ pub(crate) struct State {
     pub(crate) journal_bytes: u64,
     pub(crate) last_flush: Now,
     pub(crate) failed: Option<std::io::ErrorKind>,
+    /// Batches written in this epoch.
+    pub(crate) batches: u64,
+    pub(crate) anchor: Option<Box<dyn VersionAnchor>>,
+}
+
+impl State {
+    /// The version the store holds now.
+    pub(crate) fn version(&self) -> StoreVersion {
+        StoreVersion::new(self.epoch, self.batches)
+    }
+
+    /// Records the store's version in the anchor, once the store has made
+    /// it durable. `false` when the anchor failed (the store is still
+    /// fine; the next write records the version again).
+    pub(crate) fn advance_anchor(&mut self) -> bool {
+        let v = self.version();
+        self.anchor.as_mut().is_none_or(|a| a.write(v).is_ok())
+    }
 }
 
 /// A bouncer's persistence: the store, the queue, and the writing state.
@@ -561,7 +804,11 @@ pub(crate) struct Persist {
 }
 
 impl Persist {
-    pub(crate) fn new(store: Box<dyn Persistence>, key: Option<[u8; 32]>) -> Persist {
+    pub(crate) fn new(
+        store: Box<dyn Persistence>,
+        key: Option<[u8; 32]>,
+        anchor: Option<Box<dyn VersionAnchor>>,
+    ) -> Persist {
         Persist {
             store: Mutex::new(store),
             queue: Mutex::new(VecDeque::with_capacity(QUEUE)),
@@ -572,6 +819,8 @@ impl Persist {
                 journal_bytes: 0,
                 last_flush: Now::default(),
                 failed: None,
+                batches: 0,
+                anchor,
             }),
             backlog: std::sync::atomic::AtomicU32::new(0),
             dropped: std::sync::atomic::AtomicU64::new(0),

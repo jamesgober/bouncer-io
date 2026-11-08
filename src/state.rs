@@ -16,7 +16,7 @@ use crate::{
     events::{Emit, signals},
     keys::BanKey,
     ledger::{Applied, Contribution, Ledger, Scope},
-    persist::{self, Header, LoadFailure, Persist, Persistence, State},
+    persist::{self, Header, LoadFailure, Persist, Persistence, State, StoreVersion},
     revoke::{RevokeMode, Target},
     share::{Delta, ImportReport, Sequence},
     time::Now,
@@ -700,16 +700,31 @@ impl Shared {
         let Some(p) = &self.persist else {
             return Ok(());
         };
+        let mut state = p
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut store = p
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let anchored = state.anchor.as_mut().map_or(Ok(None), |a| a.read());
+        // A new epoch never falls below the anchor's.
+        let floor = anchored.as_ref().ok().copied().flatten();
         let loaded = (|| -> Result<Option<_>, PersistError> {
+            let anchor = anchored?;
+            // The store must hold at least what the anchor says was written;
+            // a missing store holds nothing.
+            let behind = |store: StoreVersion| match anchor {
+                Some(anchor) if store < anchor => Err(PersistError::RolledBack { store, anchor }),
+                _ => Ok(()),
+            };
             let Some(bytes) = store.load()? else {
                 if !store.journal()?.is_empty() {
                     // A journal with no snapshot: the snapshot was lost.
                     return Err(PersistError::Truncated);
                 }
+                behind(StoreVersion::default())?;
                 return Ok(None);
             };
             let (h, records, tag) = persist::decode_snapshot(&bytes, p.key.as_ref())?;
@@ -717,12 +732,17 @@ impl Shared {
             let journal = store.journal()?;
             let chain = if p.key.is_some() { tag } else { [0; 32] };
             let rep = persist::replay(&journal, h.epoch, p.key.as_ref(), chain);
+            behind(StoreVersion::new(h.epoch, rep.batches))?;
             Ok(Some((h, records, rep, journal.len() as u64)))
         })();
-        let mut state = p
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(PersistError::RolledBack { .. }) = loaded {
+            Emit {
+                reason: Reason::ADMIN,
+                ..Emit::new(signals::PERSIST_ROLLED_BACK)
+            }
+            .send(self);
+        }
+        let fresh = |wall_ms: u64| floor.map_or(wall_ms, |f| wall_ms.max(f.epoch));
         state.last_flush = self.now();
         let now_wall = unix(self.wall());
         match loaded {
@@ -758,6 +778,7 @@ impl Shared {
                 state.epoch = h.epoch;
                 state.chain = rep.chain;
                 state.journal_bytes = rep.bytes;
+                state.batches = rep.batches;
                 if rep.lost > 0 || ctx.full > 0 {
                     Emit {
                         reason: Reason::ADMIN,
@@ -771,10 +792,12 @@ impl Shared {
                 // appended to it: start a clean journal on a new snapshot.
                 if rep.bytes != journal_len || h.format < persist::SNAPSHOT_FORMAT {
                     self.compact_locked(p, &mut **store, &mut state)?;
+                } else if floor != Some(state.version()) && !state.advance_anchor() {
+                    self.report_persist_failure();
                 }
             }
             Ok(None) => {
-                state.epoch = self.wall_ms();
+                state.epoch = fresh(self.wall_ms());
                 self.compact_locked(p, &mut **store, &mut state)?;
             }
             Err(e) => {
@@ -786,7 +809,7 @@ impl Shared {
                     ..Emit::new(signals::PERSIST_FAILED)
                 }
                 .send(self);
-                state.epoch = self.wall_ms();
+                state.epoch = fresh(self.wall_ms());
                 self.compact_locked(p, &mut **store, &mut state)?;
             }
         }
@@ -816,7 +839,11 @@ impl Shared {
                 state.epoch = epoch;
                 state.chain = tag;
                 state.journal_bytes = 0;
+                state.batches = 0;
                 state.failed = None;
+                if !state.advance_anchor() {
+                    self.report_persist_failure();
+                }
                 Ok(())
             }
             Err(e) => {
@@ -880,6 +907,10 @@ impl Shared {
             }
             state.chain = chain;
             state.journal_bytes += bytes.len() as u64;
+            state.batches += 1;
+            if !state.advance_anchor() {
+                self.report_persist_failure();
+            }
         }
         state.last_flush = now;
         if Persist::wants_compaction(&state) {

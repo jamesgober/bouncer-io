@@ -403,16 +403,21 @@ mod loom_tests {
                 };
                 counts.words[i].store(w, Ordering::Relaxed);
             }
+            // Both sides spawned, so loom also runs either one first (D-129).
             let other = loom::sync::Arc::clone(&counts);
             let t = loom::thread::spawn(move || {
                 if other.acquire(b, 10, || false) == Ok(true) {
                     other.release(b);
                 }
             });
-            if counts.acquire(a, 10, || false) == Ok(true) {
-                counts.release(a);
-            }
+            let mine = loom::sync::Arc::clone(&counts);
+            let u = loom::thread::spawn(move || {
+                if mine.acquire(a, 10, || false) == Ok(true) {
+                    mine.release(a);
+                }
+            });
             t.join().unwrap();
+            u.join().unwrap();
             let live: u64 = counts
                 .words
                 .iter()

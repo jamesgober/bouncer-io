@@ -208,6 +208,7 @@ const fn catalog(id: u32) -> (&'static str, Category, f32) {
         50 => ("bouncer.persist.failed", Category::Integrity, 6.0),
         51 => ("bouncer.import.rejected", Category::Integrity, 5.0),
         52 => ("bouncer.persist.wall_jump", Category::Integrity, 5.0),
+        53 => ("bouncer.persist.rolled_back", Category::Integrity, 8.0),
         60 => ("bouncer.table.reseeded", Category::Abuse, 6.0),
         _ => ("bouncer.unknown", Category::Unknown, 0.0),
     }
@@ -273,6 +274,9 @@ pub mod signals {
     /// The wall clock jumped between save and load (backwards, or forwards
     /// past `max_wall_jump`).
     pub const PERSIST_WALL_JUMP: SignalId = SignalId::new(52);
+    /// The persisted store is older than its version anchor (restored from a
+    /// backup, or its journal cut).
+    pub const PERSIST_ROLLED_BACK: SignalId = SignalId::new(53);
     /// A table was rebuilt with a new seed.
     pub const TABLE_RESEEDED: SignalId = SignalId::new(60);
 }
@@ -515,6 +519,7 @@ mod tests {
             signals::SOURCE_SHARED_SUSPECTED,
             signals::PERSIST_FAILED,
             signals::IMPORT_REJECTED,
+            signals::PERSIST_ROLLED_BACK,
             signals::TABLE_RESEEDED,
         ] {
             assert!(s.path().starts_with("bouncer."), "{s}");

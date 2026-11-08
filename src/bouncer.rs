@@ -1520,6 +1520,7 @@ pub struct BouncerBuilder {
     node: Option<NodeId>,
     persistence: Option<Box<dyn crate::persist::Persistence>>,
     mac_key: Option<[u8; 32]>,
+    version_anchor: Option<Box<dyn crate::persist::VersionAnchor>>,
     on_load_failure: crate::persist::LoadFailure,
     max_wall_jump: Duration,
     strict_wall_jump: bool,
@@ -1558,6 +1559,7 @@ impl Default for BouncerBuilder {
             node: None,
             persistence: None,
             mac_key: None,
+            version_anchor: None,
             on_load_failure: crate::persist::LoadFailure::Refuse,
             max_wall_jump: Duration::from_secs(3600),
             strict_wall_jump: false,
@@ -2140,6 +2142,54 @@ impl BouncerBuilder {
         self
     }
 
+    /// Where the store's latest [`StoreVersion`](crate::StoreVersion) is
+    /// kept, apart from the store, so a store restored from an older backup
+    /// or with its journal cut is refused at load instead of bringing back
+    /// lifted bans (see [`VersionAnchor`](crate::VersionAnchor)). None by
+    /// default: without one, a rollback is not detected.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # type Bytes = (Option<Vec<u8>>, Vec<u8>);
+    /// # #[derive(Clone, Default)]
+    /// # struct Store(std::sync::Arc<std::sync::Mutex<Bytes>>);
+    /// # impl bouncer_io::Persistence for Store {
+    /// #     fn load(&mut self) -> Result<Option<Vec<u8>>, bouncer_io::PersistError> { Ok(self.0.lock().unwrap().0.clone()) }
+    /// #     fn journal(&mut self) -> Result<Vec<u8>, bouncer_io::PersistError> { Ok(self.0.lock().unwrap().1.clone()) }
+    /// #     fn append(&mut self, r: &[u8]) -> Result<(), bouncer_io::PersistError> {
+    /// #         self.0.lock().unwrap().1.extend_from_slice(r);
+    /// #         Ok(())
+    /// #     }
+    /// #     fn sync(&mut self) -> Result<(), bouncer_io::PersistError> { Ok(()) }
+    /// #     fn replace_snapshot(&mut self, s: &[u8]) -> Result<(), bouncer_io::PersistError> {
+    /// #         let mut g = self.0.lock().unwrap();
+    /// #         g.0 = Some(s.to_vec());
+    /// #         g.1.clear();
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// use bouncer_io::{Bouncer, BouncerError, FileAnchor, PersistError};
+    /// let anchor = std::env::temp_dir().join(format!("bouncer-io-doc-version-{}", std::process::id()));
+    /// let store = Store::default();                        // an in-memory store kept across restarts
+    /// let open = || Bouncer::builder()
+    ///     .persistence(Box::new(store.clone()))
+    ///     .version_anchor(Box::new(FileAnchor::open(&anchor)))
+    ///     .try_build();
+    /// let addr: std::net::IpAddr = "198.51.100.9".parse()?;
+    /// open()?.ban(addr)?;
+    /// let backup = store.0.lock().unwrap().clone();
+    /// open()?.lift(addr)?;
+    /// *store.0.lock().unwrap() = backup;                   // put back the older store
+    /// assert!(matches!(open(), Err(BouncerError::Persist(PersistError::RolledBack { .. }))));
+    /// # std::fs::remove_file(&anchor).ok();
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn version_anchor(mut self, anchor: Box<dyn crate::persist::VersionAnchor>) -> Self {
+        self.version_anchor = Some(anchor);
+        self
+    }
+
     /// What to do when persisted state is corrupt or tampered with (default
     /// [`LoadFailure::Refuse`](crate::LoadFailure::Refuse)).
     ///
@@ -2500,7 +2550,7 @@ impl BouncerBuilder {
             persist: self
                 .persistence
                 .take()
-                .map(|s| crate::persist::Persist::new(s, self.mac_key)),
+                .map(|s| crate::persist::Persist::new(s, self.mac_key, self.version_anchor)),
             share: crate::share::Share::new(self.channel_import_rate),
             ledger: self
                 .node
@@ -2510,7 +2560,7 @@ impl BouncerBuilder {
             clock,
             bans: BanMemory::new(
                 self.ban_capacity,
-                seeds.tables,
+                (seeds.tables, seeds.references),
                 &v4,
                 &v6,
                 self.durations,

@@ -11,8 +11,9 @@ use std::{
 };
 
 use bouncer_io::{
-    AccountKey, Actor, BanKey, BanSpec, Bouncer, BouncerError, Cidr, DurationPolicy,
+    AccountKey, Actor, BanKey, BanSpec, Bouncer, BouncerError, Cidr, DurationPolicy, FileAnchor,
     FilePersistence, FingerprintKey, LoadFailure, PersistError, Persistence, SessionKey,
+    StoreVersion, VersionAnchor,
 };
 use clock_lib::ManualClock;
 
@@ -292,6 +293,164 @@ fn test_torn_journal_tail_and_damaged_middle() {
     assert!(b.door(ip("192.0.2.3")).is_err());
 }
 
+/// An anchor kept apart from the store, to stand for one a restore of the
+/// store cannot reach.
+#[derive(Clone, Default)]
+struct Anchor(Arc<Mutex<Option<StoreVersion>>>);
+
+impl VersionAnchor for Anchor {
+    fn read(&mut self) -> Result<Option<StoreVersion>, PersistError> {
+        Ok(*self.0.lock().unwrap())
+    }
+    fn write(&mut self, version: StoreVersion) -> Result<(), PersistError> {
+        *self.0.lock().unwrap() = Some(version);
+        Ok(())
+    }
+}
+
+/// Counts `persist.rolled_back` events.
+#[derive(Default)]
+struct RolledBack(std::sync::atomic::AtomicU32);
+impl bouncer_io::EventSink for RolledBack {
+    fn event(&self, e: &bouncer_io::Event<'_>) {
+        if e.signal == bouncer_io::signals::PERSIST_ROLLED_BACK {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+fn anchored(
+    store: &Shared,
+    anchor: &Anchor,
+    clock: &Arc<ManualClock>,
+    policy: LoadFailure,
+    sink: &Arc<RolledBack>,
+) -> Result<Bouncer, BouncerError> {
+    Bouncer::builder()
+        .persistence(Box::new(store.clone()))
+        .version_anchor(Box::new(anchor.clone()))
+        .on_load_failure(policy)
+        .event_sink(sink.clone())
+        .clock(clock.clone())
+        .try_build()
+}
+
+#[test]
+fn test_a_store_restored_from_an_older_backup_is_refused() {
+    let store = Shared::default();
+    let anchor = Anchor::default();
+    let clock = Arc::new(ManualClock::new());
+    let sink = Arc::new(RolledBack::default());
+    let open = |policy| anchored(&store, &anchor, &clock, policy, &sink);
+    {
+        let b = open(LoadFailure::Refuse).unwrap();
+        b.ban(ip("192.0.2.1")).unwrap();
+        b.flush().unwrap();
+    }
+    let backup = store.0.lock().unwrap().clone();
+    {
+        let b = open(LoadFailure::Refuse).unwrap();
+        b.lift(ip("192.0.2.1")).unwrap();
+        b.ban(ip("192.0.2.2")).unwrap();
+        b.flush().unwrap();
+    }
+    // The current store loads.
+    let b = open(LoadFailure::Refuse).unwrap();
+    assert!(b.door(ip("192.0.2.1")).is_ok());
+    assert!(b.door(ip("192.0.2.2")).is_err());
+    drop(b);
+    assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // The backup is put back: it would revive the lift and forget the ban.
+    *store.0.lock().unwrap() = backup;
+    match open(LoadFailure::Refuse) {
+        Err(BouncerError::Persist(PersistError::RolledBack { store, anchor })) => {
+            assert!(store < anchor, "{store:?} {anchor:?}");
+        }
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // LoadEmpty starts without the stale bans, reports it, and writes a
+    // store newer than the anchor, so the next start loads cleanly.
+    let b = open(LoadFailure::LoadEmpty).unwrap();
+    assert!(b.door(ip("192.0.2.1")).is_ok(), "the lift is not undone");
+    assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    b.ban(ip("192.0.2.3")).unwrap();
+    drop(b);
+    let b = open(LoadFailure::Refuse).unwrap();
+    assert!(b.door(ip("192.0.2.3")).is_err());
+    assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[test]
+fn test_a_journal_cut_after_a_whole_batch_is_refused_with_an_anchor() {
+    let store = Shared::default();
+    let anchor = Anchor::default();
+    let clock = Arc::new(ManualClock::new());
+    let sink = Arc::new(RolledBack::default());
+    let open = |policy| anchored(&store, &anchor, &clock, policy, &sink);
+    let first;
+    {
+        let b = open(LoadFailure::Refuse).unwrap();
+        b.ban(ip("192.0.2.1")).unwrap();
+        b.flush().unwrap();
+        first = store.0.lock().unwrap().1.len();
+        b.ban(ip("192.0.2.2")).unwrap();
+        b.flush().unwrap();
+    }
+    store.0.lock().unwrap().1.truncate(first);
+    assert!(matches!(
+        open(LoadFailure::Refuse),
+        Err(BouncerError::Persist(PersistError::RolledBack { .. }))
+    ));
+}
+
+#[test]
+fn test_without_an_anchor_or_with_a_new_one_a_store_loads_as_before() {
+    let store = Shared::default();
+    let clock = Arc::new(ManualClock::new());
+    {
+        let b = with(&store, &clock);
+        b.ban(ip("192.0.2.1")).unwrap();
+    }
+    let backup = store.0.lock().unwrap().clone();
+    {
+        let b = with(&store, &clock);
+        b.lift(ip("192.0.2.1")).unwrap();
+    }
+    *store.0.lock().unwrap() = backup;
+    // No anchor: not detected, as before 0.9.2.
+    assert!(with(&store, &clock).door(ip("192.0.2.1")).is_err());
+    // An empty anchor (the first start with one) takes the store as it is.
+    let anchor = Anchor::default();
+    let sink = Arc::new(RolledBack::default());
+    let b = anchored(&store, &anchor, &clock, LoadFailure::Refuse, &sink).unwrap();
+    assert!(b.door(ip("192.0.2.1")).is_err());
+    drop(b);
+    assert!(anchor.0.lock().unwrap().is_some(), "the anchor is written");
+    assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn test_file_anchor_round_trips_and_refuses_damage() {
+    let dir = temp_dir("anchor");
+    let path = dir.join("bans.version");
+    let mut a = FileAnchor::open(&path);
+    assert_eq!(a.read().unwrap(), None);
+    a.write(StoreVersion::new(7, 3)).unwrap();
+    assert_eq!(
+        FileAnchor::open(&path).read().unwrap(),
+        Some(StoreVersion::new(7, 3))
+    );
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[2] ^= 1;
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(matches!(
+        FileAnchor::open(&path).read(),
+        Err(PersistError::Corrupt { .. })
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("bouncer-io-test-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -340,6 +499,9 @@ fn kill_child() {
         .persistence(Box::new(
             FilePersistence::open(dir.as_ref(), "bans").unwrap(),
         ))
+        .version_anchor(Box::new(FileAnchor::open(
+            &PathBuf::from(&dir).join("bans.version"),
+        )))
         .budgets(bouncer_io::Budgets::off())
         .try_build()
         .unwrap();
@@ -367,7 +529,8 @@ fn kill_child() {
 #[test]
 fn test_kill_during_writes_always_loads_cleanly() {
     // T-16: kill the writer at random points; the store always loads, and
-    // keeps everything that was flushed before the kill.
+    // keeps everything that was flushed before the kill. The writer keeps a
+    // version anchor: a kill never leaves it ahead of the store.
     let exe = std::env::current_exe().unwrap();
     let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
     // 12 rounds in an ordinary run; BOUNCER_KILL_ROUNDS=1000 before a release.
@@ -411,6 +574,7 @@ fn test_kill_during_writes_always_loads_cleanly() {
         let _ = child.wait();
         let b = Bouncer::builder()
             .persistence(Box::new(FilePersistence::open(&dir, "bans").unwrap()))
+            .version_anchor(Box::new(FileAnchor::open(&dir.join("bans.version"))))
             .try_build()
             .expect("the store loads after a kill");
         if let Some(n) = last {
