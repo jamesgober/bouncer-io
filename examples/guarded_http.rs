@@ -12,61 +12,15 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bouncer_io::{
-    Actor, Bouncer, ConnectionGate, Directive, Reason, RequestId, SessionKey, Ticket, TicketTag,
-};
-use net_io::{AdmitStage, Admitted, CloseReason, ConnectionInfo, Denial, Gate, WriteCheck};
+use bouncer_io::{Actor, Bouncer, Directive, Reason, RequestId, SessionKey, Ticket, TicketTag};
 use serve_net::{
     Checkpoint, CheckpointAt, Envelope, HeadAction, HttpHead, HttpReply, HttpRequest, HttpService,
     ListenerSpec, Outcome, Server, Verdict,
 };
-
-/// serve-net's envelope names a connection by id; bouncer's requests hang off
-/// the connection's tag.
-#[derive(Clone)]
-struct Door {
-    bouncer: Bouncer,
-    tags: Arc<Mutex<HashMap<u64, TicketTag>>>,
-}
-
-impl Gate for Door {
-    type Ticket = ConnectionGate;
-
-    fn admit(
-        &self,
-        info: &ConnectionInfo,
-        stage: AdmitStage,
-    ) -> Result<Admitted<ConnectionGate>, net_io::Refusal> {
-        let admitted = self.bouncer.admit(info, stage)?;
-        if let Ok(mut tags) = self.tags.lock() {
-            tags.insert(info.id.get(), admitted.ticket.tag());
-        }
-        Ok(admitted)
-    }
-
-    fn readmit(
-        &self,
-        gate: &mut ConnectionGate,
-        info: &ConnectionInfo,
-    ) -> Result<(), net_io::Refusal> {
-        self.bouncer.readmit(gate, info)
-    }
-
-    fn check(&self, gate: &mut ConnectionGate, write: &WriteCheck) -> Result<(), Denial> {
-        self.bouncer.check(gate, write)
-    }
-
-    fn closed(&self, gate: ConnectionGate, info: &ConnectionInfo, reason: CloseReason) {
-        if let Ok(mut tags) = self.tags.lock() {
-            tags.remove(&info.id.get());
-        }
-        self.bouncer.closed(gate, info, reason);
-    }
-}
 
 /// Judges the request's ticket before its reply leaves.
 struct Guard(Bouncer);
@@ -89,7 +43,7 @@ impl Checkpoint for Guard {
 }
 
 struct Site {
-    door: Door,
+    bouncer: Bouncer,
     requests: Mutex<HashMap<u64, Ticket>>,
     sessions: AtomicU64,
 }
@@ -112,15 +66,10 @@ impl HttpService for Site {
         let Some(number) = head.header_str("cookie").and_then(session_of) else {
             return HeadAction::Proceed;
         };
-        let bouncer = &self.door.bouncer;
-        let tag = self
-            .door
-            .tags
-            .lock()
-            .ok()
-            .and_then(|t| t.get(&env.connection().get()).copied());
+        // The envelope carries the tag bouncer gave the connection at the door.
+        let tag = TicketTag::from(env.gate_tag());
         let id = RequestId(u128::from(env.seq().get()));
-        let Some(Ok(mut request)) = tag.map(|t| bouncer.request(t, id)) else {
+        let Ok(mut request) = self.bouncer.request(tag, id) else {
             return HeadAction::refuse(503);
         };
         if request.bind_session(session_key(number)).is_deny() {
@@ -196,16 +145,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let site_addr = args.next().unwrap_or_else(|| "127.0.0.1:8080".to_owned());
     let admin_addr = args.next().unwrap_or_else(|| "127.0.0.1:8081".to_owned());
     let bouncer = Bouncer::new();
-    let door = Door {
-        bouncer: bouncer.clone(),
-        tags: Arc::default(),
-    };
     let site = Server::builder()
         .listener(ListenerSpec::tcp("web", site_addr.as_str()))
-        .gate(door.clone())
+        .gate(bouncer.clone())
         .checkpoint(Guard(bouncer.clone()))
         .serve(Site {
-            door,
+            bouncer: bouncer.clone(),
             requests: Mutex::default(),
             sessions: AtomicU64::new(0),
         })?;

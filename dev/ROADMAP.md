@@ -211,6 +211,14 @@ Status at 0.9.2 (the improvement pass James asked for with the targets):
 | The door's p99 on a quiet machine | The quietest window of the pass was a load of 43 to 69 on 32 cores: NFR-3 met there (48.7 ns at 32 threads, 1.05 times one thread) and NFR-10 met; NFR-2 estimated met (p50 180 to 191 ns, p99 890 to 953 ns at that load, about 75 and 340 ns scaled to 0.9's quieter run) and waits for an idle machine (`docs/READINESS-1.0.md`) |
 | Found on the way | The loom models' main-thread gap (D-129); a wall-clock bound that a busy machine broke (D-131) |
 
+Status at 0.9.3:
+
+| Item | Status |
+|---|---|
+| serve-net's envelope tag | Done (D-134): serve-net 0.7's `Envelope::gate_tag()`; the example and tests need no map, and keep-alive requests are each judged against their connection's ticket |
+| net-io 0.7 | Not adopted (D-135): serve-net is on net-io 0.6 and the two must match; the feature moves to net-io 0.8 with serve-net 0.8 |
+| net-io 0.8's soft close and `close_after_flush` | Waiting for net-io 0.8 and a serve-net on it (D-135): closes the Windows denial lost to an abortive close and `NetIoEjector`'s aborts |
+
 Exit:
 - [ ] No API change needed by either consumer for two release candidates.
 
