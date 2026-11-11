@@ -11,6 +11,15 @@
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-11-11
+
+### Changed
+
+- The `net-io` feature requires net-io 0.6.2 or later (D-134), the version serve-net 0.7 requires and the one tested; 0.6.0 and 0.6.1 carry defects fixed in 0.6.2.
+- Behind serve-net 0.7, the `Bouncer` is the server's gate as it is, and each request takes its connection's ticket from `Envelope::gate_tag()` (D-134). `examples/guarded_http.rs` and the serve-net tests drop the map from connection id to tag and the wrapper type that kept it; `docs/INTEGRATION.md` shows the call.
+- The net-io feature stays on net-io 0.6 until serve-net moves; it moves to net-io 0.8 with serve-net 0.8, for the soft close after a denial and `close_after_flush` (D-135).
+- A new serve-net test sends four requests on one kept-alive connection and checks each is judged against that connection's ticket, the last after its session is revoked.
+
 ## [0.9.2] - 2026-11-08
 
 ### Security
@@ -392,7 +401,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/jamesgober/bouncer-io/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/jamesgober/bouncer-io/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/jamesgober/bouncer-io/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/jamesgober/bouncer-io/compare/v0.8.0...v0.9.0

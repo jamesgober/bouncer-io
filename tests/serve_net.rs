@@ -7,59 +7,16 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use bouncer_io::{Bouncer, ConnectionGate, Reason, RequestId, SessionKey, Ticket, TicketTag};
-use net_io::{AdmitStage, Admitted, CloseReason, ConnectionInfo, Denial, Gate, WriteCheck};
+use bouncer_io::{Bouncer, Reason, RequestId, SessionKey, Ticket, TicketTag};
 use serve_net::{
     Checkpoint, CheckpointAt, Envelope, HeadAction, HttpHead, HttpReply, HttpRequest, HttpService,
     ListenerSpec, Outcome, Running, Server, Verdict,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
-
-/// serve-net's envelope names a connection by id; bouncer's requests hang
-/// off the connection's tag. This remembers one from the other.
-#[derive(Clone)]
-struct Door {
-    bouncer: Bouncer,
-    tags: Arc<Mutex<HashMap<u64, TicketTag>>>,
-}
-
-impl Gate for Door {
-    type Ticket = ConnectionGate;
-
-    fn admit(
-        &self,
-        info: &ConnectionInfo,
-        stage: AdmitStage,
-    ) -> Result<Admitted<ConnectionGate>, net_io::Refusal> {
-        let admitted = self.bouncer.admit(info, stage)?;
-        self.tags
-            .lock()
-            .unwrap()
-            .insert(info.id.get(), admitted.ticket.tag());
-        Ok(admitted)
-    }
-
-    fn readmit(
-        &self,
-        gate: &mut ConnectionGate,
-        info: &ConnectionInfo,
-    ) -> Result<(), net_io::Refusal> {
-        self.bouncer.readmit(gate, info)
-    }
-
-    fn check(&self, gate: &mut ConnectionGate, write: &WriteCheck) -> Result<(), Denial> {
-        self.bouncer.check(gate, write)
-    }
-
-    fn closed(&self, gate: ConnectionGate, info: &ConnectionInfo, reason: CloseReason) {
-        self.tags.lock().unwrap().remove(&info.id.get());
-        self.bouncer.closed(gate, info, reason);
-    }
-}
 
 /// Judges the request's ticket before its reply leaves.
 struct Guard(Bouncer);
@@ -82,7 +39,7 @@ impl Checkpoint for Guard {
 /// A logged-in page: the `session` header names the session. When `hold` is
 /// set, the handler reports in and waits, so a test can revoke mid-request.
 struct App {
-    door: Door,
+    bouncer: Bouncer,
     requests: Mutex<HashMap<u64, Ticket>>,
     hold: Option<(mpsc::Sender<()>, Mutex<mpsc::Receiver<()>>)>,
 }
@@ -96,16 +53,10 @@ impl HttpService for App {
         let Some(n) = head.header_str("session").and_then(|s| s.parse().ok()) else {
             return HeadAction::Proceed;
         };
-        let bouncer = &self.door.bouncer;
-        let tag = self
-            .door
-            .tags
-            .lock()
-            .unwrap()
-            .get(&env.connection().get())
-            .copied();
+        // serve-net carries the tag bouncer gave the connection at the door.
+        let tag = TicketTag::from(env.gate_tag());
         let id = RequestId(u128::from(env.seq().get()));
-        let Some(Ok(mut request)) = tag.map(|t| bouncer.request(t, id)) else {
+        let Ok(mut request) = self.bouncer.request(tag, id) else {
             return HeadAction::refuse(503);
         };
         if request.bind_session(session(n)).is_deny() {
@@ -136,10 +87,6 @@ impl HttpService for App {
 type Hold = (mpsc::Receiver<()>, mpsc::Sender<()>);
 
 fn serve(bouncer: &Bouncer, hold: bool) -> (Running, SocketAddr, Option<Hold>) {
-    let door = Door {
-        bouncer: bouncer.clone(),
-        tags: Arc::default(),
-    };
     let (held, hold) = if hold {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (go_tx, go_rx) = mpsc::channel();
@@ -152,10 +99,10 @@ fn serve(bouncer: &Bouncer, hold: bool) -> (Running, SocketAddr, Option<Hold>) {
     };
     let running = Server::builder()
         .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
-        .gate(door.clone())
+        .gate(bouncer.clone())
         .checkpoint(Guard(bouncer.clone()))
         .serve(App {
-            door,
+            bouncer: bouncer.clone(),
             requests: Mutex::default(),
             hold: held,
         })
@@ -284,6 +231,43 @@ fn test_serve_net_revoked_session_is_refused_on_its_next_request() {
 }
 
 #[test]
+fn test_serve_net_keep_alive_requests_each_reach_the_connection_ticket() {
+    // serve-net hands the gate's tag to every request of a connection, so a
+    // later request on a kept-alive connection is judged like the first, and
+    // a revocation between them is seen by the second.
+    let bouncer = Bouncer::new();
+    let (running, addr, _) = serve(&bouncer, false);
+    let mut c = client(addr);
+    let keep = |n: u8| {
+        format!("GET /account HTTP/1.1\r\nHost: localhost\r\nsession: {n}\r\n\r\n").into_bytes()
+    };
+    let read_one = |c: &mut TcpStream| {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !String::from_utf8_lossy(&got).contains("\r\n\r\n") {
+            let n = c.read(&mut buf).expect("read");
+            assert!(n > 0, "closed early: {}", String::from_utf8_lossy(&got));
+            got.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&got).into_owned()
+    };
+    for _ in 0..3 {
+        c.write_all(&keep(6)).expect("write");
+        let page = read_one(&mut c);
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    }
+    assert!(
+        eventually(|| bouncer.health().tickets_live == 1),
+        "one connection, no requests left"
+    );
+    bouncer.revoke(session(6), Reason::ADMIN).expect("revoke");
+    c.write_all(&keep(6)).expect("write");
+    let page = response(&mut c);
+    assert!(page.starts_with("HTTP/1.1 403"), "{page}");
+    drop(running);
+}
+
+#[test]
 fn test_serve_net_releases_tickets_after_a_clean_request() {
     let bouncer = Bouncer::new();
     let (running, addr, _) = serve(&bouncer, false);
@@ -299,21 +283,14 @@ fn test_serve_net_releases_tickets_after_a_clean_request() {
 /// A login page: a wrong password is a strike against the client the PROXY
 /// header named, and a 401.
 struct Login {
-    door: Door,
+    bouncer: Bouncer,
 }
 
 impl HttpService for Login {
     fn head(&self, head: &HttpHead<'_>, env: &mut Envelope) -> HeadAction {
-        let bouncer = &self.door.bouncer;
-        let tag = self
-            .door
-            .tags
-            .lock()
-            .unwrap()
-            .get(&env.connection().get())
-            .copied();
+        let tag = TicketTag::from(env.gate_tag());
         let id = RequestId(u128::from(env.seq().get()));
-        let Some(Ok(request)) = tag.map(|t| bouncer.request(t, id)) else {
+        let Ok(request) = self.bouncer.request(tag, id) else {
             return HeadAction::refuse(503);
         };
         if head.header_str("password") != Some("right") {
@@ -343,10 +320,6 @@ fn test_serve_net_credential_stuffing_behind_a_proxy_bans_the_48() {
         )
         .try_build()
         .expect("bouncer");
-    let door = Door {
-        bouncer: bouncer.clone(),
-        tags: Arc::default(),
-    };
     let trusted = serve_net::net_io::TrustedProxies::parse("127.0.0.1").expect("proxies");
     let running = Server::builder()
         .listener(
@@ -357,8 +330,10 @@ fn test_serve_net_credential_stuffing_behind_a_proxy_bans_the_48() {
                 ),
             )),
         )
-        .gate(door.clone())
-        .serve(Login { door })
+        .gate(bouncer.clone())
+        .serve(Login {
+            bouncer: bouncer.clone(),
+        })
         .expect("serve");
     let addr = running.local_addr().expect("address");
     let attempt = |client: &str, password: &str| {

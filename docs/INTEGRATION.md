@@ -92,6 +92,8 @@ fn handle(conn: &bouncer_io::Ticket, id: RequestId, session: SessionKey) {
 }
 ```
 
+Behind serve-net (0.7 and later), give the `Bouncer` itself to the server's builder as its gate, and take each request's connection from the envelope: `bouncer.request(TicketTag::from(env.gate_tag()), id)`. serve-net carries the tag bouncer returned from `Gate::admit` on every request of the connection, so no map from connection id to tag is needed. `examples/guarded_http.rs` is the whole integration.
+
 Build every response in a `Collected`, so a denial overwrites it: growth copies and wipes, and the whole capacity is wiped on deny and on drop. For responses that must be all-or-nothing, buffer the whole response before the first write, so the egress check sees all of it; a streamed response can leak at most one transport chunk after a revocation.
 
 ## Protocol adapter
