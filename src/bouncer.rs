@@ -1766,7 +1766,7 @@ impl BouncerBuilder {
     }
 
     /// Which addresses are shared by many people (default
-    /// [`SharedAddresses::detect`]): see [`SharedAddresses`] for what a
+    /// [`SharedAddresses::detect`](crate::SharedAddresses::detect)): see [`SharedAddresses`](crate::SharedAddresses) for what a
     /// shared address changes and the ceilings it keeps.
     ///
     /// # Examples
