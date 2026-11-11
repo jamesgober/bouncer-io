@@ -759,16 +759,25 @@ impl DoorBudgets {
         // refused with a handful of strikes. The prefix tier still holds.
         let gives_way = &shared_source;
         if let Some(tiers) = &self.rate {
+            // A throttle on a shared address must still slow it: when its
+            // address tier gives way, the throttle's factor goes with it to
+            // the prefix tier, where the door holds it (F-2).
+            let mut carried = 1u32;
             for (i, (tier, &key)) in tiers.iter().zip(keys.iter()).enumerate() {
-                let n = self.factor(key, now_secs).saturating_mul(divisor);
+                let factor = self.factor(key, now_secs).max(carried);
+                let n = factor.saturating_mul(divisor);
                 // A full table charges the next tier instead (hierarchical
                 // fallback), and past the prefix tier the global cell: a
                 // flood of new keys cannot reset anyone's limit, and is
                 // never unlimited.
-                match self.charge(tier, i + 1 == tiers.len(), key, n, now_d) {
-                    Err(_) if i == 0 && gives_way() => {}
-                    r => r?,
+                let charged = self.charge(tier, i + 1 == tiers.len(), key, n, now_d);
+                // Asked only when the address tier refuses or is throttled,
+                // so the common path never looks the address up.
+                if i == 0 && (charged.is_err() || factor > 1) && gives_way() {
+                    carried = factor;
+                    continue;
                 }
+                charged?;
             }
         }
         let mut charged = 0u8;

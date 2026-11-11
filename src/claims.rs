@@ -142,6 +142,61 @@ impl<P> Claims<P> {
     }
 
     /// Bytes reserved by the slots (key words and payloads).
+    /// As [`find_or_claim`](Self::find_or_claim), but a full path never
+    /// refuses: with no empty and no idle slot, the slot with the lowest
+    /// `score` on the path is taken over (the earliest on a tie). Returns the
+    /// slot, whether it is new to `key`, and whether a live payload was
+    /// evicted for it. `None` only when every takeover lost its race.
+    pub(crate) fn find_or_claim_lowest(
+        &self,
+        key: u64,
+        idle: impl Fn(usize) -> bool,
+        score: impl Fn(usize) -> u64,
+        reset: impl Fn(usize),
+    ) -> Option<(usize, bool, bool)> {
+        let mut i = self.start(key);
+        let mut idle_slot: Option<(usize, u64)> = None;
+        let mut lowest: Option<(usize, u64, u64)> = None;
+        for _ in 0..PROBE {
+            let word = &self.slots[i].key;
+            let k = word.load(Ordering::Acquire);
+            if k == key {
+                return Some((i, false, false));
+            }
+            if k == 0 {
+                match word.compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => return Some((i, true, false)),
+                    Err(actual) if actual == key => return Some((i, false, false)),
+                    Err(_) => {}
+                }
+            } else if idle_slot.is_none() && idle(i) {
+                idle_slot = Some((i, k));
+            } else if idle_slot.is_none() {
+                let s = score(i);
+                if lowest.is_none_or(|(_, _, best)| s < best) {
+                    lowest = Some((i, k, s));
+                }
+            }
+            i = (i + 1) & self.mask;
+        }
+        let (slot, old, evicted) = match (idle_slot, lowest) {
+            (Some((slot, old)), _) => (slot, old, false),
+            (None, Some((slot, old, _))) => (slot, old, true),
+            (None, None) => return None,
+        };
+        match self.slots[slot]
+            .key
+            .compare_exchange(old, key, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                reset(slot);
+                Some((slot, true, evicted))
+            }
+            Err(actual) if actual == key => Some((slot, false, false)),
+            Err(_) => None,
+        }
+    }
+
     pub(crate) fn bytes(&self) -> u64 {
         (self.slots.len() * core::mem::size_of::<Slot<P>>()) as u64
     }

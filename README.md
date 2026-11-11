@@ -21,7 +21,7 @@
         <strong>bouncer-io</strong> is the door guy. Every connection that comes in goes past it, and everything that goes back out goes past it again. At the door it knows who is banned (by address, prefix, client fingerprint, session, or account) and refuses them before a byte of their traffic is read.
     </p>
     <p>
-        Inside, it does not care where a request has got to. If the request, its session, its account, or its source is flagged while it is still being handled, the next checkpoint it crosses wipes everything it collected, replaces the response with a denial, throws the connection out, and remembers the offender so the next attempt dies at the door. A checkpoint costs one atomic load until something is actually revoked.
+        Inside, it does not care where a request has got to. If the request, its session, its account, or its source is flagged while it is still being handled, the next checkpoint it crosses wipes everything it collected, replaces the response with a denial, and throws the connection out. A revocation that also bans (`revoke_and_ban`, or a strike threshold) keeps the offender out at the door next time. A checkpoint costs one atomic load until something is actually revoked.
     </p>
     <br>
     <hr>
@@ -67,7 +67,7 @@ bouncer.revoke(conn.connection(), Reason::ADMIN)?;
 
 // Between pipeline stages: one atomic load until something is revoked.
 if let Verdict::Deny(_) = request.checkpoint() {
-    request.deny_and_eject(&mut reply);   // wipe, replace, eject, remember
+    request.deny_and_eject(&mut reply);   // wipe, replace, eject
 }
 ```
 

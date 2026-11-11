@@ -1148,10 +1148,15 @@ pub(crate) struct Tables {
 
 type AtomicU64Std = std::sync::atomic::AtomicU64;
 
-type CachedTable = Option<(u64, u64, std::sync::Arc<Table>)>;
+/// Slots per thread, by table uid: a thread serving up to four bouncers keeps
+/// each one's table without a read lock per lookup (F-15).
+const CACHE_SLOTS: usize = 4;
+
+type CachedTable = [Option<(u64, u64, std::sync::Arc<Table>)>; CACHE_SLOTS];
 
 std::thread_local! {
-    static CURRENT: core::cell::RefCell<CachedTable> = const { core::cell::RefCell::new(None) };
+    static CURRENT: core::cell::RefCell<CachedTable> =
+        const { core::cell::RefCell::new([None, None, None, None]) };
 }
 
 static NEXT_TABLES: AtomicU64Std = AtomicU64Std::new(1);
@@ -1187,7 +1192,8 @@ impl Tables {
         let mut f = Some(f);
         let done = CURRENT
             .try_with(|cell| {
-                let mut slot = cell.try_borrow_mut().ok()?;
+                let mut slots = cell.try_borrow_mut().ok()?;
+                let slot = &mut slots[(self.uid as usize) % CACHE_SLOTS];
                 if !matches!(&*slot, Some((uid, v, _)) if *uid == self.uid && *v == version) {
                     *slot = Some((self.uid, version, self.load()));
                 }

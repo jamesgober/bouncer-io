@@ -55,6 +55,8 @@ pub(crate) struct Shared {
     pub(crate) allow: Published<PrefixSet<AllowKind>>,
     /// Entries in the allow list now: the door skips the list when zero.
     pub(crate) allow_len: AtomicU32,
+    /// Serializes `replace_allow` (F-8).
+    pub(crate) allow_writer: std::sync::Mutex<()>,
     /// The latest whole second the door has seen: a clock reading for
     /// coarse uses (shared-address windows) without reading the clock.
     seen_secs: AtomicU64,
@@ -329,7 +331,7 @@ impl Shared {
             };
             let blocked = self.allow.with(|s| s.overlaps(&parent))
                 || self.proxies.overlaps(&parent)
-                || self.sources.any_within(&parent, secs);
+                || self.sources.known_within(&parent);
             if blocked {
                 self.bans.refuse_escalation(&plan, secs);
                 Emit {
@@ -500,8 +502,13 @@ impl Bouncer {
     /// A bouncer with safe defaults: 65,536 tickets, 1,048,576 ban entries,
     /// 65,536 revocation entries, automatic keys at IPv4 /32 and /24 and IPv6
     /// /64, /56, /48, door budgets of 20 connections per second (burst 40)
-    /// and 64 concurrent per address, local heuristics in observe mode, no
-    /// event sink, no ejector, no maintainer thread.
+    /// and 64 concurrent per address, local heuristics in observe mode (they
+    /// report what they would ban and ban nothing until a deployment turns
+    /// enforcement on), shared addresses detected by their accounts, no event
+    /// sink, no ejector, and no maintainer thread (a full revocation table
+    /// reclaims what it can inline). Its tables take about 78 MB, reserved at
+    /// once; [`capacity`](Self::capacity) reports the exact figure, and the
+    /// builder sizes each table.
     ///
     /// # Examples
     ///
@@ -563,7 +570,11 @@ impl Bouncer {
     }
 
     /// The door for transports that number their connections and read the
-    /// time at accept.
+    /// time at accept. `now` must come from [`now`](Self::now) or the same
+    /// clock: ban expiry is judged by it, so a time from another clock (one
+    /// ahead of the bouncer's) would make timed bans look expired. Reading
+    /// the clock once per accept and passing it here saves the door's own
+    /// clock read (about a fifth of its cost).
     ///
     /// # Errors
     ///
@@ -676,7 +687,6 @@ impl Bouncer {
             Refusal::Banned { .. } => meter!(shared.meters, refused_ban),
             Refusal::OverBudget { .. } => meter!(shared.meters, refused_budget),
             Refusal::RegistryFull => meter!(shared.meters, refused_registry_full),
-            Refusal::Posture => meter!(shared.meters, refused_posture),
         }
         if shared.sink.is_none() {
             return;
@@ -688,7 +698,6 @@ impl Bouncer {
                 events::signals::DOOR_REFUSED_REGISTRY_FULL,
                 Reference::new(0),
             ),
-            _ => return,
         };
         let subject = events::Subject {
             source: Some(peer),
@@ -877,7 +886,19 @@ impl Bouncer {
             reason,
         };
         let reference = shared.reference(shared.epoch.next() ^ 0x5eed);
-        let epoch = match shared.revocations.insert(&record, &shared.epoch) {
+        // A full table first gives back what no live ticket needs, so a
+        // bouncer with no maintainer thread does not stay full (F-6).
+        let inserted = shared
+            .revocations
+            .insert(&record, &shared.epoch)
+            .or_else(|()| {
+                if maintain::reclaim_now(shared) > 0 {
+                    shared.revocations.insert(&record, &shared.epoch)
+                } else {
+                    Err(())
+                }
+            });
+        let epoch = match inserted {
             Ok(e) => e,
             Err(()) => {
                 maintain::direct_sweep(shared, &target, code, keep_connection);
@@ -953,6 +974,15 @@ impl Bouncer {
         let mut applied = Applied::default();
         match d.action {
             Action::Throttle { factor, duration } => {
+                // Automation never touches an allow-listed key, a throttle
+                // included (it would have no effect and report success).
+                if let Target::Source(c) = d.target {
+                    if d.actor.is_automated() && self.inner.shared.immune_covers(&c) {
+                        return Err(BouncerError::AllowListed {
+                            key: host_or_prefix(c),
+                        });
+                    }
+                }
                 self.throttle(&d.target, factor, duration)?;
                 applied.throttled = true;
             }
@@ -1011,6 +1041,39 @@ impl Bouncer {
             }
         }
         Ok(applied)
+    }
+
+    /// Applies directives in order, as [`apply`](Self::apply) does one by
+    /// one, for bulk loads (a blocklist of thousands of prefixes): the
+    /// administrator prefix set is rebuilt once for the batch instead of once
+    /// per prefix, so loading n prefixes costs one build rather than n. Each
+    /// directive's result is returned in order; a refused one does not stop
+    /// the rest.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, Bouncer, Cidr, Directive, Reason};
+    /// let bouncer = Bouncer::new();
+    /// let blocklist: Vec<Cidr> = (0..64u8)
+    ///     .map(|i| format!("10.{i}.0.0/20").parse())
+    ///     .collect::<Result<_, _>>()?;
+    /// let results = bouncer.apply_all(
+    ///     blocklist
+    ///         .iter()
+    ///         .map(|&c| Directive::ban(c).by(Actor::Admin(1)).because(Reason::POLICY).permanent()),
+    /// );
+    /// assert!(results.iter().all(Result::is_ok));
+    /// assert!(bouncer.door("10.7.1.1".parse()?).is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn apply_all(
+        &self,
+        directives: impl IntoIterator<Item = Directive>,
+    ) -> Vec<Result<Applied, BouncerError>> {
+        crate::bans::batched(&self.inner.shared.bans, || {
+            directives.into_iter().map(|d| self.apply(d)).collect()
+        })
     }
 
     /// Whether `d` would ban a shared address on automation's word alone.
@@ -1326,7 +1389,10 @@ impl Bouncer {
     /// (no concurrency). `verified` says the source has proven it receives
     /// (a completed handshake, a returned cookie). An unverified source is
     /// never struck or banned, and is charged only at its prefix, because a
-    /// UDP source address can be forged to frame a victim.
+    /// UDP source address can be forged to frame a victim. For the same
+    /// reason an unverified source earns no exemption from the allow list,
+    /// and a source inside the trusted proxies is an ordinary source: a
+    /// datagram carries no PROXY header.
     ///
     /// # Examples
     ///
@@ -1341,13 +1407,16 @@ impl Bouncer {
         let shared = &self.inner.shared;
         let source = normalize(source);
         match shared.judge(source, Provenance::Socket, now) {
-            Judgement::ProxyHop => DatagramVerdict::Accept,
             Judgement::Refuse(_) => {
                 meter!(shared.meters, refused_ban);
                 DatagramVerdict::Drop
             }
-            Judgement::Admit { exempt: true, .. } => DatagramVerdict::Accept,
-            Judgement::Admit { .. } => {
+            // An exemption is earned by the address, and a UDP source
+            // address is forgeable until the protocol has verified it (F-5).
+            Judgement::Admit { exempt: true, .. } if verified => DatagramVerdict::Accept,
+            // A trusted proxy hop means nothing for a datagram (no PROXY
+            // header names a client): an ordinary source.
+            Judgement::ProxyHop | Judgement::Admit { .. } => {
                 match shared
                     .budgets
                     .datagram(source, verified, now, shared.door_divisor())
@@ -1485,6 +1554,8 @@ pub struct Capacity {
     pub revocations: u32,
     /// Budget keys per tier.
     pub budget_keys: u32,
+    /// Strike counter slots.
+    pub strike_counters: u32,
     /// Bytes of the dynamic ban table.
     pub table_bytes: u64,
     /// Bytes of every table together (on a node that shares, its ledger of
@@ -1513,6 +1584,8 @@ pub struct BouncerBuilder {
     shards: Option<u16>,
     ban_capacity: u32,
     revocation_capacity: u32,
+    strike_capacity: u32,
+    shared_addresses: crate::sources::SharedAddresses,
     ipv4_lengths: Vec<u8>,
     ipv6_lengths: Vec<u8>,
     durations: DurationPolicy,
@@ -1552,6 +1625,8 @@ impl Default for BouncerBuilder {
             shards: None,
             ban_capacity: crate::DEFAULT_BAN_CAPACITY,
             revocation_capacity: crate::DEFAULT_REVOCATION_CAPACITY,
+            strike_capacity: crate::DEFAULT_STRIKE_CAPACITY,
+            shared_addresses: crate::sources::SharedAddresses::detect(),
             ipv4_lengths: crate::DEFAULT_IPV4_LENGTHS.to_vec(),
             ipv6_lengths: crate::DEFAULT_IPV6_LENGTHS.to_vec(),
             durations: DurationPolicy::default(),
@@ -1593,6 +1668,8 @@ impl fmt::Debug for BouncerBuilder {
             .field("shards", &self.shards)
             .field("ban_capacity", &self.ban_capacity)
             .field("revocation_capacity", &self.revocation_capacity)
+            .field("strike_capacity", &self.strike_capacity)
+            .field("shared_addresses", &self.shared_addresses)
             .field("ipv4_lengths", &self.ipv4_lengths)
             .field("ipv6_lengths", &self.ipv6_lengths)
             .field("maintainer", &self.maintainer)
@@ -1666,6 +1743,44 @@ impl BouncerBuilder {
     /// ```
     pub fn revocation_capacity(mut self, entries: u32) -> Self {
         self.revocation_capacity = entries;
+        self
+    }
+
+    /// Strike counter slots (default 262,144, 16 bytes each). Every source,
+    /// prefix, session, and account with a strike in its window holds one;
+    /// when a probe path is full, the counter with the fewest strikes gives
+    /// up its slot, so a flood of new keys never switches strikes off.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Bouncer;
+    /// let bouncer = Bouncer::builder().strike_capacity(1 << 20).build()?;
+    /// assert!(bouncer.capacity().strike_counters >= 1 << 20);
+    /// assert!(Bouncer::builder().strike_capacity(0).build().is_err());
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
+    pub fn strike_capacity(mut self, entries: u32) -> Self {
+        self.strike_capacity = entries;
+        self
+    }
+
+    /// Which addresses are shared by many people (default
+    /// [`SharedAddresses::detect`]): see [`SharedAddresses`] for what a
+    /// shared address changes and the ceilings it keeps.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, SharedAddresses};
+    /// let bouncer = Bouncer::builder()
+    ///     .shared_addresses(SharedAddresses::off())
+    ///     .build()?;
+    /// # let _ = bouncer;
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
+    pub fn shared_addresses(mut self, policy: crate::sources::SharedAddresses) -> Self {
+        self.shared_addresses = policy;
         self
     }
 
@@ -2460,6 +2575,18 @@ impl BouncerBuilder {
             u64::from(MAX_BAN_CAPACITY),
         )?;
         check_range(
+            "strike_capacity",
+            u64::from(self.strike_capacity),
+            1,
+            u64::from(MAX_BAN_CAPACITY),
+        )?;
+        check_range(
+            "shared_addresses",
+            self.shared_addresses.known.len() as u64,
+            0,
+            crate::sources::MAX_KNOWN as u64,
+        )?;
+        check_range(
             "revocation_rate_limit",
             u64::from(self.revocation_rate_limit),
             1,
@@ -2480,7 +2607,13 @@ impl BouncerBuilder {
         if self.ipv6_lengths.contains(&128) {
             return Err(ConfigError::new("ipv6_lengths", ConfigProblem::HostBansForbidden).into());
         }
-        if self.ipv6_lengths.is_empty() || self.ipv6_lengths.iter().any(|&l| l > 128) {
+        // An address ban is kept at the client's /64: without it, a host
+        // rotates out of its own ban (longer lengths) or bans its
+        // neighbours (shorter).
+        if self.ipv6_lengths.is_empty()
+            || self.ipv6_lengths.iter().any(|&l| l > 128)
+            || !self.ipv6_lengths.contains(&64)
+        {
             return Err(ConfigError::new("ipv6_lengths", ConfigProblem::InvalidLength).into());
         }
         self.durations.validate("durations")?;
@@ -2585,6 +2718,7 @@ impl BouncerBuilder {
                 seeds.rng,
             ),
             allow_len: AtomicU32::new(allow.len() as u32),
+            allow_writer: std::sync::Mutex::new(()),
             seen_secs: AtomicU64::new(0),
             allow: Published::new(allow),
             proxies,
@@ -2598,12 +2732,13 @@ impl BouncerBuilder {
             sources: crate::sources::Sources::new(
                 self.budgets.capacity_keys().min(65_536),
                 derived(&mut rng),
+                &self.shared_addresses,
             ),
             posture: AtomicU32::new(0),
             strict_divisor: u32::from(self.strict_budget_divisor.max(1)),
             strict_revokes_unauthenticated: self.strict_revokes_unauthenticated,
             strikes: self.strikes.clone(),
-            counters: Counters::new(65_536, derived(&mut rng)),
+            counters: Counters::new(self.strike_capacity, derived(&mut rng)),
             enforcement: self.enforcement,
             denials: self.denials.clone(),
             sink: self.sink.clone(),
@@ -2631,6 +2766,7 @@ impl BouncerBuilder {
             bans: shared.bans.capacity(),
             revocations: shared.revocations.capacity(),
             budget_keys: shared.budgets.capacity(),
+            strike_counters: shared.counters.len() as u32,
             table_bytes: 0,
             total_bytes: 0,
         };

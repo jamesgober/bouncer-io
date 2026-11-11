@@ -396,9 +396,10 @@ fn test_an_imported_local_ban_never_takes_an_address_shared_here() {
     let conn = b.door(nat).unwrap();
     for s in 0..500u32 {
         let mut r = conn.request(RequestId(u128::from(s))).unwrap();
-        let mut d = [0u8; 16];
-        d[..4].copy_from_slice(&s.to_be_bytes());
-        assert!(r.bind_session(SessionKey::from_digest(d)).is_pass());
+        assert!(
+            r.bind_account(AccountKey(0x1_0000 + u128::from(s)))
+                .is_pass()
+        );
     }
     assert!(b.explain(nat).shared_source);
 

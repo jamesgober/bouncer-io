@@ -31,7 +31,7 @@ The complete public API of `bouncer-io`. Every item lists its tier, its grade, t
 - [`Bouncer`](#bouncer)
   - [`Bouncer::new`](#bouncernew) · [`Bouncer::builder`](#bouncerbuilder)
   - [`door`](#door) · [`door_at`](#door_at) · [`datagram`](#datagram)
-  - [`ban`](#ban) · [`lift`](#lift) · [`revoke`](#revoke) · [`apply`](#apply)
+  - [`ban`](#ban) · [`lift`](#lift) · [`revoke`](#revoke) · [`apply`](#apply) · [`apply_all`](#apply_all)
   - [`request`](#request) · [`egress`](#egress) · [`release`](#release)
   - [`replace_allow`](#replace_allow) · [`explain`](#explain) · [`list`](#list)
   - [`set_posture` and `posture`](#set_posture-and-posture) · [`health`](#health) · [`capacity`](#capacity)
@@ -74,7 +74,7 @@ The complete public API of `bouncer-io`. Every item lists its tier, its grade, t
 - [Sharing across nodes](#sharing-across-nodes)
   - [`NodeId`](#nodeid) · [`Delta` and `Sequence`](#delta-and-sequence) · [`ImportReport`](#importreport) · [Merge rules](#merge-rules)
 - [Posture, time, maintenance, health](#posture-time-maintenance-health)
-  - [`Posture`](#posture) · [`Now`](#now-1) · [`MaintenanceReport`](#maintenancereport) · [`Health` and `Capacity`](#health-and-capacity)
+  - [`SharedAddresses`](#sharedaddresses) · [`Posture`](#posture) · [`Now`](#now-1) · [`MaintenanceReport`](#maintenancereport) · [`Health` and `Capacity`](#health-and-capacity)
 - [Metrics](#metrics-1)
 - [net-io integration](#net-io-integration)
 - [Errors](#errors)
@@ -102,7 +102,7 @@ Rate and concurrency budgets are one tool inside the door. They are not the purp
 | Checkpoint | Called by | Call | Cost while nothing is revoked |
 |---|---|---|---|
 | B1 door | the transport, right after accept | [`Bouncer::door`](#door) | ban lookups and budget check, under 100 ns p99 with 1,000,000 bans [est.] |
-| B1' real client | the transport after a trusted PROXY header; the protocol adapter after a trusted forwarded header | [`Ticket::bind_client`](#ticketbind_client) | same as the door |
+| B1' real client | the transport after a trusted PROXY header; the protocol adapter after a trusted forwarded header | [`Ticket::bind_client`](#ticketbind_client) | the door's allow, ban, and budget steps: a PROXY-protocol client is charged once for its connection, a forwarded-header client once per request |
 | B2 fingerprint | the TLS adapter after the ClientHello | [`Ticket::bind_fingerprint`](#ticketbind_fingerprint) | one hash probe |
 | B3 identity | the pipeline right after authentication | [`Ticket::bind_session`](#ticketbind_session-bind_account-bind_tenant) and friends | one probe per key |
 | B4 between stages | the pipeline, between every pair of stages | [`Ticket::checkpoint`](#ticketcheckpoint) | one atomic load and compare |
@@ -304,7 +304,7 @@ pub fn datagram(&self, source: IpAddr, verified: bool, now: Now) -> DatagramVerd
 
 Tier 2 · P2 · 0.5 · 30-60 ns [est.]
 
-Per-datagram door for UDP. The source is checked against ban memory, then the door rate budgets (no concurrency). `verified` says whether the source has proven it can receive (a completed handshake or a returned cookie). An unverified source is charged only at its prefix, never at its own client budget, and is never struck or banned, because UDP source addresses can be forged to frame a victim.
+Per-datagram door for UDP. The source is checked against ban memory, then the door rate budgets (no concurrency). `verified` says whether the source has proven it can receive (a completed handshake or a returned cookie). An unverified source is charged only at its prefix, never at its own client budget, and is never struck or banned, because UDP source addresses can be forged to frame a victim. For the same reason an unverified source earns no exemption from the allow list, and a source inside the trusted proxies is an ordinary source (a datagram carries no PROXY header).
 
 ```rust
 use bouncer_io::{Bouncer, DatagramVerdict};
@@ -448,6 +448,28 @@ bouncer.apply(
         .because(Reason::POLICY)
         .confidence(60),
 )?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+### `apply_all`
+
+```rust
+pub fn apply_all(&self, directives: impl IntoIterator<Item = Directive>) -> Vec<Result<Applied, BouncerError>>;
+```
+
+Tier 2 · P1 · 0.10 · one administrator-set build for the batch instead of one per prefix
+
+Applies directives in order, each as [`apply`](#apply) would, for bulk loads such as a blocklist of thousands of prefixes. A prefix at a length that is not automatic goes to the administrator set, which is compiled for lock-free reading; one by one, each such ban rebuilds the set, so a load of n prefixes costs n builds. Inside `apply_all` the set is built once, when the batch ends. A refused directive does not stop the rest; each result comes back in order. Bans from other threads during the batch publish as usual, with the batch's changes so far.
+
+```rust
+use bouncer_io::{Actor, Bouncer, Cidr, Directive, Reason};
+
+let bouncer = Bouncer::new();
+let blocklist: Vec<Cidr> = (0..64u8).map(|i| format!("10.{i}.0.0/20").parse()).collect::<Result<_, _>>()?;
+let results = bouncer.apply_all(
+    blocklist.iter().map(|&c| Directive::ban(c).by(Actor::Admin(1)).because(Reason::POLICY).permanent()),
+);
+assert!(results.iter().all(Result::is_ok));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -720,6 +742,8 @@ impl BouncerBuilder {
     pub fn shards(self, count: u16) -> Self;
     pub fn ban_capacity(self, entries: u32) -> Self;
     pub fn revocation_capacity(self, entries: u32) -> Self;
+    pub fn strike_capacity(self, entries: u32) -> Self;
+    pub fn shared_addresses(self, policy: SharedAddresses) -> Self;
     pub fn ipv4_lengths(self, lengths: &[u8]) -> Self;
     pub fn ipv6_lengths(self, lengths: &[u8]) -> Self;
     pub fn durations(self, policy: DurationPolicy) -> Self;
@@ -760,9 +784,11 @@ Tier 2 throughout, except `epoch`, `clock`, and `seed` (Tier 3). Plug-ins (the d
 | `tickets` | registry capacity; one cell per connection and one per in-flight request; 128 B per cell; rounded up to a multiple of the shard count | 65,536 (8 MiB) | `Config(TooSmall/TooLarge)` | P0 | 0.3 |
 | `shards` | registry shards, rounded down to a power of two and to at most the ticket count | one per core, at most 256 | `Config(..)` for 0 or more than 256 | P0 | 0.3 |
 | `ban_capacity` | dynamic ban table entries | 1,048,576 (about 45 MiB [est.]) | `Config(..)` | P0 | 0.3 |
-| `revocation_capacity` | revocation table entries | 65,536 | `Config(..)` | P0 | 0.4 |
+| `revocation_capacity` | revocation table entries; a full table reclaims, inline, what no live ticket needs before it refuses | 65,536 | `Config(..)` | P0 | 0.4 |
+| `strike_capacity` | strike counter slots, 16 B each; a full probe path gives the slot of the counter with the fewest strikes to the newcomer, so strikes never switch off | 262,144 (4 MiB) | `Config(..)` | P0 | 0.10 |
+| `shared_addresses` | which addresses are shared by many people: detected by distinct accounts, named ranges, or off ([`SharedAddresses`](#sharedaddresses)) | `SharedAddresses::detect()` | `Config(TooLarge)` past 4,096 known ranges | P1 | 0.10 |
 | `ipv4_lengths` | automatic key lengths for IPv4; must include 32 | `[32, 24]` | `Config(InvalidLength)` | P0 | 0.3 |
-| `ipv6_lengths` | automatic key lengths for IPv6; 128 is refused (one host owns its whole /64) | `[64, 56, 48]` | `Config(InvalidLength)`, `Config(HostBansForbidden)` | P0 | 0.3 |
+| `ipv6_lengths` | automatic key lengths for IPv6; must include 64, where an address ban is kept; 128 is refused (one host owns its whole /64) | `[64, 56, 48]` | `Config(InvalidLength)`, `Config(HostBansForbidden)` | P0 | 0.3 |
 | `durations` | how long automatic bans last, growing for repeat offenders | [`DurationPolicy::default()`](#durationpolicy) | `Config(InvalidDuration)` | P0 | 0.3 |
 | `escalation` | prefix escalation | [`EscalationPolicy::default()`](#escalationpolicy) | `Config(..)` | P1 | 0.5 |
 | `allow` | the allow list, compiled at build | empty | `InvalidPrefix`, `Config(AllowListTooLarge)` | P0 | 0.3 |
@@ -970,7 +996,6 @@ pub enum Refusal {
     Banned { reference: Reference },
     OverBudget { retry_after: Duration },
     RegistryFull,
-    Posture,
 }
 impl Display for Refusal; impl std::error::Error for Refusal;
 ```
@@ -1133,7 +1158,7 @@ if request.before_commit().is_pass() {
 
 Tier 2 · P0 · 0.3 · about the cost of the door
 
-Checkpoint B1'. Sets the real client address learned from a trusted proxy and runs the door's allow, ban, and budget steps on it; the connection's concurrency count moves from the proxy to the client.
+Checkpoint B1'. Sets the real client address learned from a trusted proxy and runs the door's allow, ban, and budget steps on it. A PROXY-protocol client is charged the door budgets once, for its connection. A client named by a forwarded header is charged once per request, since each request stands in for a connection behind an HTTP proxy, and its concurrency slot returns when the request ends.
 
 - **PROXY protocol:** the transport calls it on the connection ticket with `Provenance::ProxyProtocol` after the header is read under the handshake deadline.
 - **Forwarded headers:** the protocol adapter calls it on each request ticket with `Provenance::ForwardedHeader`, because a proxy may carry different clients' requests over one pooled connection.
@@ -2185,6 +2210,7 @@ pub mod signals { pub const DOOR_REFUSED_BAN: SignalId; /* one constant per row 
 | 26 | `BAN_REFUSED_ALLOWLISTED` | `bouncer.ban.refused_allowlisted` | policy | 3.0 | automation tried to act on an allow-listed key |
 | 30 | `STRIKE` | `bouncer.strike` | per kind | per kind | strike received |
 | 31 | `THRESHOLD_REACHED` | `bouncer.threshold.reached` | per kind | per kind | a local threshold fired (observe or enforce) |
+| 32 | `STRIKE_TABLE_FULL` | `bouncer.strike.table_full` | abuse | 5.0 | the strike counters were full and a counter with fewer strikes gave up its slot (sampled); raise `strike_capacity` |
 | 40 | `SOURCE_SHARED_SUSPECTED` | `bouncer.source.shared_suspected` | anomaly | 1.0 | an address was flagged shared |
 | 50 | `PERSIST_FAILED` | `bouncer.persist.failed` | integrity | 6.0 | write or load failure |
 | 51 | `IMPORT_REJECTED` | `bouncer.import.rejected` | integrity | 5.0 | a delta or one of its records was refused |
@@ -2343,6 +2369,47 @@ Each rule is commutative, associative, and idempotent, so any order and any repe
 
 ## Posture, time, maintenance, health
 
+### `SharedAddresses`
+
+```rust
+#[non_exhaustive] #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAddresses { /* detect, known ranges */ }
+impl SharedAddresses {
+    pub fn detect() -> SharedAddresses;                 // the default
+    pub fn off() -> SharedAddresses;
+    pub fn known(self, ranges: &[Cidr]) -> SharedAddresses;
+}
+impl Default for SharedAddresses;                       // detect()
+```
+
+Tier 2 · P1 · 0.10 · `BouncerBuilder::shared_addresses`
+
+Which addresses bouncer treats as shared by many people (an office, a mobile carrier, a carrier-grade NAT). For a shared address, a strike threshold throttles the address and bans the identities instead of banning everyone behind it.
+
+- **`detect()`** (the default) counts distinct accounts bound from an address in an hour: about 32 make it shared for a day. Sessions never count, because a client mints them at will (a login, a dropped cookie).
+- **`known(ranges)`** names ranges that are shared whatever the evidence (at most 4,096), such as a carrier's NAT pools.
+- **`off()`** never treats an address as shared unless `known` names it.
+
+A shared address keeps ceilings, so shared never means unlimited:
+
+- the door holds it to its prefix's budgets;
+- a throttle on it slows it at the door, its factor carried to the prefix tier;
+- a second threshold while it is throttled bans it;
+- its strikes do not count toward a prefix ban.
+
+Escalation and prefix strike bans stop at known ranges only. A detected address does not stop them, so a client that earned the flag cannot shield its whole /24 or /48.
+
+```rust
+use bouncer_io::{Bouncer, Cidr, SharedAddresses};
+
+let pools: [Cidr; 1] = ["100.64.0.0/10".parse()?];
+let bouncer = Bouncer::builder()
+    .shared_addresses(SharedAddresses::detect().known(&pools))
+    .build()?;
+assert!(bouncer.explain("100.64.9.9".parse::<std::net::IpAddr>()?).shared_source);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ### `Posture`
 
 ```rust
@@ -2388,7 +2455,7 @@ impl Health { pub fn is_ok(&self) -> bool; }
 pub enum MaintainerState { NotStarted, Parked, Running, Stopped }
 
 #[non_exhaustive] #[derive(Clone, Copy, Debug)]
-pub struct Capacity { pub tickets: u32, pub bans: u32, pub revocations: u32, pub budget_keys: u32, pub table_bytes: u64, pub total_bytes: u64 }
+pub struct Capacity { pub tickets: u32, pub bans: u32, pub revocations: u32, pub budget_keys: u32, pub strike_counters: u32, pub table_bytes: u64, pub total_bytes: u64 }
 ```
 
 Tier 2 · P1 · 0.5 (`Capacity` 0.3)
@@ -2403,7 +2470,7 @@ Tier 2 · P1 · 0.5 (`Capacity` 0.3)
 #[cfg(feature = "metrics")]
 #[non_exhaustive] #[derive(Clone, Copy, Debug, Default)]
 pub struct MetricsSnapshot {
-    pub admitted: u64, pub refused_ban: u64, pub refused_budget: u64, pub refused_registry_full: u64, pub refused_posture: u64,
+    pub admitted: u64, pub refused_ban: u64, pub refused_budget: u64, pub refused_registry_full: u64,
     pub checkpoints_fast: u64, pub checkpoints_slow: u64, pub revocations: u64, pub denials: u64, pub ejections: u64,
     pub commits_blocked: u64, pub egress_blocked: u64,
     pub bans_active: u64, pub bans_added: u64, pub bans_expired: u64, pub bans_evicted: u64, pub bans_escalated: u64, pub bans_lifted: u64,
@@ -2509,7 +2576,7 @@ Every message says what to do, and none prints key bytes.
 |---|---|---|
 | `RegistryFull` | `Ticket::request`, `Bouncer::request` | answer `Unavailable`; raise `tickets` or shed load upstream |
 | `BanTableFull` | `ban`, `apply` | raise `ban_capacity`; check escalation thresholds |
-| `RevocationTableFull` | `revoke`, `apply` | the revocation still reached live tickets; check the maintainer is running; raise `revocation_capacity` |
+| `RevocationTableFull` | `revoke`, `apply` | the table is full of entries live tickets still need (it reclaimed the rest first); the revocation still reached live tickets; raise `revocation_capacity` |
 | `InvalidPrefix` | key constructors, `ban`, `lift`, `revoke` | fix the length or clear the host bits |
 | `ParseCidr` | `Cidr::parse` | fix the text at `position` |
 | `AllowListed` | `ban`, `revoke`, `apply` | remove the allow entry first |
@@ -2569,6 +2636,7 @@ pub const VERSION: &str;                                 // env!("CARGO_PKG_VERS
 pub const DEFAULT_TICKETS: u32 = 65_536;
 pub const DEFAULT_BAN_CAPACITY: u32 = 1_048_576;
 pub const DEFAULT_REVOCATION_CAPACITY: u32 = 65_536;
+pub const DEFAULT_STRIKE_CAPACITY: u32 = 262_144;
 pub const DEFAULT_IPV4_LENGTHS: &[u8] = &[32, 24];
 pub const DEFAULT_IPV6_LENGTHS: &[u8] = &[64, 56, 48];
 pub const MAX_DENIAL_BYTES: usize = 1024;

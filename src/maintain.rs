@@ -184,6 +184,33 @@ impl Maintenance {
     }
 }
 
+/// Reclaims the revocation entries no live ticket needs, now: the
+/// revocation half of [`run`], with every ticket that has not checked at the
+/// current epoch checked here. Called when the table is full, so a bouncer
+/// with no maintainer thread never stays full (F-6). One pass over the
+/// registry; returns the entries removed.
+pub(crate) fn reclaim_now(shared: &Shared) -> u32 {
+    let epoch = shared.epoch.load();
+    let mut min_seen = epoch;
+    for (index, cell) in shared.registry.cells.iter().enumerate() {
+        let st = cell.state.load(Ordering::Acquire);
+        if st & F_LIVE == 0 || st & F_REVOKED != 0 {
+            continue;
+        }
+        let seen = cell.seen.load(Ordering::Acquire);
+        if st & F_PENDING_CLIENT != 0 {
+            // As in `run`: checked at its bind, against everything born
+            // after it was issued.
+            min_seen = min_seen.min(seen);
+            continue;
+        }
+        if seen != epoch && check_cell(shared, index as u32, generation(st), epoch).is_err() {
+            eject_revoked(shared, index as u32, true);
+        }
+    }
+    shared.revocations.remove_born_by(min_seen)
+}
+
 /// One bounded maintenance step.
 pub(crate) fn run(shared: &Shared, now: Now) -> MaintenanceReport {
     crate::metrics::meter!(shared.meters, sweeps);

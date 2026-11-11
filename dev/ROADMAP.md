@@ -225,6 +225,7 @@ Status at 0.10.0 (the simplicity audit James asked for, 2026-11-11):
 |---|---|
 | Public API against the simple-API rule | Done (D-136, `dev/API-AUDIT-0.10.md`): nine findings, each fixed; seven items kept with their reasons |
 | `docs/API.md` lists every public item | Done: checked by a script against rustdoc's JSON output |
+| Independent security and performance review | Done (D-137 to D-143): one high, six medium, five low, three notes, every one fixed with a test that failed first; loom models and two fuzz targets re-run |
 | Release candidates | The count of release candidates with no API change starts again at 0.10.0 |
 
 Exit:

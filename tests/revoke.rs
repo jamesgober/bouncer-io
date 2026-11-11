@@ -506,12 +506,17 @@ fn test_no_checkpoint_after_revoke_returned_passes() {
 
 #[test]
 fn test_revocation_table_full_still_reaches_live_tickets() {
-    // Edge case 35, threat T-13.
+    // Edge case 35, threat T-13. A full table first gives back what no live
+    // ticket needs (F-6); here a proxied request still waiting for its
+    // client needs every entry born after it, so the table stays full.
     let b = Bouncer::builder()
         .revocation_capacity(4)
         .budgets(Budgets::off())
+        .trusted_proxies(&[c("10.0.0.1/32")])
         .build()
         .unwrap();
+    let hop = b.door(ip("10.0.0.1")).unwrap();
+    let _pending = hop.request(RequestId(77)).unwrap();
     for i in 0..4u64 {
         b.revoke(ConnectionId(900 + i), Reason::ADMIN).unwrap();
     }

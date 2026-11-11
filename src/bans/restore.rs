@@ -112,8 +112,8 @@ impl BanMemory {
                 }
             }
             Placement::Admin(cidr) => {
-                match writer.admin.iter_mut().find(|(c, _)| *c == cidr) {
-                    Some((_, e)) if exact => {
+                match writer.admin.get_mut(&cidr) {
+                    Some(e) if exact => {
                         *e = AdminEntry {
                             id: r.id,
                             until: r.until,
@@ -122,14 +122,14 @@ impl BanMemory {
                             reason: r.reason,
                         };
                     }
-                    Some((_, e)) => e.until = super::longer(e.until, r.until),
+                    Some(e) => e.until = super::longer(e.until, r.until),
                     None => {
                         if writer.admin.len() >= super::MAX_ADMIN_PREFIXES {
                             return Err(BouncerError::BanTableFull {
                                 capacity: super::MAX_ADMIN_PREFIXES as u32,
                             });
                         }
-                        writer.admin.push((
+                        writer.admin.insert(
                             cidr,
                             AdminEntry {
                                 id: r.id,
@@ -138,7 +138,7 @@ impl BanMemory {
                                 actor: r.actor,
                                 reason: r.reason,
                             },
-                        ));
+                        );
                     }
                 }
                 self.publish_admin(&writer.admin);
@@ -160,11 +160,7 @@ impl BanMemory {
                 self.count(writer, &tkey, false);
             }
             Placement::Admin(cidr) => {
-                let before = writer.admin.len();
-                writer.admin.retain(|(c, _)| *c != cidr);
-                if writer.admin.len() == before {
-                    return None;
-                }
+                writer.admin.remove(&cidr)?;
                 self.publish_admin(&writer.admin);
             }
         }
@@ -192,7 +188,7 @@ impl BanMemory {
                 }
             }
             Placement::Admin(cidr) => {
-                let (_, a) = w.admin.iter().find(|(c, _)| *c == cidr)?;
+                let a = w.admin.get(&cidr)?;
                 Held {
                     key,
                     id: a.id,

@@ -572,7 +572,9 @@ struct Writer {
     counts_v4: [u32; 33],
     counts_v6: [u32; 129],
     counts_ident: [u32; 16],
-    admin: Vec<(Cidr, AdminEntry)>,
+    /// Administrator prefixes by prefix: a lookup, insert, or removal is
+    /// O(log n), so a bulk load is not quadratic (F-7).
+    admin: std::collections::BTreeMap<Cidr, AdminEntry>,
     /// The originals of compound fingerprint keys (stored as digests), by
     /// (length, digest words): for listings, persistence, and sharing.
     compound: HashMap<(u8, u64, u64), (crate::keys::FingerprintKey, Cidr)>,
@@ -583,10 +585,41 @@ struct Writer {
 }
 
 /// The per-thread cache of the administrator set: bouncer id, version, set.
-type AdminCache = Option<(u64, u64, Arc<PrefixSet<DoorAdmin>>)>;
+/// Slots per thread: a thread serving up to four bouncers keeps each one's
+/// set without reloading it on every lookup (F-15).
+const CACHE_SLOTS: usize = 4;
+type AdminCache = [Option<(u64, u64, Arc<PrefixSet<DoorAdmin>>)>; CACHE_SLOTS];
 
 thread_local! {
-    static ADMIN_CACHE: RefCell<AdminCache> = const { RefCell::new(None) };
+    /// Set while this thread applies a batch: administrator-set changes are
+    /// published once, when the batch ends.
+    static DEFER_ADMIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with administrator-set publishing deferred on this thread, then
+/// publishes once if anything changed. Other threads' bans publish as
+/// usual, and each publish includes the batch's changes so far.
+pub(crate) fn batched<T>(bans: &BanMemory, f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DEFER_ADMIN.with(|d| d.set(self.0));
+        }
+    }
+    let outer = DEFER_ADMIN.with(|d| d.replace(true));
+    let out = {
+        let _reset = Reset(outer);
+        f()
+    };
+    if !outer && bans.admin_dirty.load(std::sync::atomic::Ordering::Acquire) {
+        let w = bans.lock();
+        bans.publish_admin(&w.admin);
+    }
+    out
+}
+
+thread_local! {
+    static ADMIN_CACHE: RefCell<AdminCache> = const { RefCell::new([None, None, None, None]) };
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -622,6 +655,8 @@ pub(crate) struct BanMemory {
     present_ident: AtomicU64,
     admin_version: AtomicU64,
     admin_count: AtomicU64,
+    /// An administrator-set change waits to be published (inside a batch).
+    admin_dirty: std::sync::atomic::AtomicBool,
     admin: RwLock<Arc<PrefixSet<DoorAdmin>>>,
     /// The key of ban references (the bouncer's).
     references: HashKey,
@@ -713,6 +748,7 @@ impl BanMemory {
             present_ident: AtomicU64::new(0),
             admin_version: AtomicU64::new(0),
             admin_count: AtomicU64::new(0),
+            admin_dirty: std::sync::atomic::AtomicBool::new(false),
             admin: RwLock::new(Arc::new(PrefixSet::empty())),
             references,
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -722,7 +758,7 @@ impl BanMemory {
                 counts_v4: [0; 33],
                 counts_v6: [0; 129],
                 counts_ident: [0; 16],
-                admin: Vec::new(),
+                admin: std::collections::BTreeMap::new(),
                 compound: HashMap::new(),
                 rng,
                 next_id: 1,
@@ -1086,9 +1122,10 @@ impl BanMemory {
                     reason: spec.reason,
                 };
                 let writer = &mut *w;
-                writer.admin.retain(|(_, e)| !e.expired(now_secs));
-                let id = match writer.admin.iter_mut().find(|(c, _)| *c == cidr) {
-                    Some((_, existing)) => {
+                // Expired entries read as expired at the door, and are
+                // dropped when the set is full.
+                let id = match writer.admin.get_mut(&cidr) {
+                    Some(existing) => {
                         existing.until = longer(existing.until, until);
                         existing.actor = actor;
                         existing.reason = spec.reason;
@@ -1096,11 +1133,14 @@ impl BanMemory {
                     }
                     None => {
                         if writer.admin.len() >= MAX_ADMIN_PREFIXES {
+                            writer.admin.retain(|_, e| !e.expired(now_secs));
+                        }
+                        if writer.admin.len() >= MAX_ADMIN_PREFIXES {
                             return Err(BouncerError::BanTableFull {
                                 capacity: MAX_ADMIN_PREFIXES as u32,
                             });
                         }
-                        writer.admin.push((cidr, entry));
+                        writer.admin.insert(cidr, entry);
                         id
                     }
                 };
@@ -1274,9 +1314,7 @@ impl BanMemory {
                 None => 0,
             },
             Placement::Admin(cidr) => {
-                let before = writer.admin.len();
-                writer.admin.retain(|(c, _)| *c != cidr);
-                let n = (before - writer.admin.len()) as u32;
+                let n = u32::from(writer.admin.remove(&cidr).is_some());
                 if n > 0 {
                     self.publish_admin(&writer.admin);
                 }
@@ -1319,7 +1357,15 @@ impl BanMemory {
         self.place(&key.normalized(), actor).is_ok()
     }
 
-    fn publish_admin(&self, list: &[(Cidr, AdminEntry)]) {
+    fn publish_admin(&self, list: &std::collections::BTreeMap<Cidr, AdminEntry>) {
+        // Inside a batch the set is built once, at its end (F-7).
+        if DEFER_ADMIN.with(std::cell::Cell::get) {
+            self.admin_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        self.admin_dirty
+            .store(false, std::sync::atomic::Ordering::Release);
         let door: Vec<(Cidr, DoorAdmin)> = list
             .iter()
             .map(|(c, e)| {
@@ -1789,14 +1835,10 @@ impl BanMemory {
                 != 0
             {
                 let host = Cidr::host(src);
-                let lengths: Vec<u8> = match host.family() {
-                    Family::V4 => (0..=32u8)
-                        .filter(|&l| self.is_auto(Family::V4, l))
-                        .collect(),
-                    Family::V6 => (0..=128u8)
-                        .filter(|&l| self.is_auto(Family::V6, l))
-                        .collect(),
-                };
+                let family = host.family();
+                // The automatic lengths, read from their bitmaps: no
+                // allocation per bind (F-14).
+                let lengths = (0..=family.max_len()).filter(|&l| self.is_auto(family, l));
                 for len in lengths {
                     if let Some(p) = host.parent(len) {
                         match self.table.find(&self.fingerprint_in_key(fp, &p), now_secs) {
@@ -1818,7 +1860,8 @@ impl BanMemory {
         let mut f = Some(f);
         let cached = ADMIN_CACHE
             .try_with(|cell| {
-                let mut slot = cell.try_borrow_mut().ok()?;
+                let mut slots = cell.try_borrow_mut().ok()?;
+                let slot = &mut slots[(self.uid as usize) % CACHE_SLOTS];
                 let fresh =
                     matches!(&*slot, Some((uid, v, _)) if *uid == self.uid && *v == version);
                 if !fresh {

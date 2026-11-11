@@ -440,7 +440,7 @@ pub enum Posture {
 pub(crate) struct Counters {
     key: HashKey,
     claims: Claims,
-    /// window start secs (32) | weighted count (32)
+    /// window start secs (32) | kind index (8) | weighted count (24)
     cells: Box<[AtomicU64]>,
 }
 
@@ -452,6 +452,9 @@ pub(crate) enum Counted {
     Full,
 }
 
+/// The highest weighted count a cell holds.
+const COUNT_CAP: u64 = (1 << 24) - 1;
+
 impl Counters {
     pub(crate) fn new(capacity: u32, key: HashKey) -> Counters {
         let claims = Claims::new(capacity);
@@ -461,6 +464,11 @@ impl Counters {
 
     pub(crate) fn bytes(&self) -> u64 {
         self.claims.bytes() + (self.cells.len() * 8) as u64
+    }
+
+    /// Counter slots.
+    pub(crate) fn len(&self) -> usize {
+        self.claims.len()
     }
 
     /// The counter key of a source: its IPv4 address or IPv6 /64.
@@ -483,38 +491,65 @@ impl Counters {
         Claims::key(self.key.hash3((kind.code() << 8) | (tag << 56), k0, k1))
     }
 
+    /// Whether a cell's window has ended, judged by the window of the kind
+    /// that holds it (F-11), not the kind asking.
+    fn ended(rules: &StrikeRules, v: u64, now_secs: u64) -> bool {
+        let kind = ((v >> 24) & 0xff) as usize;
+        let window = rules
+            .rules
+            .get(kind)
+            .map_or(1, |r| r.window.as_secs().max(1));
+        v == 0 || (v >> 32) + window <= now_secs
+    }
+
     /// The weighted count in the current window (0 when none).
     pub(crate) fn peek(
         &self,
         rules: &StrikeRules,
-        kind: StrikeKind,
+        _kind: StrikeKind,
         key: u64,
         now_secs: u64,
     ) -> u16 {
-        let window = rules.rules[kind.index()].window.as_secs().max(1);
         self.claims.find(key).map_or(0, |slot| {
             let v = self.cells[slot].load(Ordering::Acquire);
-            if v == 0 || (v >> 32) + window <= now_secs {
+            if Self::ended(rules, v, now_secs) {
                 0
             } else {
-                (v & 0xffff_ffff).min(u64::from(u16::MAX)) as u16
+                (v & COUNT_CAP).min(u64::from(u16::MAX)) as u16
             }
         })
     }
 
+    /// Clears a key's count, so its next threshold is reached afresh.
+    pub(crate) fn reset(&self, key: u64) {
+        if let Some(slot) = self.claims.find(key) {
+            let _ = update(
+                &self.cells[slot],
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |v| Some(v & !COUNT_CAP),
+            );
+        }
+    }
+
     /// Adds `weight` within the rule's window; reports whether the threshold
-    /// is reached by this strike (exactly once per window).
+    /// is reached by this strike (exactly once per window), and whether a
+    /// live counter of another key was evicted to make room.
     pub(crate) fn add(
         &self,
         rules: &StrikeRules,
         kind: StrikeKind,
         key: u64,
         now_secs: u64,
-    ) -> Counted {
+    ) -> (Counted, bool) {
         self.add_times(rules, kind, key, now_secs, 1)
     }
 
     /// As [`add`](Self::add), against `times` the rule's threshold.
+    ///
+    /// A full probe path never drops the strike: the counter with the fewest
+    /// strikes on it gives up its slot (F-4), so a flood of one-strike keys
+    /// cannot push out a key near its threshold, and nothing fails open.
     pub(crate) fn add_times(
         &self,
         rules: &StrikeRules,
@@ -522,41 +557,43 @@ impl Counters {
         key: u64,
         now_secs: u64,
         times: u32,
-    ) -> Counted {
+    ) -> (Counted, bool) {
         let rule = rules.rules[kind.index()];
         let threshold = u64::from(rule.threshold).saturating_mul(u64::from(times.max(1)));
         let window = rule.window.as_secs().max(1);
         let cells = &self.cells;
-        let idle = |slot: usize| {
-            let v = cells[slot].load(Ordering::Acquire);
-            (v >> 32) + window <= now_secs
-        };
-        let Some((slot, _)) = self
-            .claims
-            .find_or_claim(key, idle, |s| cells[s].store(0, Ordering::Release))
-        else {
-            return Counted::Full;
+        let kind_bits = (kind.index() as u64 & 0xff) << 24;
+        let claimed = (0..2).find_map(|_| {
+            self.claims.find_or_claim_lowest(
+                key,
+                |slot| Self::ended(rules, cells[slot].load(Ordering::Acquire), now_secs),
+                |slot| cells[slot].load(Ordering::Acquire) & COUNT_CAP,
+                |s| cells[s].store(0, Ordering::Release),
+            )
+        });
+        let Some((slot, _, evicted)) = claimed else {
+            return (Counted::Full, false);
         };
         let now32 = now_secs.min(u64::from(u32::MAX));
         let mut reached = false;
         let _ = update(&cells[slot], Ordering::AcqRel, Ordering::Acquire, |v| {
-            let (start, count) = (v >> 32, v & 0xffff_ffff);
-            let (start, count) = if start + window <= now32 || v == 0 {
+            let (start, count) = if v == 0 || (v >> 32) + window <= now32 {
                 (now32, 0)
             } else {
-                (start, count)
+                (v >> 32, v & COUNT_CAP)
             };
-            let next = count
-                .saturating_add(u64::from(rule.weight))
-                .min(0xffff_ffff);
+            let next = count.saturating_add(u64::from(rule.weight)).min(COUNT_CAP);
             reached = count < threshold && next >= threshold;
-            Some((start << 32) | next)
+            Some((start << 32) | kind_bits | next)
         });
-        if reached {
-            Counted::Reached
-        } else {
-            Counted::Below
-        }
+        (
+            if reached {
+                Counted::Reached
+            } else {
+                Counted::Below
+            },
+            evicted,
+        )
     }
 }
 
@@ -567,6 +604,14 @@ fn source_of(addr: IpAddr) -> Cidr {
         Family::V4 => host,
         Family::V6 => host.parent(64).unwrap_or(host),
     }
+}
+
+/// Whether a shared address is to be throttled rather than banned: it is
+/// shared, and no throttle is on it yet. A second threshold (or decoy touch)
+/// while the throttle lasts bans it, so a shared address is never shielded
+/// without end (D-137).
+fn spare_shared(shared: &crate::bouncer::Shared, src: IpAddr, now: u64) -> bool {
+    shared.sources.is_shared(src, now) && shared.budgets.source_factor(src, now) <= 1
 }
 
 /// Throttles a shared address (likely a NAT) for one base ban length, where
@@ -649,7 +694,7 @@ pub(crate) fn strike(
         // address (likely a NAT) is throttled, not banned, as at a threshold.
         let now = shared.now().secs();
         let source = match subject.source {
-            Some(src) if shared.sources.is_shared(src, now) => {
+            Some(src) if spare_shared(shared, src, now) => {
                 throttle_shared(shared, src, policy, now);
                 None
             }
@@ -680,12 +725,17 @@ pub(crate) fn strike(
     let counters = &shared.counters;
     let mut reached: Option<BanKey> = None;
     let mut full = false;
-    let mut count = |key: u64, ban: BanKey| match counters.add(&shared.strikes, kind, key, now) {
-        Counted::Reached => {
-            reached.get_or_insert(ban);
+    let mut evicted = false;
+    let mut count = |key: u64, ban: BanKey| {
+        let (counted, out) = counters.add(&shared.strikes, kind, key, now);
+        evicted |= out;
+        match counted {
+            Counted::Reached => {
+                reached.get_or_insert(ban);
+            }
+            Counted::Full => full = true,
+            Counted::Below => {}
         }
-        Counted::Full => full = true,
-        Counted::Below => {}
     };
     if let Some(src) = subject.source {
         count(counters.source_key(kind, src), BanKey::Address(src));
@@ -704,21 +754,41 @@ pub(crate) fn strike(
     // against the strikes escalation would need to get there, so an
     // attacker that moves to a new /64 (or address) before any reaches its
     // threshold is caught at the prefix all the same (D-108).
+    //
+    // A shared address's strikes do not count at its prefix: the many people
+    // behind one NAT would otherwise add up to a prefix ban. Its own counter
+    // still holds it to its ceilings.
     let mut prefix_due: Option<Cidr> = None;
-    if let Some(src) = subject.source {
+    if let Some(src) = subject
+        .source
+        .filter(|&s| !shared.sources.is_shared(s, now))
+    {
         if let Some((prefix, times)) = shared.bans.strike_prefix(&source_of(src)) {
             let key = counters.prefix_key(kind, &prefix);
-            match counters.add_times(&shared.strikes, kind, key, now, times) {
+            let (counted, out) = counters.add_times(&shared.strikes, kind, key, now, times);
+            evicted |= out;
+            match counted {
                 Counted::Reached => prefix_due = Some(prefix),
                 Counted::Full => full = true,
                 Counted::Below => {}
             }
         }
     }
-    // A prefix is banned only where escalation could ban it: never over an
-    // address flagged as shared (allow-list entries and trusted proxies are
-    // refused by the ban itself).
-    let prefix_due = prefix_due.filter(|p| !shared.sources.any_within(p, now));
+    if evicted {
+        // The table was full: a counter with fewer strikes gave up its slot.
+        Emit {
+            subject: crate::events::Subject {
+                source: subject.source,
+                ..crate::events::Subject::default()
+            },
+            ..Emit::new(signals::STRIKE_TABLE_FULL)
+        }
+        .send(shared);
+    }
+    // A prefix is banned only where escalation could ban it: never over a
+    // range the deployment named as shared (allow-list entries and trusted
+    // proxies are refused by the ban itself).
+    let prefix_due = prefix_due.filter(|p| !shared.sources.known_within(p));
     let extra_prefix = match reached {
         None => {
             reached = prefix_due.map(BanKey::Prefix);
@@ -756,9 +826,12 @@ pub(crate) fn strike(
     }
     crate::metrics::meter!(shard.meters, thresholds_enforced);
     if let BanKey::Address(src) = would_ban {
-        if shared.sources.is_shared(src, now) {
-            // Likely a NAT: throttle the address, ban the identities.
+        if spare_shared(shared, src, now) {
+            // Likely a NAT: throttle the address, ban the identities, and
+            // count afresh, so its next threshold during the throttle bans
+            // it.
             throttle_shared(shared, src, policy, now);
+            counters.reset(counters.source_key(kind, src));
             let mut banned = false;
             for key in [
                 subject.session.map(BanKey::Session),
@@ -804,24 +877,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_a_full_counter_path_is_judged_by_each_occupant_window() {
+        // F-11: one probe path of 16 slots, all held by `LoginFailed`
+        // counters (a one-hour window). Two minutes on, a `Malformed` strike
+        // (a one-minute window) must not treat them as idle: it takes the
+        // slot with the fewest strikes, and the counts near a threshold stay.
+        let c = Counters::new(16, HashKey::new(5, 6));
+        let rules = StrikeRules::default()
+            .rule(StrikeKind::LoginFailed, 1, 10, Duration::from_secs(3600))
+            .rule(StrikeKind::Malformed, 1, 10, Duration::from_secs(60));
+        let key = |i: u8| c.source_key(StrikeKind::LoginFailed, IpAddr::from([192, 0, 2, i]));
+        for i in 0..15u8 {
+            for _ in 0..4 {
+                let _ = c.add(&rules, StrikeKind::LoginFailed, key(i), 0);
+            }
+        }
+        let _ = c.add(&rules, StrikeKind::LoginFailed, key(15), 0);
+        let newcomer = c.source_key(StrikeKind::Malformed, "198.51.100.1".parse().unwrap());
+        let (_, evicted) = c.add(&rules, StrikeKind::Malformed, newcomer, 120);
+        assert!(evicted, "the path was full");
+        for i in 0..15u8 {
+            assert_eq!(
+                c.peek(&rules, StrikeKind::LoginFailed, key(i), 120),
+                4,
+                "key {i}"
+            );
+        }
+        assert_eq!(c.peek(&rules, StrikeKind::LoginFailed, key(15), 120), 0);
+        assert_eq!(c.peek(&rules, StrikeKind::Malformed, newcomer, 120), 1);
+    }
+
+    #[test]
     fn test_counter_reaches_threshold_once_per_window() {
         let c = Counters::new(64, HashKey::new(3, 4));
         let rules =
             StrikeRules::default().rule(StrikeKind::Malformed, 1, 3, Duration::from_secs(10));
         let k = c.source_key(StrikeKind::Malformed, "192.0.2.1".parse().unwrap());
-        assert_eq!(c.add(&rules, StrikeKind::Malformed, k, 100), Counted::Below);
-        assert_eq!(c.add(&rules, StrikeKind::Malformed, k, 101), Counted::Below);
         assert_eq!(
-            c.add(&rules, StrikeKind::Malformed, k, 102),
+            c.add(&rules, StrikeKind::Malformed, k, 100).0,
+            Counted::Below
+        );
+        assert_eq!(
+            c.add(&rules, StrikeKind::Malformed, k, 101).0,
+            Counted::Below
+        );
+        assert_eq!(
+            c.add(&rules, StrikeKind::Malformed, k, 102).0,
             Counted::Reached
         );
         assert_eq!(
-            c.add(&rules, StrikeKind::Malformed, k, 103),
+            c.add(&rules, StrikeKind::Malformed, k, 103).0,
             Counted::Below,
             "once per window"
         );
         // A new window starts the count again.
-        assert_eq!(c.add(&rules, StrikeKind::Malformed, k, 115), Counted::Below);
+        assert_eq!(
+            c.add(&rules, StrikeKind::Malformed, k, 115).0,
+            Counted::Below
+        );
     }
 
     #[test]
@@ -834,10 +947,13 @@ mod tests {
         let k2 = c.source_key(StrikeKind::Malformed, a);
         assert_ne!(k1, k2);
         assert_eq!(
-            c.add(&rules, StrikeKind::LoginFailed, k1, 1),
+            c.add(&rules, StrikeKind::LoginFailed, k1, 1).0,
             Counted::Reached
         );
-        assert_eq!(c.add(&rules, StrikeKind::Malformed, k2, 1), Counted::Below);
+        assert_eq!(
+            c.add(&rules, StrikeKind::Malformed, k2, 1).0,
+            Counted::Below
+        );
     }
 
     #[test]

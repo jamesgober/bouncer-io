@@ -34,7 +34,7 @@ What a pipeline must do, in order:
 | Step | Where | Call | On a refusal or `Deny` |
 |---|---|---|---|
 | 1 door | right after accept, before the socket is read | `bouncer.door(peer)` (or `door_at`) | close abortively; read and write nothing |
-| 2 real client | after a trusted PROXY header (connection) or forwarded header (each request) | `ticket.bind_client(addr, provenance)` | deny and eject; until bound, a proxied request is denied |
+| 2 real client | after a trusted PROXY header (connection) or forwarded header (each request) | `ticket.bind_client(addr, provenance)` | deny and eject; until bound, a proxied request is denied. The client is charged the door budgets: once for a PROXY-protocol connection, once per request for a forwarded header (each request stands in for a connection, so size `door_rate` and `door_concurrency` for requests behind an HTTP proxy) |
 | 3 fingerprint | after the TLS ClientHello | `conn.bind_fingerprint(digest)` | deny and eject |
 | 4 request | every request | `conn.request(id)`; build the response in a `Collected` | `RegistryFull`: answer unavailable |
 | 5 identity | right after authentication | `bind_session`, `bind_account`, `bind_tenant` | deny and eject; final |

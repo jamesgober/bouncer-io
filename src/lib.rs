@@ -53,7 +53,8 @@
 //!   ticket; [`Ticket::checkpoint`], [`Ticket::before_commit`], and the
 //!   identity binds return a [`Verdict`]; [`Ticket::deny_and_eject`] wipes
 //!   the response collected so far in a [`Collected`], replaces it with a
-//!   generic denial, closes the connection, and remembers the offender.
+//!   generic denial, and closes the connection; `Directive::revoke_and_ban`
+//!   also keeps the offender out at the door.
 //! - **Revocation**: [`Bouncer::revoke`] and [`Directive`] reach requests
 //!   already running, by connection, request, session, account, tenant,
 //!   fingerprint, or source prefix.
@@ -144,6 +145,7 @@ pub use crate::{
     },
     revoke::{Revocation, RevocationEpoch, RevokeMode, Target},
     share::{Delta, ImportReport, NodeId, Sequence},
+    sources::SharedAddresses,
     strikes::{Enforcement, IgnoredBecause, Mode, Posture, StrikeKind, StrikeOutcome, StrikeRules},
     ticket::{LaneClass, Ticket, TicketId, TicketKind, TicketTag},
     time::Now,
@@ -161,6 +163,9 @@ pub const DEFAULT_BAN_CAPACITY: u32 = 1_048_576;
 
 /// Default revocation table capacity, in entries.
 pub const DEFAULT_REVOCATION_CAPACITY: u32 = 65_536;
+
+/// Default strike counter slots.
+pub const DEFAULT_STRIKE_CAPACITY: u32 = 262_144;
 
 /// Default automatic ban lengths for IPv4.
 pub const DEFAULT_IPV4_LENGTHS: &[u8] = &[32, 24];

@@ -10,7 +10,7 @@ use std::{
 use bouncer_io::{
     AccountKey, Actor, AllowList, BanKey, BanKeys, Bouncer, Budgets, Cidr, DatagramVerdict,
     Directive, DurationPolicy, Enforcement, EscalationPolicy, Event, EventSink, Filter, Mode, Page,
-    Rate, Reason, RequestId, SessionKey, StrikeKind, StrikeOutcome, signals,
+    Rate, Reason, RequestId, SessionKey, SharedAddresses, StrikeKind, StrikeOutcome, signals,
 };
 use clock_lib::ManualClock;
 
@@ -247,7 +247,7 @@ fn test_offender_memory_lengthens_and_decays() {
 
 #[test]
 fn test_shared_source_strikes_throttle_not_ban() {
-    // T-5: 500 sessions behind one address, one attacker.
+    // T-5: 500 accounts behind one address, one attacker.
     let b = Bouncer::builder()
         .budgets(Budgets::off())
         .enforcement(Enforcement::observe_all().enforce(StrikeKind::LoginFailed))
@@ -257,9 +257,10 @@ fn test_shared_source_strikes_throttle_not_ban() {
     let conn = b.door(nat).unwrap();
     for s in 0..500u32 {
         let mut r = conn.request(RequestId(u128::from(s))).unwrap();
-        let mut d = [0u8; 16];
-        d[..4].copy_from_slice(&s.to_be_bytes());
-        assert!(r.bind_session(SessionKey::from_digest(d)).is_pass());
+        assert!(
+            r.bind_account(AccountKey(0x1_0000 + u128::from(s)))
+                .is_pass()
+        );
     }
     assert!(b.explain(nat).shared_source);
     let attacker = SessionKey::from_digest([0xee; 16]);
@@ -288,21 +289,35 @@ fn test_shared_source_strikes_throttle_not_ban() {
 }
 
 #[test]
-fn test_shared_source_blocks_escalation() {
-    let b = Bouncer::builder().budgets(Budgets::off()).build().unwrap();
-    let nat = ip("198.51.100.77");
-    let conn = b.door(nat).unwrap();
-    for s in 0..100u8 {
-        let mut r = conn.request(RequestId(u128::from(s))).unwrap();
-        let _ = r.bind_session(SessionKey::from_digest([s; 16]));
-    }
-    assert!(b.explain(nat).shared_source);
-    for i in 1..=8u8 {
-        b.apply(local(IpAddr::from([198, 51, 100, i]))).unwrap();
-    }
+fn test_known_shared_ranges_block_escalation_and_detected_addresses_do_not() {
+    // D-137: a range the deployment names as shared keeps escalation off
+    // its prefix. An address flagged by detection does not: a client that
+    // earned the flag would otherwise shield its whole /24.
+    let run = |policy: SharedAddresses| {
+        let b = Bouncer::builder()
+            .budgets(Budgets::off())
+            .shared_addresses(policy)
+            .build()
+            .unwrap();
+        let nat = ip("198.51.100.77");
+        let conn = b.door(nat).unwrap();
+        for s in 0..100u32 {
+            let mut r = conn.request(RequestId(u128::from(s))).unwrap();
+            let _ = r.bind_account(AccountKey(0x2_0000 + u128::from(s)));
+        }
+        assert!(b.explain(nat).shared_source);
+        for i in 1..=8u8 {
+            b.apply(local(IpAddr::from([198, 51, 100, i]))).unwrap();
+        }
+        b.door(ip("198.51.100.200")).is_err()
+    };
     assert!(
-        b.door(ip("198.51.100.200")).is_ok(),
-        "no escalation over a shared address"
+        run(SharedAddresses::detect()),
+        "escalated over a detected address"
+    );
+    assert!(
+        !run(SharedAddresses::detect().known(&["198.51.100.77/32".parse().unwrap()])),
+        "no escalation over a known shared range"
     );
 }
 
@@ -408,25 +423,26 @@ fn test_lifted_children_do_not_count_toward_escalation() {
 }
 
 #[test]
-fn test_prefix_strikes_never_ban_over_a_shared_address() {
+fn test_prefix_strikes_never_ban_over_a_known_shared_range() {
     // T-5 and D-108: strikes from a /24's hosts reach the prefix threshold
-    // (40 at the default), but one of its addresses is flagged as shared,
-    // so the /24 is not banned; without the flag it is.
-    let run = |shared: bool| {
-        let b = Bouncer::builder()
+    // (40 at the default). A range named as shared keeps the /24 from being
+    // banned; an address flagged by detection does not (D-137), though its
+    // own strikes never count at the prefix.
+    let run = |policy: Option<SharedAddresses>| {
+        let mut builder = Bouncer::builder()
             .budgets(Budgets::off())
-            .enforcement(Enforcement::observe_all().enforce(StrikeKind::LoginFailed))
-            .build()
-            .unwrap();
-        let nat = ip("100.64.0.1");
-        if shared {
-            let conn = b.door(nat).unwrap();
-            for s in 0..100u8 {
-                let mut r = conn.request(RequestId(u128::from(s))).unwrap();
-                let _ = r.bind_session(SessionKey::from_digest([s; 16]));
-            }
-            assert!(b.explain(nat).shared_source);
+            .enforcement(Enforcement::observe_all().enforce(StrikeKind::LoginFailed));
+        if let Some(policy) = policy {
+            builder = builder.shared_addresses(policy);
         }
+        let b = builder.build().unwrap();
+        let nat = ip("100.64.0.1");
+        let conn = b.door(nat).unwrap();
+        for s in 0..100u32 {
+            let mut r = conn.request(RequestId(u128::from(s))).unwrap();
+            let _ = r.bind_account(AccountKey(0x3_0000 + u128::from(s)));
+        }
+        assert!(b.explain(nat).shared_source);
         // Four strikes from each of twelve hosts: none reaches its own
         // threshold, the /24 passes 40.
         for h in 10..22u8 {
@@ -439,8 +455,41 @@ fn test_prefix_strikes_never_ban_over_a_shared_address() {
         }
         b.door(ip("100.64.0.200")).is_err()
     };
-    assert!(run(false), "the /24 is banned when nothing in it is shared");
-    assert!(!run(true), "no prefix ban over a shared address");
+    assert!(run(None), "the /24 is banned over a detected address");
+    assert!(
+        !run(Some(
+            SharedAddresses::detect().known(&["100.64.0.1/32".parse().unwrap()])
+        )),
+        "no prefix ban over a known shared range"
+    );
+
+    // The shared address's own strikes do not add up to a prefix ban.
+    let b = Bouncer::builder()
+        .budgets(Budgets::off())
+        .enforcement(Enforcement::observe_all().enforce(StrikeKind::LoginFailed))
+        .build()
+        .unwrap();
+    let nat = ip("100.64.0.2");
+    let conn = b.door(nat).unwrap();
+    for s in 0..100u32 {
+        let mut r = conn.request(RequestId(u128::from(s))).unwrap();
+        let _ = r.bind_account(AccountKey(0x4_0000 + u128::from(s)));
+    }
+    for _ in 0..4 {
+        let _ = conn.strike(StrikeKind::LoginFailed);
+    }
+    for h in 10..19u8 {
+        for _ in 0..4 {
+            let _ = b
+                .door(IpAddr::from([100, 64, 0, h]))
+                .unwrap()
+                .strike(StrikeKind::LoginFailed);
+        }
+    }
+    assert!(
+        b.door(ip("100.64.0.200")).is_ok(),
+        "36 strikes from ordinary hosts, the shared address's not counted"
+    );
 }
 
 #[test]
@@ -454,9 +503,10 @@ fn test_connection_ban_never_takes_a_shared_address_on_a_weak_word() {
         let conn = b.door(nat).unwrap();
         for s in 0..500u32 {
             let mut r = conn.request(RequestId(u128::from(s))).unwrap();
-            let mut d = [0u8; 16];
-            d[..4].copy_from_slice(&s.to_be_bytes());
-            assert!(r.bind_session(SessionKey::from_digest(d)).is_pass());
+            assert!(
+                r.bind_account(AccountKey(0x1_0000 + u128::from(s)))
+                    .is_pass()
+            );
         }
         assert!(b.explain(nat).shared_source);
         (b, nat, conn)
@@ -545,9 +595,10 @@ fn test_decoy_touch_behind_a_shared_address_bans_the_identities_only() {
     let conn = b.door(nat).unwrap();
     for s in 0..500u32 {
         let mut r = conn.request(RequestId(u128::from(s))).unwrap();
-        let mut d = [0u8; 16];
-        d[..4].copy_from_slice(&s.to_be_bytes());
-        assert!(r.bind_session(SessionKey::from_digest(d)).is_pass());
+        assert!(
+            r.bind_account(AccountKey(0x1_0000 + u128::from(s)))
+                .is_pass()
+        );
     }
     assert!(b.explain(nat).shared_source);
     let toucher = SessionKey::from_digest([0xdc; 16]);

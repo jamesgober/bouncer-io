@@ -211,6 +211,7 @@ const fn catalog(id: u32) -> (&'static str, Category, f32) {
         26 => ("bouncer.ban.refused_allowlisted", Category::Policy, 3.0),
         30 => ("bouncer.strike", Category::Abuse, 2.0),
         31 => ("bouncer.threshold.reached", Category::Abuse, 4.0),
+        32 => ("bouncer.strike.table_full", Category::Abuse, 5.0),
         40 => ("bouncer.source.shared_suspected", Category::Anomaly, 1.0),
         50 => ("bouncer.persist.failed", Category::Integrity, 6.0),
         51 => ("bouncer.import.rejected", Category::Integrity, 5.0),
@@ -272,6 +273,9 @@ pub mod signals {
     pub const STRIKE: SignalId = SignalId::new(30);
     /// A local threshold was reached (observe or enforce).
     pub const THRESHOLD_REACHED: SignalId = SignalId::new(31);
+    /// The strike counters were full: a counter with fewer strikes gave up
+    /// its slot (sampled). Raise `strike_capacity`.
+    pub const STRIKE_TABLE_FULL: SignalId = SignalId::new(32);
     /// An address was flagged as shared.
     pub const SOURCE_SHARED_SUSPECTED: SignalId = SignalId::new(40);
     /// A persistence write or load failed.
@@ -448,7 +452,7 @@ impl Sampler {
 /// The samplers of the sampled signals: door refusals (ban, budget,
 /// registry full), identity budget refusals, and expiries.
 #[derive(Default)]
-pub(crate) struct Samplers([Sampler; 5]);
+pub(crate) struct Samplers([Sampler; 6]);
 
 impl Samplers {
     fn get(&self, signal: SignalId) -> Option<&Sampler> {
@@ -458,6 +462,7 @@ impl Samplers {
             3 => 2,
             5 => 3,
             23 => 4,
+            32 => 5,
             _ => return None,
         };
         Some(&self.0[i])

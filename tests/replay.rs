@@ -285,9 +285,13 @@ fn test_replay_credential_stuffing_from_a_48_bans_the_48() {
 
 #[test]
 fn test_replay_cgnat_population_keeps_its_users_and_loses_its_attacker() {
-    // 2,000 users behind one carrier-grade NAT address, each connecting
-    // every 20 seconds on average and holding the connection for 2 seconds;
-    // one of them tries passwords against one account. Default budgets.
+    // 2,000 logged-in users behind one carrier-grade NAT address, each
+    // connecting every 20 seconds on average and holding the connection for
+    // 2 seconds; one of them tries passwords against one account. Default
+    // budgets. The address is shared (by its accounts), so its threshold
+    // throttles it instead of banning it, and the throttle slows the whole
+    // address at the door until it ends (D-137): the NAT's users are slowed,
+    // never banned, and nothing they bind is denied.
     let mut r = Replay::new(
         Budgets::default(),
         Enforcement::observe_all().enforce(StrikeKind::LoginFailed),
@@ -306,7 +310,12 @@ fn test_replay_cgnat_population_keeps_its_users_and_loses_its_attacker() {
         // 2,000 users every 20 s: one connection per 10 ms on average.
         if let Some(conn) = r.connect(nat, false) {
             let user = rng.below(2000);
-            let _ = r.request(&conn, session(user), None, false);
+            let _ = r.request(
+                &conn,
+                session(user),
+                Some(AccountKey(0x5_0000 + u128::from(user))),
+                false,
+            );
             held.push_back((ms, conn));
         }
         if tick % 100 == 0 {
@@ -324,9 +333,18 @@ fn test_replay_cgnat_population_keeps_its_users_and_loses_its_attacker() {
         "cgnat: {:?} {:?} attacker served after a minute {attacker_served_late}",
         r.attacker, r.innocent
     );
-    assert!(r.bouncer.explain(nat).shared_source);
-    assert!(r.bouncer.door(nat).is_ok(), "the address is not banned");
+    let shown = r.bouncer.explain(nat);
+    assert!(shown.shared_source);
+    assert!(
+        shown.bans.is_empty(),
+        "the address is not banned: {shown:?}"
+    );
     assert_eq!(attacker_served_late, 0, "the attacker's session is");
-    assert_eq!(r.innocent.refused, 0, "{:?}", r.innocent);
+    let attempts = r.innocent.admitted + r.innocent.refused;
+    assert!(
+        r.innocent.admitted * 100 >= attempts * 45,
+        "throttled, not shut out: {:?}",
+        r.innocent
+    );
     assert_eq!(r.innocent.denied, 0);
 }

@@ -91,8 +91,6 @@ meters! {
     refused_budget,
     /// Refused at the door: no free ticket.
     refused_registry_full,
-    /// Refused at the door by the strict posture.
-    refused_posture,
     /// Checkpoints that took the one-load fast path.
     checkpoints_fast,
     /// Checkpoints that took the slow path.

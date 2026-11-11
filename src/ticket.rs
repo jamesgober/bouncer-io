@@ -629,11 +629,15 @@ impl Ticket {
     }
 
     /// Checkpoint B1': sets the real client learned from a trusted proxy and
-    /// runs the door's allow and ban steps on it.
+    /// runs the door's allow, ban, and budget steps on it.
     ///
     /// With the PROXY protocol, the transport calls it on the connection
-    /// ticket; with forwarded headers, the protocol adapter calls it on each
-    /// request ticket (a proxy may carry many clients over one connection).
+    /// ticket, and the client is charged the door budgets once for the
+    /// connection; with forwarded headers, the protocol adapter calls it on
+    /// each request ticket (a proxy may carry many clients over one
+    /// connection), and the client is charged once per request, its
+    /// concurrency slot held until the request ends. Over budget is the same
+    /// `Deny` as a ban.
     /// Until a client is bound, a request under a proxy hop is denied at
     /// every checkpoint. Binding is allowed once, only from a trusted
     /// provenance, and only on a proxy hop; anything else is a `Deny` with
@@ -685,9 +689,11 @@ impl Ticket {
             }
             Judgement::Refuse(_) => return self.deny(DenialCode::Unavailable),
         };
-        // A PROXY-protocol client is a connection: it is charged the door
-        // budgets the proxy hop was not.
-        let charge = self.kind == TicketKind::Connection && !exempt;
+        // The client is charged the door budgets the proxy hop was not: a
+        // PROXY-protocol client once for its connection, a client named by a
+        // forwarded header once for each request, which holds its
+        // concurrency slot until the request ends (F-3).
+        let charge = !exempt;
         let charged = if charge {
             match shared.budgets.admit(addr, now, shared.door_divisor(), || {
                 shared.sources.is_shared(addr, now.secs())
@@ -1047,8 +1053,10 @@ impl Ticket {
             }
             Bound::Written => {
                 let verdict = self.checkpoint();
-                if verdict.is_pass() && (kind == table::KIND_SESSION || kind == table::KIND_ACCOUNT)
-                {
+                // Only accounts are evidence of a shared address: a client
+                // mints sessions at will (a login, a dropped cookie), so
+                // sessions would let it flag its own address (D-137).
+                if verdict.is_pass() && kind == table::KIND_ACCOUNT {
                     self.note_identity(hi.unwrap_or(0), lo);
                 }
                 verdict
@@ -1123,7 +1131,7 @@ impl Ticket {
         Bound::Written
     }
 
-    /// Counts a session or account toward shared-address detection.
+    /// Counts an account toward shared-address detection.
     fn note_identity(&self, k0: u64, k1: u64) {
         let shared = &*self.shard.shared;
         let cell = shared.registry.cell(self.index);
@@ -1699,6 +1707,16 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
             // The connection may still name it as its latest request; the
             // egress check sees it is no longer live.
             uncount_child(shared, pi, pg);
+            // A forwarded-header client's request holds door concurrency.
+            let charged = crate::budgets::Charged::from_flags(
+                st & F_CHARGED != 0,
+                st & crate::registry::F_CHARGED_PREFIX != 0,
+            );
+            if charged != crate::budgets::Charged::NONE {
+                shared
+                    .budgets
+                    .release_connection(source_present(cell, present_child), charged);
+            }
         }
     }
     if st & F_TENANT_CHARGED != 0 {

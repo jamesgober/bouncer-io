@@ -13,13 +13,26 @@
 
 ## [0.10.0] - 2026-11-11
 
-The API simplified after an audit against the simple-API rule (D-136, `dev/API-AUDIT-0.10.md`). A breaking release: `docs/release/v0.10.0.md` has the migration.
+The API simplified after an audit against the simple-API rule (D-136, `dev/API-AUDIT-0.10.md`), and every finding of an independent security and performance review fixed (D-137 to D-143). A breaking release: `docs/release/v0.10.0.md` has the migration.
+
+### Security
+
+- Shared-address protection now needs evidence a client cannot mint: distinct accounts, not sessions, or ranges the deployment names. A shared address keeps ceilings: a throttle on it slows it at the door, a second threshold while it is throttled bans it, its strikes do not add up to a prefix ban, and only named ranges stop escalation (D-137).
+- Clients named by a forwarded header are charged the door budgets, once per request (D-138).
+- A full strike counter table no longer ignores strikes: the counter with the fewest strikes gives up its slot, and each counter is judged idle by its own kind's window (D-139).
+- An unverified datagram earns no exemption from the allow list or the trusted proxies (D-140).
+- Concurrent allow-list replacements can no longer leave the door skipping the list (D-143).
+- `Collected::clear` and `truncate` also wipe bytes written through `spare` and not committed (D-143).
+- An automated actor's throttle of an allow-listed source is refused, as its bans are.
 
 ### Added
 
 - `BouncerError::Refused(Refusal)` and `From<Refusal> for BouncerError`, so `bouncer.door(peer)?` works in a function that returns `BouncerError`.
 - `Target::FingerprintIn` and `From<BanKey> for Target`: a directive bans and lifts every key that `ban` and `lift` take. A revocation or a throttle of `FingerprintIn` is `InvalidTarget`.
 - Blanket impls of `EventSink`, `Ejector`, and `DenialFormat` for `Arc<T>`, and of `Persistence` and `VersionAnchor` for `Box<T>`.
+- `SharedAddresses` and `BouncerBuilder::shared_addresses`: detection by accounts (the default), named ranges, or off.
+- `BouncerBuilder::strike_capacity` (default 262,144), `Capacity::strike_counters`, `DEFAULT_STRIKE_CAPACITY`, and the sampled signal `STRIKE_TABLE_FULL` (`bouncer.strike.table_full`).
+- `Bouncer::apply_all`: a batch of directives, with the administrator prefix set built once (D-142).
 
 ### Changed
 
@@ -28,12 +41,18 @@ The API simplified after an audit against the simple-API rule (D-136, `dev/API-A
 - `BouncerBuilder::try_build` is now `build`.
 - The builder takes its plug-ins by value: `event_sink`, `ejector`, `denial_format`, `clock`, `persistence`, and `version_anchor` accept `impl Trait + 'static`. An `Arc` (or a `Box` of a store) still works.
 - `Delta::last` is now `Delta::last_sequence`.
+- `ipv6_lengths` must include 64, where an address ban is kept.
+- A full revocation table reclaims, inline, what no live ticket needs before it refuses, so a bouncer with no maintainer thread does not stay full (D-141).
+- Administrator prefixes are kept by prefix (O(log n) to add or remove), and listed in prefix order.
+- `bind_fingerprint` no longer allocates once compound fingerprint bans exist, and the per-thread caches hold four bouncers.
+- `door_at` documents that its time must come from the bouncer's clock.
 - The crate-level docs describe the crate as it is, Tier 1 first. `docs/API.md` lists every public item.
 
 ### Removed
 
 - `BanSpec` and `LiftSpec` (use `Directive::ban` and `Directive::lift`).
 - `Ticket::is_cancelled` (use `checkpoint().is_deny()`).
+- `Refusal::Posture` and `MetricsSnapshot::refused_posture`: nothing produced them; the strict posture refuses through the door budgets (`Refusal::OverBudget`).
 
 ## [0.9.3] - 2026-11-11
 

@@ -782,10 +782,25 @@ impl Bouncer {
     pub fn replace_allow(&self, list: AllowList) -> Result<(), BouncerError> {
         let shared = self.shared();
         let set = list.compile()?;
-        // Swap first: a ban racing this call is checked against the new list.
         let len = set.len() as u32;
-        shared.allow.store(set);
-        shared.allow_len.store(len, crate::sync::Ordering::Release);
+        {
+            // One replacement at a time, so the list and its length come from
+            // the same call (F-8). The door skips the list while the length
+            // reads 0, so the length says "non-empty" before a non-empty list
+            // is visible, and "empty" only after an empty one is. Swap before
+            // lifting: a ban racing this call is checked against the new list.
+            let _one = shared
+                .allow_writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if len > 0 {
+                shared.allow_len.store(len, crate::sync::Ordering::Release);
+                shared.allow.store(set);
+            } else {
+                shared.allow.store(set);
+                shared.allow_len.store(0, crate::sync::Ordering::Release);
+            }
+        }
         let lifted = shared.bans.lift_covered(|c| shared.immune_covers(c));
         for h in &lifted {
             Emit {

@@ -95,11 +95,14 @@ fn test_hot_paths_do_not_allocate() {
     assert_eq!(n, 0, "door, request, checkpoint, and release allocated");
 
     let ((), n) = counted(|| {
-        for _ in 0..100 {
+        for i in 0..100u32 {
             let hop = b.door("10.0.0.1".parse().unwrap()).unwrap();
             let mut req = hop.request(RequestId(2)).unwrap();
+            // A new client each time: a forwarded client is charged the door
+            // budgets per request.
+            let client = IpAddr::from((0x0c00_0000 | (i << 8)).to_be_bytes());
             assert!(
-                req.bind_client(admitted, Provenance::ForwardedHeader)
+                req.bind_client(client, Provenance::ForwardedHeader)
                     .is_pass()
             );
             assert!(req.checkpoint().is_pass());
