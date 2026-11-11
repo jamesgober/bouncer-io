@@ -37,7 +37,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u16);
 
-/// A position in a node's outbound log. Pass [`Delta::last`] as `since` to
+/// A position in a node's outbound log. Pass [`Delta::last_sequence`] as `since` to
 /// the next [`export_delta`](crate::Bouncer::export_delta).
 ///
 /// # Examples
