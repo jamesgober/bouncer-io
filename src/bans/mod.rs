@@ -144,7 +144,7 @@ impl BanSpec {
     }
 
     /// Lasts exactly `duration`.
-    #[cfg(test)]
+    #[cfg(all(test, not(bouncer_loom)))]
     #[must_use]
     pub(crate) fn for_duration(mut self, duration: Duration) -> BanSpec {
         self.duration = BanDuration::Fixed(duration);
@@ -152,7 +152,7 @@ impl BanSpec {
     }
 
     /// Lasts until lifted.
-    #[cfg(test)]
+    #[cfg(all(test, not(bouncer_loom)))]
     #[must_use]
     pub(crate) fn permanent(mut self) -> BanSpec {
         self.duration = BanDuration::Permanent;
