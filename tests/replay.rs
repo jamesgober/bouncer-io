@@ -11,8 +11,8 @@
 use std::{net::IpAddr, sync::Arc, time::Duration};
 
 use bouncer_io::{
-    AccountKey, Bouncer, Budgets, ConnId, Enforcement, Provenance, Refusal, RequestId, SessionKey,
-    StrikeKind, Ticket,
+    AccountKey, Bouncer, Budgets, ConnectionId, Enforcement, Provenance, Refusal, RequestId,
+    SessionKey, StrikeKind, Ticket,
 };
 use clock_lib::ManualClock;
 
@@ -67,7 +67,7 @@ impl Replay {
             .clock(clock.clone())
             .budgets(budgets)
             .enforcement(enforcement)
-            .try_build()
+            .build()
             .unwrap();
         Replay {
             clock,
@@ -99,7 +99,7 @@ impl Replay {
 
     /// A connection from `peer`, as net-io's gate opens it.
     fn connect(&mut self, peer: IpAddr, attacker: bool) -> Option<Ticket> {
-        let conn = ConnId(self.next_conn);
+        let conn = ConnectionId(self.next_conn);
         self.next_conn += 1;
         let now = self.bouncer.now();
         match self.bouncer.door_at(conn, peer, Provenance::Socket, now) {

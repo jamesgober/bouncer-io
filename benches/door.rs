@@ -9,7 +9,7 @@ mod fixture;
 
 use std::hint::black_box;
 
-use bouncer_io::{ConnId, Provenance, RequestId};
+use bouncer_io::{ConnectionId, Provenance, RequestId};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 fn benches(c: &mut Criterion) {
@@ -25,7 +25,7 @@ fn benches(c: &mut Criterion) {
         bench.iter(|| {
             i = (i + 1) & 4095;
             let t = b.door_at(
-                ConnId(i as u64),
+                ConnectionId(i as u64),
                 black_box(admitted[i]),
                 Provenance::Socket,
                 now,
@@ -37,7 +37,7 @@ fn benches(c: &mut Criterion) {
         bench.iter(|| {
             i = (i + 1) % banned.len();
             let t = b.door_at(
-                ConnId(i as u64),
+                ConnectionId(i as u64),
                 black_box(banned[i]),
                 Provenance::Socket,
                 now,

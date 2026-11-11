@@ -552,7 +552,7 @@ impl Directive {
     /// use std::time::Duration;
     /// let bouncer = Bouncer::builder()
     ///     .budgets(Budgets::off().door_rate(Rate::per_minute(8), Rate::per_minute(1_000)))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let addr: std::net::IpAddr = "198.51.100.40".parse()?;
     /// let applied = bouncer.apply(Directive::throttle(addr, 4, Duration::from_secs(600)))?;
     /// assert!(applied.throttled);
@@ -666,7 +666,7 @@ impl Directive {
     /// use clock_lib::ManualClock;
     /// use std::{sync::Arc, time::Duration};
     /// let clock = Arc::new(ManualClock::new());
-    /// let bouncer = Bouncer::builder().clock(clock.clone()).try_build()?;
+    /// let bouncer = Bouncer::builder().clock(clock.clone()).build()?;
     /// let addr: std::net::IpAddr = "198.51.100.46".parse()?;
     /// bouncer.apply(Directive::ban(addr).for_duration(Duration::from_secs(300)))?;
     /// clock.advance(Duration::from_secs(299));
@@ -721,7 +721,7 @@ impl Directive {
     /// // No maintainer thread, so the sweep runs inside `apply`.
     /// let bouncer = Bouncer::new();
     /// let idle = bouncer.door("192.0.2.61".parse()?)?;
-    /// let applied = bouncer.apply(Directive::revoke(idle.conn()).eject_now())?;
+    /// let applied = bouncer.apply(Directive::revoke(idle.connection()).eject_now())?;
     /// assert_eq!(applied.revocation.and_then(|r| r.matched_live), Some(1));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -825,7 +825,7 @@ impl Directive {
     /// }
     /// static PAIRS: [(&str, EvidenceValue<'static>); 1] = [("failed_logins", EvidenceValue::Number(12))];
     /// let kept = Arc::new(Kept::default());
-    /// let bouncer = Bouncer::builder().event_sink(kept.clone()).try_build()?;
+    /// let bouncer = Bouncer::builder().event_sink(kept.clone()).build()?;
     /// let addr: std::net::IpAddr = "198.51.100.48".parse()?;
     /// bouncer.apply(Directive::ban(addr).evidence(Evidence::new(&PAIRS)))?;
     /// assert_eq!(*kept.0.lock().unwrap(), [12]);

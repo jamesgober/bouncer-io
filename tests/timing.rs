@@ -16,7 +16,7 @@
 
 use std::{hint::black_box, net::IpAddr, time::Instant};
 
-use bouncer_io::{BanSpec, Bouncer, Budgets, ConnId, Provenance, RequestId, SessionKey};
+use bouncer_io::{Bouncer, Budgets, ConnectionId, Provenance, RequestId, SessionKey};
 
 /// Calls per batch: Windows' clock resolves 100 ns.
 const BATCH: usize = 64;
@@ -93,7 +93,7 @@ fn fixture() -> (Bouncer, Vec<IpAddr>, Vec<IpAddr>, Vec<IpAddr>) {
         .budgets(Budgets::off())
         .tickets(1 << 16)
         .ban_capacity(1 << 18)
-        .try_build()
+        .build()
         .unwrap();
     let mut dirty = Vec::new();
     let mut clean = Vec::new();
@@ -103,7 +103,7 @@ fn fixture() -> (Bouncer, Vec<IpAddr>, Vec<IpAddr>, Vec<IpAddr>) {
         // 13.0.0.0/8 clean ones, with the same host numbers.
         let net = 0x0a00_0000 + (i << 8);
         let host = net + 1;
-        b.ban(BanSpec::address(v4(host))).unwrap();
+        b.ban(v4(host)).unwrap();
         banned.push(v4(host));
         let probe = 2 + (i % 250);
         dirty.push(v4(net + probe));
@@ -115,7 +115,7 @@ fn fixture() -> (Bouncer, Vec<IpAddr>, Vec<IpAddr>, Vec<IpAddr>) {
 fn door_case(b: &Bouncer, a: &[IpAddr], c: &[IpAddr]) -> (f64, f64, f64, f64) {
     let now = b.now();
     let (mut ta, mut tc) = interleaved(a, c, |peer, n| {
-        let r = b.door_at(ConnId(n as u64), peer, Provenance::Socket, now);
+        let r = b.door_at(ConnectionId(n as u64), peer, Provenance::Socket, now);
         black_box(r.is_ok());
     });
     let (ma, mc) = (median(&ta), median(&tc));
@@ -156,7 +156,7 @@ fn test_timing_bind_does_not_reveal_near_banned_digests() {
     let b = Bouncer::builder()
         .budgets(Budgets::off())
         .ban_capacity(1 << 16)
-        .try_build()
+        .build()
         .unwrap();
     // 1,000 banned sessions; "near" digests differ from one in the last
     // byte only, "far" digests are unrelated.
@@ -166,7 +166,7 @@ fn test_timing_bind_does_not_reveal_near_banned_digests() {
         let mut d = [0u8; 16];
         d[..4].copy_from_slice(&i.to_le_bytes());
         d[4..8].copy_from_slice(&0x5eed_u32.to_le_bytes());
-        b.ban(BanSpec::key(SessionKey::from_digest(d))).unwrap();
+        b.ban(SessionKey::from_digest(d)).unwrap();
         for last in 1..=4u8 {
             let mut n = d;
             n[15] = last;

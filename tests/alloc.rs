@@ -61,7 +61,7 @@ fn test_hot_paths_do_not_allocate() {
         .tickets(4096)
         .ban_capacity(4096)
         .trusted_proxies(&[proxy])
-        .try_build()
+        .build()
         .unwrap();
     for i in 0..500u32 {
         b.ban(IpAddr::from((0xc633_6400 | i).to_be_bytes()))

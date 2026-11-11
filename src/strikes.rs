@@ -217,7 +217,7 @@ impl StrikeRules {
     /// use bouncer_io::{Bouncer, StrikeKind, StrikeOutcome, StrikeRules};
     /// use std::time::Duration;
     /// let rules = StrikeRules::default().rule(StrikeKind::LoginFailed, 1, 2, Duration::from_secs(300));
-    /// let bouncer = Bouncer::builder().strikes(rules).try_build()?;
+    /// let bouncer = Bouncer::builder().strikes(rules).build()?;
     /// let conn = bouncer.door("192.0.2.5".parse()?)?;
     /// assert_eq!(conn.strike(StrikeKind::LoginFailed), StrikeOutcome::Counted);
     /// // The second reaches the threshold of 2 (observed: nothing is banned).
@@ -254,7 +254,7 @@ impl StrikeRules {
     /// let bouncer = Bouncer::builder()
     ///     .strikes(rules)
     ///     .enforcement(Enforcement::enforce_all())
-    ///     .try_build()?;
+    ///     .build()?;
     /// let conn = bouncer.door("192.0.2.5".parse()?)?;
     /// let _ = conn.strike(StrikeKind::Malformed);
     /// let ban = &bouncer.explain("192.0.2.5".parse::<std::net::IpAddr>()?).bans[0];

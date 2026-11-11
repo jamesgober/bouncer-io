@@ -45,7 +45,7 @@ impl Now {
     /// use clock_lib::ManualClock;
     /// use std::{sync::Arc, time::Duration};
     /// let clock = Arc::new(ManualClock::new());
-    /// let bouncer = Bouncer::builder().clock(clock.clone()).try_build()?;
+    /// let bouncer = Bouncer::builder().clock(clock.clone()).build()?;
     /// clock.advance(Duration::from_millis(3));
     /// assert_eq!(bouncer.now().as_nanos(), 3_000_000);
     /// # Ok::<(), bouncer_io::BouncerError>(())

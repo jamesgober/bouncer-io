@@ -22,7 +22,7 @@ use std::{
 };
 
 use bouncer_io::{
-    BanSpec, Bouncer, ConnId, LiftSpec, MaintainerState, Provenance, Reason, Refusal, RequestId,
+    Bouncer, ConnectionId, Directive, MaintainerState, Provenance, Reason, Refusal, RequestId,
     SessionKey,
 };
 
@@ -119,7 +119,7 @@ fn soak_connections_bans_and_revocations() {
         .tickets(1 << 16)
         .ban_capacity(1 << 17)
         .maintainer(true)
-        .try_build()
+        .build()
         .unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let counts = Arc::new(Counts::default());
@@ -141,7 +141,7 @@ fn soak_connections_bans_and_revocations() {
                     std::thread::sleep(due - now);
                 }
                 for _ in 0..64 {
-                    let id = ConnId((w << 48) | n);
+                    let id = ConnectionId((w << 48) | n);
                     n += 1;
                     match b.door_at(id, rng.client(), Provenance::Socket, b.now()) {
                         Ok(conn) => {
@@ -172,13 +172,13 @@ fn soak_connections_bans_and_revocations() {
             let mut recent: Vec<IpAddr> = Vec::with_capacity(16);
             while !stop.load(Ordering::Relaxed) {
                 let addr = rng.offender();
-                let spec = BanSpec::address(addr).for_duration(Duration::from_secs(30));
-                if b.ban(spec).is_ok() {
+                let ban = Directive::ban(addr).for_duration(Duration::from_secs(30));
+                if b.apply(ban).is_ok() {
                     counts.bans.fetch_add(1, Ordering::Relaxed);
                     recent.push(addr);
                 }
                 if recent.len() == 10 {
-                    if b.lift(LiftSpec::key(recent[0])).is_ok() {
+                    if b.lift(recent[0]).is_ok() {
                         counts.lifts.fetch_add(1, Ordering::Relaxed);
                     }
                     recent.clear();

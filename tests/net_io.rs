@@ -200,7 +200,7 @@ fn test_net_io_proxy_header_names_the_client_the_door_judges() {
     // trusted proxy and asks the gate again with the real client.
     let bouncer = Bouncer::builder()
         .trusted_proxies(&["127.0.0.1/32".parse().unwrap()])
-        .try_build()
+        .build()
         .expect("bouncer");
     bouncer
         .ban("203.0.113.9".parse::<IpAddr>().unwrap())
@@ -251,11 +251,11 @@ fn test_net_io_a_bouncer_with_its_own_clock_judges_on_it() {
     let clock = std::sync::Arc::new(clock_lib::ManualClock::new());
     let bouncer = Bouncer::builder()
         .clock(clock.clone())
-        .try_build()
+        .build()
         .expect("bouncer");
     bouncer
-        .ban(
-            bouncer_io::BanSpec::address("203.0.113.9".parse::<IpAddr>().unwrap())
+        .apply(
+            bouncer_io::Directive::ban("203.0.113.9".parse::<IpAddr>().unwrap())
                 .for_duration(Duration::from_secs(3600)),
         )
         .expect("ban");
@@ -370,7 +370,7 @@ fn test_net_io_ejector_closes_an_idle_connection() {
     let ejector = std::sync::Arc::new(bouncer_io::NetIoEjector::new());
     let bouncer = Bouncer::builder()
         .ejector(ejector.clone())
-        .try_build()
+        .build()
         .expect("bouncer");
     let (server, addr, _rx) = server(&bouncer);
     assert!(ejector.attach(server.handle()));
@@ -399,7 +399,7 @@ fn test_net_io_readmit_binds_the_proxied_client_and_refuses_a_banned_one() {
     let proxy = bouncer_io::Cidr::new("192.0.2.1".parse().unwrap(), 32).unwrap();
     let bouncer = Bouncer::builder()
         .trusted_proxies(&[proxy])
-        .try_build()
+        .build()
         .expect("bouncer");
     bouncer
         .ban("203.0.113.9".parse::<IpAddr>().unwrap())
@@ -456,7 +456,7 @@ fn test_net_io_every_refusal_is_the_same_close() {
     use bouncer_io::Budgets;
     let bouncer = Bouncer::builder()
         .budgets(Budgets::off().door_concurrency(1, 1))
-        .try_build()
+        .build()
         .expect("bouncer");
     let (server, addr, _rx) = server(&bouncer);
     let mut held = client(addr);
@@ -484,7 +484,7 @@ fn test_net_io_slow_reader_is_aborted_without_waiting_for_it() {
     let ejector = std::sync::Arc::new(bouncer_io::NetIoEjector::new());
     let bouncer = Bouncer::builder()
         .ejector(ejector.clone())
-        .try_build()
+        .build()
         .expect("bouncer");
     let (server, addr, _rx) = server(&bouncer);
     assert!(ejector.attach(server.handle()));

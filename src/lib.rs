@@ -23,24 +23,54 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
+//! Banning is one line, and so is a logout that stops the session's running
+//! requests. Anything more than the key (who decided, why, for how long) is a
+//! [`Directive`], the message every other layer of the stack sends:
+//!
+//! ```
+//! use bouncer_io::{Actor, Bouncer, Directive, Reason, SessionKey};
+//! use std::time::Duration;
+//!
+//! let bouncer = Bouncer::new();
+//! bouncer.ban("2001:db8:7::/48".parse::<bouncer_io::Cidr>()?)?;
+//! bouncer.revoke(SessionKey::from_digest([1; 16]), Reason::LOGOUT)?;
+//! bouncer.apply(
+//!     Directive::ban("198.51.100.20".parse::<std::net::IpAddr>()?)
+//!         .for_duration(Duration::from_secs(3600))
+//!         .by(Actor::Admin(17))
+//!         .because(Reason::ADMIN),
+//! )?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
 //! ## What is here
 //!
-//! - **Keys**: [`Cidr`] (strict parsing, IPv4-mapped IPv6 normalized to IPv4),
-//!   connection and request ids, and identity digests ([`SessionKey`],
-//!   [`FingerprintKey`]) that compare in constant time and never print.
-//! - **Ban memory**: bans by address, prefix, and identity, timed by a
-//!   growing [`DurationPolicy`] with jitter, or permanent by administrators.
-//!   IPv6 clients are keyed at /64. Readers never take a lock.
 //! - **The door**: [`Bouncer::door`] checks trusted proxies, the
-//!   [`AllowList`], and ban memory, and issues a [`Ticket`].
-//! - **Tickets and checkpoints**: [`Ticket::request`],
-//!   [`Ticket::checkpoint`], and [`Ticket::bind_client`] for the real client
-//!   behind a trusted proxy.
+//!   [`AllowList`], ban memory, and the door budgets before a byte is read,
+//!   and issues a connection [`Ticket`]. A [`Refusal`] converts into
+//!   [`BouncerError`], so `?` works.
+//! - **Tickets and checkpoints**: [`Ticket::request`] issues a request
+//!   ticket; [`Ticket::checkpoint`], [`Ticket::before_commit`], and the
+//!   identity binds return a [`Verdict`]; [`Ticket::deny_and_eject`] wipes
+//!   the response collected so far in a [`Collected`], replaces it with a
+//!   generic denial, closes the connection, and remembers the offender.
+//! - **Revocation**: [`Bouncer::revoke`] and [`Directive`] reach requests
+//!   already running, by connection, request, session, account, tenant,
+//!   fingerprint, or source prefix.
+//! - **Ban memory**: bans by address, prefix, and identity, timed by a growing
+//!   [`DurationPolicy`], escalated to prefixes ([`EscalationPolicy`]), and fed
+//!   by strikes from every layer ([`StrikeRules`], [`Enforcement`]).
+//! - **Budgets**: accept rate and concurrency at the door, per lane and per
+//!   tenant ([`Budgets`]).
+//! - **Operations**: [`Bouncer::explain`], [`Bouncer::list`],
+//!   [`Bouncer::health`], security [`Event`]s, persistence
+//!   ([`FilePersistence`], [`VersionAnchor`]), and sharing across nodes
+//!   ([`Delta`]).
+//! - **net-io** (feature `net-io`): `Bouncer` is net-io's `Gate`.
 //!
-//! In-flight revocation, wipe-replace-eject, strikes, budgets, and events
-//! arrive in 0.4; persistence, sharing across nodes, and administration in
-//! 0.5. The full planned API is in `docs/API.md` in the
-//! [repository](https://github.com/jamesgober/bouncer-io).
+//! The configuration lives on [`Bouncer::builder`]. `docs/API.md` in the
+//! [repository](https://github.com/jamesgober/bouncer-io) is the full
+//! reference.
 
 #![doc(html_root_url = "https://docs.rs/bouncer-io")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -92,9 +122,7 @@ pub use crate::{
         OffenderRecord, Page, StrikeState,
     },
     allow::{AllowKind, AllowList},
-    bans::{
-        BanDuration, BanId, BanSpec, DurationPolicy, LiftSpec, Lifted, escalate::EscalationPolicy,
-    },
+    bans::{BanDuration, BanId, DurationPolicy, Lifted, escalate::EscalationPolicy},
     bouncer::{Bouncer, BouncerBuilder, Capacity},
     budgets::{Budgets, Rate},
     collected::Collected,
@@ -106,8 +134,8 @@ pub use crate::{
     events::{Category, Event, EventSink, GENERATOR, NoSink, SignalId, Subject, signals},
     format::{DenialFormat, Ejected, FormatError, NoFormat},
     keys::{
-        AccountKey, BanKey, Cidr, ConnId, Family, FingerprintKey, RequestId, SessionKey, TenantKey,
-        normalize, prefix_of,
+        AccountKey, BanKey, Cidr, ConnectionId, Family, FingerprintKey, RequestId, SessionKey,
+        TenantKey, normalize, prefix_of,
     },
     maintain::{CloseKind, Ejector, MaintenanceReport},
     persist::{

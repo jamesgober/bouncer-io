@@ -132,7 +132,7 @@ impl Rate {
     /// use bouncer_io::{Bouncer, Budgets, Rate};
     /// let bouncer = Bouncer::builder()
     ///     .budgets(Budgets::off().door_rate(Rate::per_minute(1).burst(3), Rate::per_minute(1_000)))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let addr: std::net::IpAddr = "192.0.2.80".parse()?;
     /// // One a minute, but three may arrive at once.
     /// let admitted = (0..5).filter(|_| bouncer.door(addr).is_ok()).count();
@@ -213,7 +213,7 @@ impl Rate {
 ///             .tenant_plan(TenantKey(7), Rate::per_second(2_000).burst(4_000))
 ///             .tenant_in_flight(64),
 ///     )
-///     .try_build()?;
+///     .build()?;
 /// # let _ = bouncer;
 /// # Ok::<(), bouncer_io::BouncerError>(())
 /// ```
@@ -252,7 +252,7 @@ impl Budgets {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, Budgets};
-    /// let bouncer = Bouncer::builder().budgets(Budgets::off()).try_build()?;
+    /// let bouncer = Bouncer::builder().budgets(Budgets::off()).build()?;
     /// let addr: std::net::IpAddr = "192.0.2.81".parse()?;
     /// // The default holds one address to a burst of 40; with no budgets all 100 get in.
     /// let held = (0..100).map(|_| bouncer.door(addr)).collect::<Result<Vec<_>, _>>()?;
@@ -280,7 +280,7 @@ impl Budgets {
     /// use bouncer_io::{Bouncer, Budgets, Rate, Refusal};
     /// let bouncer = Bouncer::builder()
     ///     .budgets(Budgets::off().door_rate(Rate::per_minute(2), Rate::per_minute(100)))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let addr: std::net::IpAddr = "192.0.2.82".parse()?;
     /// assert!(bouncer.door(addr).is_ok() && bouncer.door(addr).is_ok());
     /// assert!(matches!(bouncer.door(addr), Err(Refusal::OverBudget { .. })));
@@ -299,7 +299,7 @@ impl Budgets {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, Budgets, Refusal};
-    /// let bouncer = Bouncer::builder().budgets(Budgets::off().door_concurrency(2, 100)).try_build()?;
+    /// let bouncer = Bouncer::builder().budgets(Budgets::off().door_concurrency(2, 100)).build()?;
     /// let addr: std::net::IpAddr = "192.0.2.84".parse()?;
     /// let first = bouncer.door(addr)?;
     /// let _second = bouncer.door(addr)?;
@@ -323,7 +323,7 @@ impl Budgets {
     /// use bouncer_io::{Bouncer, Budgets, LaneClass, Rate, RequestId};
     /// let bouncer = Bouncer::builder()
     ///     .budgets(Budgets::off().lane_rate(LaneClass::Auth, Rate::per_minute(1)))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let conn = bouncer.door("192.0.2.85".parse()?)?;
     /// assert!(conn.request(RequestId(1))?.bind_lane(LaneClass::Auth).is_pass());
     /// assert!(conn.request(RequestId(2))?.bind_lane(LaneClass::Auth).is_deny());
@@ -345,7 +345,7 @@ impl Budgets {
     /// use bouncer_io::{Bouncer, Budgets, Rate, RequestId, TenantKey};
     /// let bouncer = Bouncer::builder()
     ///     .budgets(Budgets::off().tenant_rate(Rate::per_minute(1)))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let conn = bouncer.door("192.0.2.86".parse()?)?;
     /// assert!(conn.request(RequestId(1))?.bind_tenant(TenantKey(3)).is_pass());
     /// assert!(conn.request(RequestId(2))?.bind_tenant(TenantKey(3)).is_deny());
@@ -371,7 +371,7 @@ impl Budgets {
     ///             .tenant_rate(Rate::per_minute(1))
     ///             .tenant_plan(TenantKey(7), Rate::per_minute(3)),
     ///     )
-    ///     .try_build()?;
+    ///     .build()?;
     /// let conn = bouncer.door("192.0.2.87".parse()?)?;
     /// let bind = |id: u128, tenant: u64| -> Result<bool, BouncerError> {
     ///     Ok(conn.request(RequestId(id))?.bind_tenant(TenantKey(tenant)).is_pass())
@@ -395,7 +395,7 @@ impl Budgets {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, Budgets, RequestId, TenantKey};
-    /// let bouncer = Bouncer::builder().budgets(Budgets::off().tenant_in_flight(1)).try_build()?;
+    /// let bouncer = Bouncer::builder().budgets(Budgets::off().tenant_in_flight(1)).build()?;
     /// let conn = bouncer.door("192.0.2.88".parse()?)?;
     /// let mut first = conn.request(RequestId(1))?;
     /// assert!(first.bind_tenant(TenantKey(5)).is_pass());
@@ -418,9 +418,9 @@ impl Budgets {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, Budgets};
-    /// let bouncer = Bouncer::builder().budgets(Budgets::default().capacity(4_096)).try_build()?;
+    /// let bouncer = Bouncer::builder().budgets(Budgets::default().capacity(4_096)).build()?;
     /// assert_eq!(bouncer.capacity().budget_keys, 4_096);
-    /// assert!(Bouncer::builder().budgets(Budgets::default().capacity(0)).try_build().is_err());
+    /// assert!(Bouncer::builder().budgets(Budgets::default().capacity(0)).build().is_err());
     /// # Ok::<(), bouncer_io::BouncerError>(())
     /// ```
     #[must_use]

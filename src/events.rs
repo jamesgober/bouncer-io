@@ -12,7 +12,7 @@ use std::{net::IpAddr, time::SystemTime};
 use crate::{
     bouncer::Shared,
     directive::{Actor, Evidence, Reason},
-    keys::{AccountKey, Cidr, ConnId, FingerprintKey, RequestId, SessionKey, TenantKey},
+    keys::{AccountKey, Cidr, ConnectionId, FingerprintKey, RequestId, SessionKey, TenantKey},
     registry::Cell,
     strikes::Mode,
     time::Now,
@@ -42,7 +42,7 @@ pub const GENERATOR: u16 = 2;
 ///     }
 /// }
 /// let seen = Arc::new(Seen::default());
-/// let bouncer = Bouncer::builder().event_sink(seen.clone()).try_build()?;
+/// let bouncer = Bouncer::builder().event_sink(seen.clone()).build()?;
 /// bouncer.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
 /// assert!(seen.0.lock().unwrap().contains(&signals::BAN_ADDED.path()));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -58,12 +58,19 @@ pub trait EventSink: Send + Sync {
 ///
 /// ```
 /// use std::sync::Arc;
-/// let bouncer = bouncer_io::Bouncer::builder().event_sink(Arc::new(bouncer_io::NoSink)).try_build()?;
+/// let bouncer = bouncer_io::Bouncer::builder().event_sink(bouncer_io::NoSink).build()?;
 /// # let _ = bouncer;
 /// # Ok::<(), bouncer_io::BouncerError>(())
 /// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoSink;
+
+/// A shared sink: one `Arc` can feed several bouncers.
+impl<T: EventSink + ?Sized> EventSink for std::sync::Arc<T> {
+    fn event(&self, event: &Event<'_>) {
+        (**self).event(event);
+    }
+}
 
 impl EventSink for NoSink {
     fn event(&self, _event: &Event<'_>) {}
@@ -286,7 +293,7 @@ pub mod signals {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Subject {
     /// The connection.
-    pub conn: Option<ConnId>,
+    pub connection: Option<ConnectionId>,
     /// The request.
     pub request: Option<RequestId>,
     /// The source address.

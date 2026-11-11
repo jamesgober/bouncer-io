@@ -119,7 +119,7 @@ record   := length:u32 | type:u8 | origin:u16 | sequence:u64 | payload | crc32c:
 
 Every ban, lift, removal, and offender change becomes a record in a bounded queue (65,536); the maintainer writes queued records as one journal batch and syncs about every second. The snapshot's keyed BLAKE3 MAC covers all of it; each batch's MAC covers the previous MAC and the batch, so batches cannot be dropped, reordered, or spliced in without the key. A batch carries the snapshot's epoch: batches left by a crash during compaction belong to an older epoch and are skipped. Past 16 MiB of journal, the full state becomes a new snapshot of the next epoch.
 
-Loading happens in `try_build`, before the first door check: the snapshot (refused whole on any checksum or MAC failure, unless `LoadFailure::LoadEmpty`), then the journal batches up to the first damaged one. Bans store wall times and their original length, so a clock step between save and load can neither lengthen nor resurrect a ban.
+Loading happens in `build`, before the first door check: the snapshot (refused whole on any checksum or MAC failure, unless `LoadFailure::LoadEmpty`), then the journal batches up to the first damaged one. Bans store wall times and their original length, so a clock step between save and load can neither lengthen nor resurrect a ban.
 
 ## Sharing across nodes
 

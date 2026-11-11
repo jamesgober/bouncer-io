@@ -318,7 +318,7 @@ fn test_serve_net_credential_stuffing_behind_a_proxy_bans_the_48() {
         .enforcement(
             bouncer_io::Enforcement::observe_all().enforce(bouncer_io::StrikeKind::LoginFailed),
         )
-        .try_build()
+        .build()
         .expect("bouncer");
     let trusted = serve_net::net_io::TrustedProxies::parse("127.0.0.1").expect("proxies");
     let running = Server::builder()

@@ -4,8 +4,8 @@
 use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
 
 use bouncer_io::{
-    AccountKey, Actor, AllowList, BanSpec, Bouncer, BouncerError, Budgets, Cidr, Delta, Filter,
-    ImportError, LiftSpec, NodeId, Page, Reason, RequestId, Sequence, SessionKey,
+    AccountKey, Actor, AllowList, Bouncer, BouncerError, Budgets, Cidr, Delta, Directive, Filter,
+    ImportError, NodeId, Page, Reason, RequestId, Sequence, SessionKey,
 };
 use clock_lib::ManualClock;
 
@@ -18,7 +18,7 @@ fn node(id: u16, clock: &Arc<ManualClock>) -> Bouncer {
         .node(NodeId(id))
         .clock(clock.clone())
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap()
 }
 
@@ -62,7 +62,7 @@ fn test_deltas_converge_under_every_order() {
     let mut since_c = Sequence::START;
     let take = |b: &Bouncer, since: &mut Sequence, from: u64, deltas: &mut Vec<(Delta, u64)>| {
         let d = b.export_delta(*since).unwrap();
-        *since = d.last();
+        *since = d.last_sequence();
         deltas.push((d, from));
     };
     a.ban(ip("192.0.2.1")).unwrap();
@@ -71,7 +71,7 @@ fn test_deltas_converge_under_every_order() {
     clock.advance(Duration::from_secs(2));
     clock.step_wall_forward(Duration::from_secs(2));
     c.ban(ip("192.0.2.3")).unwrap();
-    c.ban(BanSpec::key(AccountKey(4))).unwrap();
+    c.ban(AccountKey(4)).unwrap();
     take(&c, &mut since_c, 3, &mut deltas);
     clock.advance(Duration::from_secs(2));
     clock.step_wall_forward(Duration::from_secs(2));
@@ -194,7 +194,7 @@ fn test_import_cannot_touch_allowlist_and_foreign_lifts_refused() {
         .node(NodeId(2))
         .clock(clock.clone())
         .allow(AllowList::new().immune("10.20.0.0/16".parse::<Cidr>().unwrap(), "infra"))
-        .try_build()
+        .build()
         .unwrap();
     a.ban(ip("10.20.1.1")).unwrap();
     let report = b
@@ -244,7 +244,7 @@ fn test_delta_past_the_skew_bound_refused_with_an_event() {
         .clock(clock.clone())
         .event_sink(rejected.clone())
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let c = node(3, &ahead);
     c.ban(ip("198.51.100.67")).unwrap();
@@ -284,12 +284,12 @@ fn test_node_a_day_ahead_cannot_poison_the_cluster() {
         let b = node(2, &clock);
         let c = node(3, &fast);
         // Permanent, so the node a day ahead holds it too.
-        a.ban(BanSpec::address(ip("198.51.100.1")).permanent())
+        a.apply(Directive::ban(ip("198.51.100.1")).permanent())
             .unwrap();
         let delta = a.export_delta(Sequence::START).unwrap();
         let _ = b.import(&delta, Actor::Channel(1)).unwrap();
         let _ = c.import(&delta, Actor::Channel(1)).unwrap();
-        c.lift(LiftSpec::key(ip("198.51.100.1")).by(Actor::Admin(3)))
+        c.apply(Directive::lift(ip("198.51.100.1")).by(Actor::Admin(3)))
             .unwrap();
         c.ban(ip("198.51.100.2")).unwrap();
         let report = b
@@ -323,7 +323,7 @@ fn test_old_since_exports_everything() {
     assert!(report.applied >= 1);
     assert!(b.door(ip("192.0.2.5")).is_err());
     assert!(
-        a.export_delta(a.export_delta(Sequence::START).unwrap().last())
+        a.export_delta(a.export_delta(Sequence::START).unwrap().last_sequence())
             .unwrap()
             .as_bytes()
             .len()
@@ -340,7 +340,7 @@ fn test_a_channel_carries_only_its_own_nodes_records() {
     let a = node(1, &clock);
     let c = node(3, &clock);
     let k = ip("198.51.100.77");
-    a.ban(BanSpec::address(k).permanent()).unwrap();
+    a.apply(Directive::ban(k).permanent()).unwrap();
     let _ = c
         .import(&a.export_delta(Sequence::START).unwrap(), Actor::Channel(1))
         .unwrap();
@@ -350,7 +350,7 @@ fn test_a_channel_carries_only_its_own_nodes_records() {
     clock.step_wall_forward(Duration::from_secs(1));
     let forger = node(1, &clock);
     forger
-        .ban(BanSpec::address(k).for_duration(Duration::from_secs(1)))
+        .apply(Directive::ban(k).for_duration(Duration::from_secs(1)))
         .unwrap();
     let forged = forger.export_delta(Sequence::START).unwrap();
     let report = c.import(&forged, Actor::Channel(2)).unwrap();
@@ -358,7 +358,7 @@ fn test_a_channel_carries_only_its_own_nodes_records() {
     assert!(report.rejected >= 1);
     assert_eq!(c.explain(k).bans[0].until, None, "still permanent");
     // Node 1's next delta, first relayed by node 2 (refused), then from node 1.
-    let since = a.export_delta(Sequence::START).unwrap().last();
+    let since = a.export_delta(Sequence::START).unwrap().last_sequence();
     a.ban(ip("198.51.100.78")).unwrap();
     let d = a.export_delta(since).unwrap();
     let relayed = c.import(&d, Actor::Channel(2)).unwrap();
@@ -402,8 +402,8 @@ fn test_an_imported_local_ban_never_takes_an_address_shared_here() {
     }
     assert!(b.explain(nat).shared_source);
 
-    a.ban(
-        BanSpec::address(nat)
+    a.apply(
+        Directive::ban(nat)
             .by(Actor::Local)
             .because(Reason::STRIKE_THRESHOLD),
     )
@@ -420,7 +420,7 @@ fn test_an_imported_local_ban_never_takes_an_address_shared_here() {
 
     // An administrator's ban of the same address is imported.
     let a = node(3, &clock);
-    a.ban(BanSpec::address(nat).by(Actor::Admin(1))).unwrap();
+    a.apply(Directive::ban(nat).by(Actor::Admin(1))).unwrap();
     let report = b
         .import(&a.export_delta(Sequence::START).unwrap(), Actor::Channel(3))
         .unwrap();

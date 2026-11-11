@@ -223,10 +223,10 @@ impl Filter {
     /// # Examples
     ///
     /// ```
-    /// use bouncer_io::{BanSpec, Bouncer, Filter, Page, SessionKey};
+    /// use bouncer_io::{Bouncer, Filter, Page, SessionKey};
     /// let bouncer = Bouncer::new();
     /// bouncer.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
-    /// bouncer.ban(BanSpec::key(SessionKey::from_digest([3; 16])))?;
+    /// bouncer.ban(SessionKey::from_digest([3; 16]))?;
     /// assert_eq!(bouncer.list(&Filter::all(), Page::first(10)).total, 2);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -280,9 +280,9 @@ impl Filter {
     /// # Examples
     ///
     /// ```
-    /// use bouncer_io::{Actor, BanSpec, Bouncer, Filter, Page};
+    /// use bouncer_io::{Actor, Bouncer, Directive, Filter, Page};
     /// let bouncer = Bouncer::new();
-    /// bouncer.ban(BanSpec::address("198.51.100.1".parse()?).by(Actor::Admin(17)))?;
+    /// bouncer.apply(Directive::ban("198.51.100.1".parse::<std::net::IpAddr>()?).by(Actor::Admin(17)))?;
     /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;   // Actor::App
     /// // The kind is matched, not the administrator's id.
     /// let listing = bouncer.list(&Filter::all().by(Actor::Admin(0)), Page::first(10));
@@ -301,9 +301,9 @@ impl Filter {
     /// # Examples
     ///
     /// ```
-    /// use bouncer_io::{BanSpec, Bouncer, Filter, Page, Reason};
+    /// use bouncer_io::{Bouncer, Directive, Filter, Page, Reason};
     /// let bouncer = Bouncer::new();
-    /// bouncer.ban(BanSpec::address("198.51.100.1".parse()?).because(Reason::DECOY))?;
+    /// bouncer.apply(Directive::ban("198.51.100.1".parse::<std::net::IpAddr>()?).because(Reason::DECOY))?;
     /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;   // Reason::ADMIN
     /// let listing = bouncer.list(&Filter::all().because(Reason::DECOY), Page::first(10));
     /// assert_eq!(listing.total, 1);
@@ -320,12 +320,12 @@ impl Filter {
     /// # Examples
     ///
     /// ```
-    /// use bouncer_io::{BanSpec, Bouncer, Filter, Page};
+    /// use bouncer_io::{Bouncer, Directive, Filter, Page};
     /// use std::time::{Duration, SystemTime};
     /// let bouncer = Bouncer::new();
-    /// bouncer.ban(BanSpec::address("198.51.100.1".parse()?).for_duration(Duration::from_secs(60)))?;
-    /// bouncer.ban(BanSpec::address("198.51.100.2".parse()?).for_duration(Duration::from_secs(86_400)))?;
-    /// bouncer.ban(BanSpec::address("198.51.100.3".parse()?).permanent())?;
+    /// bouncer.apply(Directive::ban("198.51.100.1".parse::<std::net::IpAddr>()?).for_duration(Duration::from_secs(60)))?;
+    /// bouncer.apply(Directive::ban("198.51.100.2".parse::<std::net::IpAddr>()?).for_duration(Duration::from_secs(86_400)))?;
+    /// bouncer.apply(Directive::ban("198.51.100.3".parse::<std::net::IpAddr>()?).permanent())?;
     /// let soon = SystemTime::now() + Duration::from_secs(3_600);
     /// let listing = bouncer.list(&Filter::all().expiring_before(soon), Page::first(10));
     /// assert_eq!(listing.total, 1);
@@ -343,9 +343,9 @@ impl Filter {
     /// # Examples
     ///
     /// ```
-    /// use bouncer_io::{BanSpec, Bouncer, Filter, Page};
+    /// use bouncer_io::{Bouncer, Directive, Filter, Page};
     /// let bouncer = Bouncer::new();
-    /// bouncer.ban(BanSpec::address("198.51.100.1".parse()?).permanent())?;
+    /// bouncer.apply(Directive::ban("198.51.100.1".parse::<std::net::IpAddr>()?).permanent())?;
     /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;
     /// let listing = bouncer.list(&Filter::all().permanent_only(), Page::first(10));
     /// assert_eq!(listing.total, 1);
@@ -515,7 +515,7 @@ impl Health {
     ///
     /// ```
     /// use bouncer_io::Bouncer;
-    /// let bouncer = Bouncer::builder().tickets(10).shards(1).try_build()?;
+    /// let bouncer = Bouncer::builder().tickets(10).shards(1).build()?;
     /// let mut held = Vec::new();
     /// for i in 1..=10u8 {
     ///     held.push(bouncer.door(std::net::IpAddr::from([198, 51, i, 1]))?);
@@ -607,11 +607,11 @@ impl Bouncer {
     /// # Examples
     ///
     /// ```
-    /// use bouncer_io::{BanSpec, Bouncer, SessionKey};
+    /// use bouncer_io::{Bouncer, SessionKey};
     /// let bouncer = Bouncer::new();
     /// let session = SessionKey::from_digest([5; 16]);
     /// assert!(bouncer.explain(session).admitted);
-    /// bouncer.ban(BanSpec::key(session))?;
+    /// bouncer.ban(session)?;
     /// let why = bouncer.explain(session);
     /// assert!(!why.admitted);
     /// assert_eq!(why.bans[0].key, bouncer_io::BanKey::Session(session));

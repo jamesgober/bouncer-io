@@ -8,9 +8,9 @@ use std::{
 };
 
 use bouncer_io::{
-    AccountKey, Actor, AllowList, BanKey, BanKeys, BanSpec, Bouncer, Budgets, Cidr,
-    DatagramVerdict, Directive, DurationPolicy, Enforcement, EscalationPolicy, Event, EventSink,
-    Filter, Mode, Page, Rate, Reason, RequestId, SessionKey, StrikeKind, StrikeOutcome, signals,
+    AccountKey, Actor, AllowList, BanKey, BanKeys, Bouncer, Budgets, Cidr, DatagramVerdict,
+    Directive, DurationPolicy, Enforcement, EscalationPolicy, Event, EventSink, Filter, Mode, Page,
+    Rate, Reason, RequestId, SessionKey, StrikeKind, StrikeOutcome, signals,
 };
 use clock_lib::ManualClock;
 
@@ -50,8 +50,8 @@ impl Sink {
     }
 }
 
-fn local(addr: IpAddr) -> BanSpec {
-    BanSpec::address(addr)
+fn local(addr: IpAddr) -> Directive {
+    Directive::ban(addr)
         .by(Actor::Local)
         .because(Reason::STRIKE_THRESHOLD)
 }
@@ -60,15 +60,12 @@ fn local(addr: IpAddr) -> BanSpec {
 fn test_escalation_ipv4_eight_hosts_bans_24() {
     // T-3.
     let sink = Arc::new(Sink::default());
-    let b = Bouncer::builder()
-        .event_sink(sink.clone())
-        .try_build()
-        .unwrap();
+    let b = Bouncer::builder().event_sink(sink.clone()).build().unwrap();
     for i in 1..=7u8 {
-        b.ban(local(IpAddr::from([198, 51, 100, i]))).unwrap();
+        b.apply(local(IpAddr::from([198, 51, 100, i]))).unwrap();
     }
     assert!(b.door(ip("198.51.100.200")).is_ok(), "seven is not enough");
-    b.ban(local(ip("198.51.100.8"))).unwrap();
+    b.apply(local(ip("198.51.100.8"))).unwrap();
     assert!(b.door(ip("198.51.100.200")).is_err(), "the /24 is banned");
     assert_eq!(sink.count(signals::BAN_ESCALATED.id, Mode::Enforce), 1);
     // The children were folded into the parent.
@@ -76,7 +73,7 @@ fn test_escalation_ipv4_eight_hosts_bans_24() {
     assert_eq!(all.total, 1);
     assert_eq!(all.items[0].key, BanKey::Prefix(c("198.51.100.0/24")));
     // A new child inside the banned parent adds nothing.
-    b.ban(local(ip("198.51.100.99"))).unwrap();
+    b.apply(local(ip("198.51.100.99"))).unwrap();
     assert_eq!(b.list(&Filter::all(), Page::first(100)).total, 1);
 }
 
@@ -86,7 +83,7 @@ fn test_escalation_four_64s_bans_56_then_48() {
     let b = Bouncer::new();
     for s in 0..4u16 {
         for h in 0..4u16 {
-            b.ban(local(v6(1, s, h))).unwrap();
+            b.apply(local(v6(1, s, h))).unwrap();
         }
         let fifty_six = v6(1, s, 0xff);
         assert!(b.door(fifty_six).is_err(), "/56 number {s} escalated");
@@ -99,11 +96,11 @@ fn test_escalation_four_64s_bans_56_then_48() {
     // With the widest at /56, a full /48 of /56 bans stays at /56.
     let b = Bouncer::builder()
         .escalation(EscalationPolicy::default().widest_ipv6(56))
-        .try_build()
+        .build()
         .unwrap();
     for s in 0..4u16 {
         for h in 0..4u16 {
-            b.ban(local(v6(1, s, h))).unwrap();
+            b.apply(local(v6(1, s, h))).unwrap();
         }
     }
     assert!(
@@ -120,11 +117,11 @@ fn test_escalation_blocked_by_allow_list_and_proxy_and_shared() {
         .allow(AllowList::new().immune(c("198.51.100.250/32"), "partner"))
         .trusted_proxies(&[c("203.0.113.250/32")])
         .event_sink(sink.clone())
-        .try_build()
+        .build()
         .unwrap();
     for prefix in [[198, 51, 100], [203, 0, 113]] {
         for i in 1..=8u8 {
-            b.ban(local(IpAddr::from([prefix[0], prefix[1], prefix[2], i])))
+            b.apply(local(IpAddr::from([prefix[0], prefix[1], prefix[2], i])))
                 .unwrap();
         }
         let other = IpAddr::from([prefix[0], prefix[1], prefix[2], 100]);
@@ -148,13 +145,13 @@ fn test_escalation_per_parent_quota_forces_escalation() {
                 .ipv4_threshold(100)
                 .max_children_per_parent(4),
         )
-        .try_build()
+        .build()
         .unwrap();
     for i in 1..=4u8 {
-        b.ban(local(IpAddr::from([192, 0, 2, i]))).unwrap();
+        b.apply(local(IpAddr::from([192, 0, 2, i]))).unwrap();
     }
     assert!(b.door(ip("192.0.2.100")).is_ok());
-    b.ban(local(ip("192.0.2.5"))).unwrap();
+    b.apply(local(ip("192.0.2.5"))).unwrap();
     assert!(b.door(ip("192.0.2.100")).is_err(), "past the quota of 4");
 }
 
@@ -163,7 +160,7 @@ fn test_lift_of_parent_does_not_resurrect_children() {
     // Edge case 53.
     let b = Bouncer::new();
     for i in 1..=8u8 {
-        b.ban(local(IpAddr::from([198, 51, 100, i]))).unwrap();
+        b.apply(local(IpAddr::from([198, 51, 100, i]))).unwrap();
     }
     b.lift(c("198.51.100.0/24")).unwrap();
     for i in 1..=8u8 {
@@ -175,10 +172,10 @@ fn test_lift_of_parent_does_not_resurrect_children() {
 fn test_escalation_flood_keeps_table_bounded() {
     // T-4: ten times the capacity in unique /64s from 64 /48s.
     let cap = 4096u32;
-    let b = Bouncer::builder().ban_capacity(cap).try_build().unwrap();
+    let b = Bouncer::builder().ban_capacity(cap).build().unwrap();
     for i in 0..8u16 {
-        b.ban(
-            BanSpec::address(IpAddr::from([0x2001, 0xdb8, 0xaaaa, i, 0, 0, 0, 1]))
+        b.apply(
+            Directive::ban(IpAddr::from([0x2001, 0xdb8, 0xaaaa, i, 0, 0, 0, 1]))
                 .by(Actor::Admin(1))
                 .for_duration(Duration::from_secs(86_400)),
         )
@@ -200,7 +197,7 @@ fn test_escalation_flood_keeps_table_bounded() {
             0,
             1,
         ]);
-        let _ = b.ban(local(addr));
+        let _ = b.apply(local(addr));
     }
     assert!(b.health().ban_load <= 1.0);
     for f in 0..64u16 {
@@ -228,7 +225,7 @@ fn test_offender_memory_lengthens_and_decays() {
                 .jitter(Duration::ZERO)
                 .half_life(Duration::from_secs(1000)),
         )
-        .try_build()
+        .build()
         .unwrap();
     let addr = ip("192.0.2.77");
     let length = |b: &Bouncer| {
@@ -254,7 +251,7 @@ fn test_shared_source_strikes_throttle_not_ban() {
     let b = Bouncer::builder()
         .budgets(Budgets::off())
         .enforcement(Enforcement::observe_all().enforce(StrikeKind::LoginFailed))
-        .try_build()
+        .build()
         .unwrap();
     let nat = ip("100.64.0.1");
     let conn = b.door(nat).unwrap();
@@ -292,10 +289,7 @@ fn test_shared_source_strikes_throttle_not_ban() {
 
 #[test]
 fn test_shared_source_blocks_escalation() {
-    let b = Bouncer::builder()
-        .budgets(Budgets::off())
-        .try_build()
-        .unwrap();
+    let b = Bouncer::builder().budgets(Budgets::off()).build().unwrap();
     let nat = ip("198.51.100.77");
     let conn = b.door(nat).unwrap();
     for s in 0..100u8 {
@@ -304,7 +298,7 @@ fn test_shared_source_blocks_escalation() {
     }
     assert!(b.explain(nat).shared_source);
     for i in 1..=8u8 {
-        b.ban(local(IpAddr::from([198, 51, 100, i]))).unwrap();
+        b.apply(local(IpAddr::from([198, 51, 100, i]))).unwrap();
     }
     assert!(
         b.door(ip("198.51.100.200")).is_ok(),
@@ -318,7 +312,7 @@ fn test_datagram_bans_and_budgets() {
     let b = Bouncer::builder()
         .clock(clock.clone())
         .budgets(Budgets::off().door_rate(Rate::per_second(2), Rate::per_second(5)))
-        .try_build()
+        .build()
         .unwrap();
     b.ban(ip("192.0.2.66")).unwrap();
     assert_eq!(
@@ -353,7 +347,7 @@ fn test_datagram_unverified_never_banned() {
         .enforcement(Enforcement::enforce_all())
         .event_sink(sink.clone())
         .budgets(Budgets::off().door_rate(Rate::per_second(2), Rate::per_second(5)))
-        .try_build()
+        .build()
         .unwrap();
     let victim = ip("192.0.2.80");
     let dropped = (0..100_000)
@@ -380,7 +374,7 @@ fn test_datagram_forged_flood_does_not_starve_verified_sources() {
     // keep their own client and prefix budgets.
     let b = Bouncer::builder()
         .budgets(Budgets::off().door_rate(Rate::per_second(2), Rate::per_second(5)))
-        .try_build()
+        .build()
         .unwrap();
     for i in 0..1_000u32 {
         let forged = IpAddr::from([192, 0, 2, (i % 250) as u8 + 1]);
@@ -404,7 +398,7 @@ fn test_lifted_children_do_not_count_toward_escalation() {
     let b = Bouncer::new();
     for i in 1..=20u8 {
         let addr = IpAddr::from([198, 51, 100, i]);
-        b.ban(local(addr)).unwrap();
+        b.apply(local(addr)).unwrap();
         b.lift(addr).unwrap();
     }
     assert!(
@@ -422,7 +416,7 @@ fn test_prefix_strikes_never_ban_over_a_shared_address() {
         let b = Bouncer::builder()
             .budgets(Budgets::off())
             .enforcement(Enforcement::observe_all().enforce(StrikeKind::LoginFailed))
-            .try_build()
+            .build()
             .unwrap();
         let nat = ip("100.64.0.1");
         if shared {
@@ -455,10 +449,7 @@ fn test_connection_ban_never_takes_a_shared_address_on_a_weak_word() {
     // address bans the ticket's session, not the address, unless a strong
     // actor names the address itself.
     let setup = || {
-        let b = Bouncer::builder()
-            .budgets(Budgets::off())
-            .try_build()
-            .unwrap();
+        let b = Bouncer::builder().budgets(Budgets::off()).build().unwrap();
         let nat = ip("100.64.0.9");
         let conn = b.door(nat).unwrap();
         for s in 0..500u32 {
@@ -532,10 +523,7 @@ fn test_connection_ban_never_takes_a_shared_address_on_a_weak_word() {
     assert!(b.door(nat).is_err(), "an administrator still can");
 
     // Nothing shared: the default keys ban the source, as before.
-    let b = Bouncer::builder()
-        .budgets(Budgets::off())
-        .try_build()
-        .unwrap();
+    let b = Bouncer::builder().budgets(Budgets::off()).build().unwrap();
     let addr = ip("198.51.100.40");
     let conn = b.door(addr).unwrap();
     let _r = conn.request(RequestId(1)).unwrap();
@@ -552,10 +540,7 @@ fn test_connection_ban_never_takes_a_shared_address_on_a_weak_word() {
 fn test_decoy_touch_behind_a_shared_address_bans_the_identities_only() {
     // T-5: a decoy touch is definitive for whoever touched it, but bouncer's
     // own word never bans a shared address (likely a NAT).
-    let b = Bouncer::builder()
-        .budgets(Budgets::off())
-        .try_build()
-        .unwrap();
+    let b = Bouncer::builder().budgets(Budgets::off()).build().unwrap();
     let nat = ip("100.64.0.33");
     let conn = b.door(nat).unwrap();
     for s in 0..500u32 {
@@ -581,10 +566,7 @@ fn test_decoy_touch_behind_a_shared_address_bans_the_identities_only() {
     );
 
     // Nothing shared: the source is banned, as before.
-    let b = Bouncer::builder()
-        .budgets(Budgets::off())
-        .try_build()
-        .unwrap();
+    let b = Bouncer::builder().budgets(Budgets::off()).build().unwrap();
     let addr = ip("198.51.100.41");
     let conn = b.door(addr).unwrap();
     assert!(matches!(

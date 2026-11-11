@@ -46,7 +46,7 @@ What a pipeline must do, in order:
 
 A pipeline that skips steps 6 to 8 still cannot send a byte for a revoked connection (step 9 is the transport's), and a revoked ticket that goes `max_unchecked` without a checkpoint is found by maintenance, ejected, and reported as `bouncer.checkpoint.missing`, so the gap is visible.
 
-Long handlers poll `request.is_cancelled()` inside their loops, so a revoked request stops working, not only stops being answered.
+Long handlers call `request.checkpoint()` inside their loops (every thousand rows, say), so a revoked request stops working, not only stops being answered.
 
 ## Transport (net-io)
 

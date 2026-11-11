@@ -3,7 +3,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use bouncer_io::{
-    Actor, AllowList, BanSpec, Bouncer, BouncerError, Cidr, RequestId, normalize, prefix_of,
+    Actor, AllowList, Bouncer, BouncerError, Cidr, Directive, RequestId, normalize, prefix_of,
 };
 use proptest::prelude::*;
 
@@ -29,7 +29,7 @@ fn bouncer() -> Bouncer {
         .tickets(256)
         .ban_capacity(2048)
         .seed([3; 32])
-        .try_build()
+        .build()
         .unwrap()
 }
 
@@ -93,17 +93,17 @@ proptest! {
             .trusted_proxies(&["10.0.1.1/32".parse().unwrap()])
             .tickets(64)
             .ban_capacity(512)
-            .try_build()
+            .build()
             .unwrap();
         let actors = [Actor::Local, Actor::Policy(1), Actor::Sentinel, Actor::Gate];
         for (host, actor, wide) in ops {
             let target: IpAddr = IpAddr::from([10, 0, if host % 2 == 0 { 0 } else { 1 }, host]);
-            let spec = if wide {
-                BanSpec::prefix(prefix_of(target, 24).unwrap())
+            let ban = if wide {
+                Directive::ban(prefix_of(target, 24).unwrap())
             } else {
-                BanSpec::address(target)
+                Directive::ban(target)
             };
-            match b.ban(spec.by(actors[usize::from(actor)])) {
+            match b.apply(ban.by(actors[usize::from(actor)])) {
                 Ok(_) | Err(BouncerError::AllowListed { .. }) | Err(BouncerError::TrustedProxyTarget) => {}
                 Err(other) => prop_assert!(false, "unexpected {other}"),
             }
@@ -121,7 +121,7 @@ proptest! {
         admin in proptest::collection::vec(any::<u32>(), 1..16),
         local in proptest::collection::vec(any::<u32>(), 0..200),
     ) {
-        let b = Bouncer::builder().ban_capacity(32).tickets(32).seed([5; 32]).try_build().unwrap();
+        let b = Bouncer::builder().ban_capacity(32).tickets(32).seed([5; 32]).build().unwrap();
         let mut kept = Vec::new();
         for v in &admin {
             if b.ban(IpAddr::V4(Ipv4Addr::from(*v))).is_ok() {
@@ -129,7 +129,7 @@ proptest! {
             }
         }
         for v in &local {
-            let r = b.ban(BanSpec::address(IpAddr::V4(Ipv4Addr::from(*v))).by(Actor::Local));
+            let r = b.apply(Directive::ban(IpAddr::V4(Ipv4Addr::from(*v))).by(Actor::Local));
             prop_assert!(matches!(r, Ok(_) | Err(BouncerError::BanTableFull { .. })), "unexpected {:?}", r);
         }
         for v in &kept {

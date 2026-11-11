@@ -52,8 +52,8 @@ fn seed() -> &'static (Vec<u8>, Vec<u8>) {
     SEED.get_or_init(|| {
         let store = Store::default();
         let b = small()
-            .persistence(Box::new(store.clone()))
-            .try_build()
+            .persistence(store.clone())
+            .build()
             .unwrap();
         b.ban("192.0.2.1".parse::<std::net::IpAddr>().unwrap())
             .unwrap();
@@ -84,7 +84,7 @@ fuzz_target!(|data: &[u8]| {
             tail
         };
     }
-    if let Ok(b) = small().persistence(Box::new(store)).try_build() {
+    if let Ok(b) = small().persistence(store).build() {
         let _ = b.door("192.0.2.2".parse().unwrap());
     }
 });

@@ -14,7 +14,7 @@ use crate::{
     bouncer::Shared,
     directive::{Actor, Reason},
     events::{self, Emit},
-    keys::ConnId,
+    keys::ConnectionId,
     registry::{F_LIVE, F_PENDING_CLIENT, F_REVOKED, KIND_CONNECTION, KIND_REQUEST, generation},
     revoke::Target,
     sync::{AtomicU64, Ordering},
@@ -33,26 +33,34 @@ use crate::{
 /// # Examples
 ///
 /// ```
-/// use bouncer_io::{Bouncer, CloseKind, ConnId, Ejector};
+/// use bouncer_io::{Bouncer, CloseKind, ConnectionId, Ejector};
 /// use std::sync::{Arc, Mutex};
 ///
 /// #[derive(Default)]
-/// struct Kills(Mutex<Vec<ConnId>>);
+/// struct Kills(Mutex<Vec<ConnectionId>>);
 /// impl Ejector for Kills {
-///     fn eject(&self, conn: ConnId, _kind: CloseKind) {
+///     fn eject(&self, conn: ConnectionId, _kind: CloseKind) {
 ///         self.0.lock().unwrap().push(conn);
 ///     }
 /// }
 /// let kills = Arc::new(Kills::default());
-/// let bouncer = Bouncer::builder().ejector(kills.clone()).try_build()?;
+/// let bouncer = Bouncer::builder().ejector(kills.clone()).build()?;
 /// let conn = bouncer.door("192.0.2.7".parse()?)?;      // idle: never crosses a checkpoint
-/// bouncer.apply(bouncer_io::Directive::revoke(conn.conn()).eject_now())?;
-/// assert_eq!(*kills.0.lock().unwrap(), vec![conn.conn()]);
+/// bouncer.apply(bouncer_io::Directive::revoke(conn.connection()).eject_now())?;
+/// assert_eq!(*kills.0.lock().unwrap(), vec![conn.connection()]);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub trait Ejector: Send + Sync {
     /// Closes the connection.
-    fn eject(&self, conn: ConnId, kind: CloseKind);
+    fn eject(&self, conn: ConnectionId, kind: CloseKind);
+}
+
+/// A shared ejector: keep one `Arc` to attach the transport later (as with
+/// `NetIoEjector::attach`) and give a clone to the builder.
+impl<T: Ejector + ?Sized> Ejector for std::sync::Arc<T> {
+    fn eject(&self, conn: ConnectionId, kind: CloseKind) {
+        (**self).eject(conn, kind);
+    }
 }
 
 /// How to close.
@@ -369,7 +377,7 @@ fn eject_revoked(shared: &Shared, index: u32, idle: bool) -> u32 {
     if !first {
         return 0;
     }
-    let conn = ConnId(cell.conn.load(Ordering::Relaxed));
+    let conn = ConnectionId(cell.conn.load(Ordering::Relaxed));
     // The cell may have been released and reissued meanwhile: only eject if
     // it is still the same ticket.
     if generation(cell.state.load(Ordering::Acquire)) != gen_ {
@@ -409,12 +417,15 @@ pub(crate) fn direct_sweep(
 pub(crate) fn matches_target(cell: &crate::registry::Cell, target: &Target) -> bool {
     let s = subject_of(cell);
     match *target {
-        Target::Connection(c) => s.conn == Some(c),
+        Target::Connection(c) => s.connection == Some(c),
         Target::Request(r) => s.request == Some(r),
         Target::Session(k) => s.session == Some(k),
         Target::Account(k) => s.account == Some(k),
         Target::Tenant(k) => s.tenant == Some(k),
         Target::Fingerprint(k) => s.fingerprint == Some(k),
+        Target::FingerprintIn(k, c) => {
+            s.fingerprint == Some(k) && source_of(cell).is_some_and(|a| c.contains(a))
+        }
         Target::Source(c) => source_of(cell).is_some_and(|a| c.contains(a)),
     }
 }
@@ -481,13 +492,17 @@ pub(crate) fn report_revocation(
     }
     let mut subject = events::Subject::default();
     match *target {
-        Target::Connection(c) => subject.conn = Some(c),
+        Target::Connection(c) => subject.connection = Some(c),
         Target::Request(r) => subject.request = Some(r),
         Target::Session(k) => subject.session = Some(k),
         Target::Account(k) => subject.account = Some(k),
         Target::Tenant(k) => subject.tenant = Some(k),
         Target::Source(c) => subject.prefix = Some(c),
         Target::Fingerprint(k) => subject.fingerprint = Some(k),
+        Target::FingerprintIn(k, c) => {
+            subject.fingerprint = Some(k);
+            subject.prefix = Some(c);
+        }
     }
     Emit {
         actor,

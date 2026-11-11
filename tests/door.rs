@@ -9,8 +9,8 @@ use std::{
 
 use bouncer_io::Rate;
 use bouncer_io::{
-    AccountKey, Actor, AllowList, BanKey, BanSpec, Bouncer, BouncerError, Budgets, Cidr, ConnId,
-    DenialCode, DurationPolicy, Event, EventSink, FingerprintKey, LiftSpec, Now, Provenance,
+    AccountKey, Actor, AllowList, BanKey, Bouncer, BouncerError, Budgets, Cidr, ConnectionId,
+    DenialCode, Directive, DurationPolicy, Event, EventSink, FingerprintKey, Now, Provenance,
     Reason, Refusal, RequestId, SessionKey, Verdict, signals,
 };
 use clock_lib::ManualClock;
@@ -32,7 +32,7 @@ fn small() -> Bouncer {
         .tickets(1024)
         .ban_capacity(4096)
         .seed([7; 32])
-        .try_build()
+        .build()
         .unwrap()
 }
 
@@ -45,7 +45,7 @@ fn test_door_everything_banned_by_admin_zero_prefix_except_immune() {
         .allow(AllowList::new().immune(c("10.0.0.0/8"), "infra"))
         .ban_capacity(64)
         .tickets(64)
-        .try_build()
+        .build()
         .unwrap();
     b.ban(c("0.0.0.0/0")).unwrap();
     b.ban(c("::/0")).unwrap();
@@ -61,7 +61,7 @@ fn test_door_everything_banned_by_admin_zero_prefix_except_immune() {
     ] {
         assert!(
             matches!(
-                b.ban(BanSpec::prefix(c("0.0.0.0/0")).by(actor)),
+                b.apply(Directive::ban(c("0.0.0.0/0")).by(actor)),
                 Err(BouncerError::InvalidPrefix { .. })
             ),
             "{actor}"
@@ -123,14 +123,14 @@ fn test_door_allow_wins_over_ban_and_automation_refused() {
         .allow(AllowList::new().immune(c("192.0.2.10/32"), "partner"))
         .tickets(64)
         .ban_capacity(64)
-        .try_build()
+        .build()
         .unwrap();
     assert!(matches!(
         b.ban(ip("192.0.2.10")),
         Err(BouncerError::AllowListed { .. })
     ));
     assert!(matches!(
-        b.ban(BanSpec::address(ip("192.0.2.10")).by(Actor::Policy(4))),
+        b.apply(Directive::ban(ip("192.0.2.10")).by(Actor::Policy(4))),
         Err(BouncerError::AllowListed { .. })
     ));
     b.ban(c("192.0.2.0/24")).unwrap();
@@ -145,7 +145,7 @@ fn test_door_allow_entry_inside_banned_prefix() {
         .allow(AllowList::new().immune(c("203.0.113.128/25"), "office"))
         .tickets(64)
         .ban_capacity(64)
-        .try_build()
+        .build()
         .unwrap();
     b.ban(c("203.0.113.0/24")).unwrap();
     assert!(admitted(&b, "203.0.113.200"));
@@ -159,7 +159,7 @@ fn test_door_trusted_proxy_inside_banned_prefix_admits_hop_and_judges_clients() 
         .trusted_proxies(&[c("198.51.100.1/32")])
         .tickets(64)
         .ban_capacity(64)
-        .try_build()
+        .build()
         .unwrap();
     b.ban(c("198.51.100.0/24")).unwrap();
     b.ban(ip("203.0.113.66")).unwrap();
@@ -183,7 +183,7 @@ fn test_ban_trusted_proxy_refused() {
     // Threat T-1.
     let b = Bouncer::builder()
         .trusted_proxies(&[c("10.0.0.0/8")])
-        .try_build()
+        .build()
         .unwrap();
     assert_eq!(b.ban(ip("10.1.1.1")), Err(BouncerError::TrustedProxyTarget));
     assert_eq!(
@@ -200,7 +200,7 @@ fn test_door_forwarded_header_from_untrusted_peer_not_bound() {
         .trusted_proxies(&[c("10.0.0.1/32")])
         .tickets(64)
         .ban_capacity(64)
-        .try_build()
+        .build()
         .unwrap();
     b.ban(ip("198.51.100.66")).unwrap();
     let peer = ip("192.0.2.7");
@@ -238,7 +238,7 @@ fn test_proxied_client_cannot_tell_a_ban_from_a_spent_budget() {
     let b = Bouncer::builder()
         .trusted_proxies(&[c("10.0.0.1/32")])
         .budgets(Budgets::off().door_concurrency(1, 1000))
-        .try_build()
+        .build()
         .unwrap();
     b.ban(ip("203.0.113.9")).unwrap();
     let mut first = b.door(ip("10.0.0.1")).unwrap();
@@ -263,7 +263,7 @@ fn test_proxied_client_cannot_tell_a_ban_from_a_spent_budget() {
         .clock(clock)
         .trusted_proxies(&[c("10.0.0.1/32")])
         .budgets(Budgets::off().door_rate(Rate::per_second(1).burst(1), Rate::per_second(1000)))
-        .try_build()
+        .build()
         .unwrap();
     rated.ban(ip("203.0.113.9")).unwrap();
     let mut first = rated.door(ip("10.0.0.1")).unwrap();
@@ -294,11 +294,11 @@ fn test_local_peer_is_a_proxy_hop_when_loopback_is_trusted() {
     // TCP peer from loopback, not a refused "proxy named as client".
     let b = Bouncer::builder()
         .trusted_proxies(&[c("127.0.0.1/32")])
-        .try_build()
+        .build()
         .unwrap();
     let now = b.now();
     let local = b
-        .door_at(ConnId(1), ip("127.0.0.1"), Provenance::Local, now)
+        .door_at(ConnectionId(1), ip("127.0.0.1"), Provenance::Local, now)
         .expect("a local peer is admitted as a proxy hop");
     let mut req = local.request(RequestId(1)).unwrap();
     assert!(
@@ -312,7 +312,7 @@ fn test_local_peer_is_a_proxy_hop_when_loopback_is_trusted() {
 fn test_ban_ipv6_rotation_within_64_refused() {
     // Threat T-2.
     let b = small();
-    b.ban(BanSpec::address(ip("2001:db8:aa:bb::1")).by(Actor::Local))
+    b.apply(Directive::ban(ip("2001:db8:aa:bb::1")).by(Actor::Local))
         .unwrap();
     for host in [
         "2001:db8:aa:bb::2",
@@ -329,7 +329,7 @@ fn test_ban_ipv6_rotation_within_64_refused() {
 #[test]
 fn test_registry_capacity_one_refuses_second_until_release() {
     // Edge case 14.
-    let b = Bouncer::builder().tickets(1).try_build().unwrap();
+    let b = Bouncer::builder().tickets(1).build().unwrap();
     let first = b.door(ip("192.0.2.1")).unwrap();
     assert_eq!(b.door(ip("192.0.2.2")).err(), Some(Refusal::RegistryFull));
     assert!(matches!(
@@ -349,7 +349,7 @@ fn test_registry_concurrent_issue_n_minus_one_n_n_plus_one() {
             .tickets(capacity)
             .shards(4)
             .budgets(Budgets::off())
-            .try_build()
+            .build()
             .unwrap();
         let real = b.capacity().tickets as i64;
         let want = (real + extra) as usize;
@@ -391,11 +391,11 @@ fn test_registry_concurrent_issue_n_minus_one_n_n_plus_one() {
 fn test_ticket_dropped_on_another_thread() {
     // Edge case 16: tickets issued on one thread's shard and dropped on
     // another thread (another shard) go back to their own cells.
-    let b = Bouncer::builder().tickets(1).try_build().unwrap();
+    let b = Bouncer::builder().tickets(1).build().unwrap();
     let t = b.door(ip("192.0.2.1")).unwrap();
     std::thread::spawn(move || drop(t)).join().unwrap();
     assert!(admitted(&b, "192.0.2.1"));
-    let b = Arc::new(Bouncer::builder().shards(4).tickets(4).try_build().unwrap());
+    let b = Arc::new(Bouncer::builder().shards(4).tickets(4).build().unwrap());
     for _ in 0..3 {
         // Each thread takes the next shard: issue on four, drop on four others.
         let issued: Vec<_> = (0..4u8)
@@ -449,7 +449,7 @@ fn test_request_on_revoked_connection_refused() {
     // Edge case 19: a PROXY-protocol client found banned revokes the connection.
     let b = Bouncer::builder()
         .trusted_proxies(&[c("10.0.0.1/32")])
-        .try_build()
+        .build()
         .unwrap();
     b.ban(ip("203.0.113.9")).unwrap();
     let mut conn = b.door(ip("10.0.0.1")).unwrap();
@@ -469,7 +469,7 @@ fn test_bind_client_rules() {
     // Edge case 21, threat T-1.
     let b = Bouncer::builder()
         .trusted_proxies(&[c("10.0.0.1/32")])
-        .try_build()
+        .build()
         .unwrap();
     // A socket peer: no re-binding, whatever the provenance.
     let mut direct = b.door(ip("192.0.2.1")).unwrap();
@@ -530,7 +530,7 @@ fn test_proxied_request_without_client_denies_every_checkpoint() {
     // Edge case 22, threat T-1.
     let b = Bouncer::builder()
         .trusted_proxies(&[c("10.0.0.0/8")])
-        .try_build()
+        .build()
         .unwrap();
     let hop = b.door(ip("10.0.0.5")).unwrap();
     let mut r = hop.request(RequestId(1)).unwrap();
@@ -544,30 +544,45 @@ fn test_proxied_request_without_client_denies_every_checkpoint() {
 fn test_stale_now_never_expires_early_and_end_is_exclusive() {
     // Edge cases 23 and 24.
     let clock = Arc::new(ManualClock::new());
-    let b = Bouncer::builder().clock(clock.clone()).try_build().unwrap();
+    let b = Bouncer::builder().clock(clock.clone()).build().unwrap();
     clock.advance(Duration::from_secs(100));
-    b.ban(BanSpec::address(ip("192.0.2.1")).for_duration(Duration::from_secs(10)))
+    b.apply(Directive::ban(ip("192.0.2.1")).for_duration(Duration::from_secs(10)))
         .unwrap();
     let at = |secs: u64| Now::from_nanos(secs * 1_000_000_000);
     assert!(
-        b.door_at(ConnId(1), ip("192.0.2.1"), Provenance::Socket, at(50))
+        b.door_at(ConnectionId(1), ip("192.0.2.1"), Provenance::Socket, at(50))
             .is_err(),
         "older now"
     );
     assert!(
-        b.door_at(ConnId(2), ip("192.0.2.1"), Provenance::Socket, at(109))
-            .is_err()
+        b.door_at(
+            ConnectionId(2),
+            ip("192.0.2.1"),
+            Provenance::Socket,
+            at(109)
+        )
+        .is_err()
     );
     assert!(
-        b.door_at(ConnId(3), ip("192.0.2.1"), Provenance::Socket, at(110))
-            .is_ok(),
+        b.door_at(
+            ConnectionId(3),
+            ip("192.0.2.1"),
+            Provenance::Socket,
+            at(110)
+        )
+        .is_ok(),
         "until <= now"
     );
     // A stale time after a later one is used as given: it can only make a
     // ban look less expired, never more.
     assert!(
-        b.door_at(ConnId(4), ip("192.0.2.1"), Provenance::Socket, at(105))
-            .is_err(),
+        b.door_at(
+            ConnectionId(4),
+            ip("192.0.2.1"),
+            Provenance::Socket,
+            at(105)
+        )
+        .is_err(),
         "a stale now after the end still refuses"
     );
     clock.advance(Duration::from_secs(10));
@@ -586,16 +601,16 @@ fn test_ban_policy_durations_with_manual_clock() {
                 .base(Duration::from_secs(60))
                 .jitter(Duration::ZERO),
         )
-        .try_build()
+        .build()
         .unwrap();
-    b.ban(BanSpec::address(ip("198.51.100.1")).by(Actor::Local))
+    b.apply(Directive::ban(ip("198.51.100.1")).by(Actor::Local))
         .unwrap();
     clock.advance(Duration::from_secs(59));
     assert!(!admitted(&b, "198.51.100.1"));
     clock.advance(Duration::from_secs(1));
     assert!(admitted(&b, "198.51.100.1"));
     // Second offence: twice as long.
-    b.ban(BanSpec::address(ip("198.51.100.1")).by(Actor::Local))
+    b.apply(Directive::ban(ip("198.51.100.1")).by(Actor::Local))
         .unwrap();
     clock.advance(Duration::from_secs(119));
     assert!(!admitted(&b, "198.51.100.1"));
@@ -615,7 +630,7 @@ fn test_ban_permanent_rules_per_actor() {
         (Actor::Channel(1), false),
         (Actor::Local, false),
     ] {
-        let r = b.ban(BanSpec::address(ip("192.0.2.200")).permanent().by(actor));
+        let r = b.apply(Directive::ban(ip("192.0.2.200")).permanent().by(actor));
         assert_eq!(r.is_ok(), ok, "{actor}");
         if !ok {
             assert_eq!(r, Err(BouncerError::PermanentNotAllowed));
@@ -626,13 +641,12 @@ fn test_ban_permanent_rules_per_actor() {
 #[test]
 fn test_ban_identity_keys_stored_and_liftable() {
     let b = small();
-    b.ban(BanSpec::key(SessionKey::from_digest([1; 16])))
-        .unwrap();
-    b.ban(BanSpec::key(AccountKey(42)).permanent()).unwrap();
-    b.ban(BanSpec::key(BanKey::FingerprintIn(
+    b.ban(SessionKey::from_digest([1; 16])).unwrap();
+    b.apply(Directive::ban(AccountKey(42)).permanent()).unwrap();
+    b.ban(BanKey::FingerprintIn(
         FingerprintKey::from_digest([2; 16]),
         c("203.0.113.0/24"),
-    )))
+    ))
     .unwrap();
     assert_eq!(b.lift(BanKey::Account(AccountKey(42))).unwrap().removed, 1);
     assert_eq!(
@@ -646,19 +660,19 @@ fn test_lift_prefix_leaves_covering_ban() {
     let b = small();
     b.ban(c("203.0.113.0/24")).unwrap();
     b.ban(ip("203.0.113.7")).unwrap();
-    assert_eq!(b.lift(LiftSpec::key(ip("203.0.113.7"))).unwrap().removed, 1);
+    assert_eq!(b.lift(ip("203.0.113.7")).unwrap().removed, 1);
     assert!(!admitted(&b, "203.0.113.7"));
 }
 
 #[test]
 fn test_ban_table_full_only_unevictable_left() {
-    let b = Bouncer::builder().ban_capacity(16).try_build().unwrap();
+    let b = Bouncer::builder().ban_capacity(16).build().unwrap();
     // One per /24, so nothing escalates.
     for i in 0..16u8 {
         b.ban(IpAddr::from([192, 0, i, 2])).unwrap();
     }
     assert_eq!(
-        b.ban(BanSpec::address(ip("198.51.100.1")).by(Actor::Local)),
+        b.apply(Directive::ban(ip("198.51.100.1")).by(Actor::Local)),
         Err(BouncerError::BanTableFull { capacity: 16 })
     );
     for i in 0..16u8 {
@@ -671,12 +685,12 @@ fn test_ban_table_full_only_unevictable_left() {
 
 #[test]
 fn test_ban_table_evicts_local_bans_never_admin() {
-    let b = Bouncer::builder().ban_capacity(32).try_build().unwrap();
+    let b = Bouncer::builder().ban_capacity(32).build().unwrap();
     for i in 0..8u8 {
         b.ban(IpAddr::from([192, 0, 2, i])).unwrap();
     }
     for i in 0..200u8 {
-        b.ban(BanSpec::address(IpAddr::from([198, 51, 100, i])).by(Actor::Local))
+        b.apply(Directive::ban(IpAddr::from([198, 51, 100, i])).by(Actor::Local))
             .unwrap();
     }
     for i in 0..8u8 {
@@ -693,10 +707,10 @@ fn test_ban_fills_to_capacity_and_every_entry_is_found() {
     let b = Bouncer::builder()
         .ban_capacity(n)
         .tickets(64)
-        .try_build()
+        .build()
         .unwrap();
     for i in 0..n {
-        b.ban(BanSpec::address(IpAddr::from((0x0a00_0000 | i).to_be_bytes())).permanent())
+        b.apply(Directive::ban(IpAddr::from((0x0a00_0000 | i).to_be_bytes())).permanent())
             .unwrap();
     }
     for i in (0..n).step_by(7) {
@@ -733,7 +747,7 @@ fn test_registry_flood_from_one_address_cannot_exhaust_it() {
     let b = Bouncer::builder()
         .tickets(256)
         .budgets(Budgets::default())
-        .try_build()
+        .build()
         .unwrap();
     let mut held = Vec::new();
     for _ in 0..1000 {
@@ -755,7 +769,7 @@ fn test_registry_flood_from_one_prefix_leaves_room_for_others() {
     let b = Bouncer::builder()
         .tickets(2048)
         .budgets(Budgets::default())
-        .try_build()
+        .build()
         .unwrap();
     let mut held = Vec::new();
     for i in 0..1000u16 {
@@ -798,7 +812,7 @@ fn test_full_budget_tables_charge_the_global_cell() {
                 )
                 .capacity(1024),
         )
-        .try_build()
+        .build()
         .unwrap();
     // 16,384 prefixes, one connection each: far more than the tables hold.
     let mut admitted_fill = 0;
@@ -830,7 +844,7 @@ fn test_budget_load_counts_keys_still_limiting() {
         .clock(clock.clone())
         .tickets(1024)
         .budgets(Budgets::default().capacity(1024))
-        .try_build()
+        .build()
         .unwrap();
     for i in 0..20_000 {
         let _ = b.door(prefix_v4(i));
@@ -849,7 +863,7 @@ fn test_concurrency_limits_hold_with_every_ticket_in_use() {
     let b = Bouncer::builder()
         .tickets(4096)
         .budgets(Budgets::off().door_concurrency(2, 1_000).capacity(1024))
-        .try_build()
+        .build()
         .unwrap();
     let held: Vec<_> = (0..4000)
         .filter_map(|i| b.door(prefix_v4(i)).ok())
@@ -890,7 +904,7 @@ fn test_connection_closed_under_live_requests_reports_them_revoked() {
     let b = Bouncer::builder()
         .event_sink(seen.clone())
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let conn = b.door(ip("192.0.2.17")).unwrap();
     let mut r1 = conn.request(RequestId(1)).unwrap();
@@ -924,7 +938,7 @@ fn test_proxy_hop_without_a_client_reported_after_the_deadline() {
         .max_unchecked(Duration::from_secs(30))
         .event_sink(seen.clone())
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let hop = b.door(ip("10.0.0.1")).unwrap();
     let mut waiting = hop.request(RequestId(1)).unwrap();
@@ -967,7 +981,7 @@ fn test_crowded_prefix_every_host_found() {
         .ban_capacity(8192)
         .escalation(bouncer_io::EscalationPolicy::default().off())
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     for i in 0..1_000u32 {
         b.ban(IpAddr::from((0x0b00_0000 + i * 977).to_be_bytes()))

@@ -966,14 +966,14 @@ impl Bouncer {
     ///
     /// ```
     /// use bouncer_io::{Actor, Bouncer, NodeId, Sequence};
-    /// let a = Bouncer::builder().node(NodeId(1)).try_build()?;
-    /// let b = Bouncer::builder().node(NodeId(2)).try_build()?;
+    /// let a = Bouncer::builder().node(NodeId(1)).build()?;
+    /// let b = Bouncer::builder().node(NodeId(2)).build()?;
     /// a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
     /// let delta = a.export_delta(Sequence::START)?;
     /// b.import(&delta, Actor::Channel(1))?;
     /// assert!(b.door("198.51.100.9".parse()?).is_err());
     /// // The next export starts where this one ended: nothing new since.
-    /// assert_eq!(b.import(&a.export_delta(delta.last())?, Actor::Channel(1))?.applied, 0);
+    /// assert_eq!(b.import(&a.export_delta(delta.last_sequence())?, Actor::Channel(1))?.applied, 0);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn export_delta(&self, since: Sequence) -> Result<Delta, BouncerError> {
@@ -996,9 +996,9 @@ impl Bouncer {
     ///
     /// ```
     /// use bouncer_io::{Actor, Bouncer, NodeId};
-    /// let a = Bouncer::builder().node(NodeId(1)).try_build()?;
+    /// let a = Bouncer::builder().node(NodeId(1)).build()?;
     /// a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
-    /// let joining = Bouncer::builder().node(NodeId(2)).try_build()?;
+    /// let joining = Bouncer::builder().node(NodeId(2)).build()?;
     /// assert!(joining.import(&a.export_snapshot()?, Actor::Channel(1))?.applied >= 1);
     /// assert!(joining.door("198.51.100.9".parse()?).is_err());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1038,8 +1038,8 @@ impl Bouncer {
     ///
     /// ```
     /// use bouncer_io::{Actor, Bouncer, NodeId, Sequence};
-    /// let a = Bouncer::builder().node(NodeId(1)).try_build()?;
-    /// let b = Bouncer::builder().node(NodeId(2)).try_build()?;
+    /// let a = Bouncer::builder().node(NodeId(1)).build()?;
+    /// let b = Bouncer::builder().node(NodeId(2)).build()?;
     /// a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
     /// let delta = a.export_delta(Sequence::START)?;
     /// assert_eq!(b.import(&delta, Actor::Channel(1))?.applied, 2);      // the ban and its offender record
@@ -1448,11 +1448,11 @@ mod tests {
                 ])),
                 batch_v1(&[legacy_lift(addr("192.0.2.2"), 4)]),
             );
-            let mut builder = Bouncer::builder().persistence(Box::new(store.clone()));
+            let mut builder = Bouncer::builder().persistence(store.clone());
             if let Some(n) = node {
                 builder = builder.node(n);
             }
-            let b = builder.try_build().unwrap();
+            let b = builder.build().unwrap();
             assert!(b.door("192.0.2.1".parse().unwrap()).is_err(), "{node:?}");
             assert!(
                 b.door("192.0.2.2".parse().unwrap()).is_ok(),
@@ -1464,11 +1464,11 @@ mod tests {
             assert!(journal.is_empty(), "a new journal on the new snapshot");
             drop(b);
             // And the rewritten files load again.
-            let mut builder = Bouncer::builder().persistence(Box::new(store.clone()));
+            let mut builder = Bouncer::builder().persistence(store.clone());
             if let Some(n) = node {
                 builder = builder.node(n);
             }
-            let b = builder.try_build().unwrap();
+            let b = builder.build().unwrap();
             assert!(b.door("192.0.2.1".parse().unwrap()).is_err());
             assert!(b.door("192.0.2.2".parse().unwrap()).is_ok());
         }
@@ -1483,12 +1483,12 @@ mod tests {
         let one = || {
             Bouncer::builder()
                 .node(NodeId(1))
-                .persistence(Box::new(store.clone()))
-                .try_build()
+                .persistence(store.clone())
+                .build()
                 .unwrap()
         };
-        let two = Bouncer::builder().node(NodeId(2)).try_build().unwrap();
-        let three = Bouncer::builder().node(NodeId(3)).try_build().unwrap();
+        let two = Bouncer::builder().node(NodeId(2)).build().unwrap();
+        let three = Bouncer::builder().node(NodeId(3)).build().unwrap();
         let a: std::net::IpAddr = "198.51.100.7".parse().unwrap();
         two.ban(a).unwrap();
         three.ban(a).unwrap();
@@ -1504,14 +1504,17 @@ mod tests {
         drop(b);
         let b = one();
         assert!(b.door(a).is_err());
-        let since_two = two.export_delta(start).unwrap().last();
-        two.lift(LiftSpec::key(a).by(Actor::Gate)).unwrap();
+        let since_two = two.export_delta(start).unwrap().last_sequence();
+        two.apply(crate::Directive::lift(a).by(Actor::Gate))
+            .unwrap();
         let _ = b
             .import(&two.export_delta(since_two).unwrap(), Actor::Channel(2))
             .unwrap();
         assert!(b.door(a).is_err(), "node 3's ban stands");
-        let since_three = three.export_delta(start).unwrap().last();
-        three.lift(LiftSpec::key(a).by(Actor::Gate)).unwrap();
+        let since_three = three.export_delta(start).unwrap().last_sequence();
+        three
+            .apply(crate::Directive::lift(a).by(Actor::Gate))
+            .unwrap();
         let _ = b
             .import(&three.export_delta(since_three).unwrap(), Actor::Channel(3))
             .unwrap();
@@ -1527,16 +1530,16 @@ mod tests {
         let one = || {
             Bouncer::builder()
                 .node(NodeId(1))
-                .persistence(Box::new(store.clone()))
-                .try_build()
+                .persistence(store.clone())
+                .build()
                 .unwrap()
         };
-        let peer = Bouncer::builder().node(NodeId(2)).try_build().unwrap();
+        let peer = Bouncer::builder().node(NodeId(2)).build().unwrap();
         let a = one();
         a.ban("198.51.100.1".parse::<std::net::IpAddr>().unwrap())
             .unwrap();
         let d = a.export_delta(crate::share::Sequence::START).unwrap();
-        let since = d.last();
+        let since = d.last_sequence();
         let _ = peer.import(&d, Actor::Channel(1)).unwrap();
         a.flush().unwrap();
         drop(a);
@@ -1558,21 +1561,21 @@ mod tests {
             .node(NodeId(1))
             .ban_capacity(1 << 14)
             .budgets(crate::Budgets::off())
-            .try_build()
+            .build()
             .unwrap();
         let b = Bouncer::builder()
             .node(NodeId(2))
             .ban_capacity(64)
             .budgets(crate::Budgets::off())
-            .try_build()
+            .build()
             .unwrap();
         let cap = b.capacity().bans as usize;
         for i in 0..(cap as u32 * 3) {
             let addr = std::net::IpAddr::from((0x0a00_0000 + (i << 8)).to_be_bytes());
-            let spec = crate::BanSpec::address(addr)
+            let ban = crate::Directive::ban(addr)
                 .by(Actor::Local)
                 .for_duration(Duration::from_secs(3600));
-            a.ban(spec).unwrap();
+            a.apply(ban).unwrap();
         }
         let start = crate::share::Sequence::START;
         let _ = b.import(&a.export_delta(start).unwrap(), Actor::Channel(1));

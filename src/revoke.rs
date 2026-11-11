@@ -20,7 +20,10 @@ use crate::{
     },
     directive::{ActorKind, Reason},
     hash::HashKey,
-    keys::{AccountKey, Cidr, ConnId, Family, FingerprintKey, RequestId, SessionKey, TenantKey},
+    keys::{
+        AccountKey, BanKey, Cidr, ConnectionId, Family, FingerprintKey, RequestId, SessionKey,
+        TenantKey,
+    },
     registry::{
         Cell, K_ACCOUNT, K_FINGERPRINT, K_REQUEST, K_SESSION, K_SOURCE, K_TENANT, P_ACCOUNT,
         P_FINGERPRINT, P_REQUEST, P_SESSION, P_SOURCE, P_SOURCE_V6, P_TENANT,
@@ -43,7 +46,7 @@ use crate::{
 /// use std::sync::Arc;
 ///
 /// let epoch = Arc::new(RevocationEpoch::new());          // owned by the security core
-/// let bouncer = Bouncer::builder().epoch(epoch.clone()).try_build()?;
+/// let bouncer = Bouncer::builder().epoch(epoch.clone()).build()?;
 /// let before = epoch.current();
 /// bouncer.revoke(bouncer_io::AccountKey(1), Reason::ADMIN)?;
 /// assert!(epoch.current() > before);
@@ -92,7 +95,7 @@ impl RevocationEpoch {
     /// use bouncer_io::{AccountKey, Bouncer, Reason, RevocationEpoch};
     /// use std::sync::Arc;
     /// let epoch = Arc::new(RevocationEpoch::new());
-    /// let bouncer = Bouncer::builder().epoch(epoch.clone()).try_build()?;
+    /// let bouncer = Bouncer::builder().epoch(epoch.clone()).build()?;
     /// let receipt = bouncer.revoke(AccountKey(3), Reason::LOGOUT_EVERYWHERE)?;
     /// assert_eq!(epoch.current(), receipt.epoch); // the shared word carries the revocation
     /// # Ok::<(), bouncer_io::BouncerError>(())
@@ -180,7 +183,7 @@ const fn after(v: u64) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Target {
     /// One connection, and every request on it.
-    Connection(ConnId),
+    Connection(ConnectionId),
     /// One request, and (unless the directive keeps it) its connection.
     Request(RequestId),
     /// Every ticket carrying the session.
@@ -193,10 +196,41 @@ pub enum Target {
     Source(Cidr),
     /// Every ticket carrying the fingerprint.
     Fingerprint(FingerprintKey),
+    /// A fingerprint within a prefix: the compound ban key automation uses.
+    /// Bans and lifts only; a revocation or a throttle of it is
+    /// [`InvalidTarget`](crate::BouncerError::InvalidTarget).
+    FingerprintIn(FingerprintKey, Cidr),
 }
 
-impl From<ConnId> for Target {
-    fn from(c: ConnId) -> Self {
+/// Every ban key is a directive target, so `Directive::ban(key)` takes what
+/// `Bouncer::ban(key)` takes.
+///
+/// # Examples
+///
+/// ```
+/// use bouncer_io::{BanKey, Cidr, FingerprintKey, Target};
+/// let fp = FingerprintKey::from_digest([3; 16]);
+/// let within: Cidr = "192.0.2.0/24".parse()?;
+/// let t: Target = BanKey::FingerprintIn(fp, within).into();
+/// assert_eq!(t, Target::FingerprintIn(fp, within));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+impl From<BanKey> for Target {
+    fn from(key: BanKey) -> Self {
+        match key {
+            BanKey::Address(a) => Target::Source(Cidr::host(a)),
+            BanKey::Prefix(c) => Target::Source(c),
+            BanKey::Session(k) => Target::Session(k),
+            BanKey::Account(k) => Target::Account(k),
+            BanKey::Tenant(k) => Target::Tenant(k),
+            BanKey::Fingerprint(k) => Target::Fingerprint(k),
+            BanKey::FingerprintIn(k, c) => Target::FingerprintIn(k, c),
+        }
+    }
+}
+
+impl From<ConnectionId> for Target {
+    fn from(c: ConnectionId) -> Self {
         Target::Connection(c)
     }
 }
@@ -369,7 +403,9 @@ pub(crate) fn target_key(target: &Target) -> TableKey {
             k1: t.0,
         },
         Target::Source(c) => BanMemory::prefix_key(&c),
-        Target::Fingerprint(f) => {
+        // Refused before a revocation is recorded (`revoke_with`); keyed as
+        // its fingerprint so the match stays total.
+        Target::Fingerprint(f) | Target::FingerprintIn(f, _) => {
             let (k0, k1) = f.words();
             TableKey {
                 kind: table::KIND_FINGERPRINT,

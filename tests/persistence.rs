@@ -11,7 +11,7 @@ use std::{
 };
 
 use bouncer_io::{
-    AccountKey, Actor, BanKey, BanSpec, Bouncer, BouncerError, Cidr, DurationPolicy, FileAnchor,
+    AccountKey, Actor, BanKey, Bouncer, BouncerError, Cidr, Directive, DurationPolicy, FileAnchor,
     FilePersistence, FingerprintKey, LoadFailure, PersistError, Persistence, SessionKey,
     StoreVersion, VersionAnchor,
 };
@@ -56,9 +56,9 @@ impl Persistence for Shared {
 
 fn with(store: &Shared, clock: &Arc<ManualClock>) -> Bouncer {
     Bouncer::builder()
-        .persistence(Box::new(store.clone()))
+        .persistence(store.clone())
         .clock(clock.clone())
-        .try_build()
+        .build()
         .unwrap()
 }
 
@@ -71,19 +71,17 @@ fn test_bans_lifts_and_offences_survive_restart() {
         let b = with(&store, &clock);
         b.ban(ip("198.51.100.1")).unwrap();
         b.ban(ip("198.51.100.2")).unwrap();
-        b.ban(
-            BanSpec::prefix(c("2001:db8:9::/48"))
+        b.apply(
+            Directive::ban(c("2001:db8:9::/48"))
                 .by(Actor::Admin(1))
                 .permanent(),
         )
         .unwrap();
-        b.ban(BanSpec::prefix(c("10.200.0.0/14")).by(Actor::Admin(1)))
+        b.apply(Directive::ban(c("10.200.0.0/14")).by(Actor::Admin(1)))
             .unwrap();
-        b.ban(BanSpec::key(AccountKey(9))).unwrap();
-        b.ban(BanSpec::key(SessionKey::from_digest([4; 16])))
-            .unwrap();
-        b.ban(BanSpec::key(BanKey::FingerprintIn(fp, c("192.0.2.0/24"))))
-            .unwrap();
+        b.ban(AccountKey(9)).unwrap();
+        b.ban(SessionKey::from_digest([4; 16])).unwrap();
+        b.ban(BanKey::FingerprintIn(fp, c("192.0.2.0/24"))).unwrap();
         b.lift(ip("198.51.100.2")).unwrap();
         // Dropping flushes what is queued.
     }
@@ -116,10 +114,10 @@ fn test_offences_survive_so_the_next_ban_is_longer() {
         .jitter(Duration::ZERO);
     let build = || {
         Bouncer::builder()
-            .persistence(Box::new(store.clone()))
+            .persistence(store.clone())
             .clock(clock.clone())
             .durations(policy)
-            .try_build()
+            .build()
             .unwrap()
     };
     let addr = ip("192.0.2.50");
@@ -163,11 +161,11 @@ fn test_wall_clock_steps_never_lengthen_and_strict_keeps() {
         let addr = ip("203.0.113.5");
         {
             let b = Bouncer::builder()
-                .persistence(Box::new(store.clone()))
+                .persistence(store.clone())
                 .clock(clock.clone())
-                .try_build()
+                .build()
                 .unwrap();
-            b.ban(BanSpec::address(addr).for_duration(Duration::from_secs(3600)))
+            b.apply(Directive::ban(addr).for_duration(Duration::from_secs(3600)))
                 .unwrap();
         }
         if step_back {
@@ -177,11 +175,11 @@ fn test_wall_clock_steps_never_lengthen_and_strict_keeps() {
         }
         let jumps = Arc::new(Jumps::default());
         let b = Bouncer::builder()
-            .persistence(Box::new(store.clone()))
+            .persistence(store.clone())
             .clock(clock.clone())
             .strict_wall_jump(strict)
             .event_sink(jumps.clone())
-            .try_build()
+            .build()
             .unwrap();
         assert_eq!(
             b.door(addr).is_err(),
@@ -212,10 +210,10 @@ fn test_snapshot_tampered_byte_refused() {
     let key = [42u8; 32];
     {
         let b = Bouncer::builder()
-            .persistence(Box::new(store.clone()))
+            .persistence(store.clone())
             .mac_key(key)
             .clock(clock.clone())
-            .try_build()
+            .build()
             .unwrap();
         b.ban(ip("192.0.2.77")).unwrap();
         b.flush().unwrap();
@@ -223,22 +221,22 @@ fn test_snapshot_tampered_byte_refused() {
     // Compact so the ban sits in the snapshot, then tamper with it.
     {
         let b = Bouncer::builder()
-            .persistence(Box::new(store.clone()))
+            .persistence(store.clone())
             .mac_key(key)
             .clock(clock.clone())
-            .try_build()
+            .build()
             .unwrap();
         assert!(b.door(ip("192.0.2.77")).is_err());
     }
     let open = |k: Option<[u8; 32]>, policy| {
         let mut builder = Bouncer::builder()
-            .persistence(Box::new(store.clone()))
+            .persistence(store.clone())
             .clock(clock.clone())
             .on_load_failure(policy);
         if let Some(k) = k {
             builder = builder.mac_key(k);
         }
-        builder.try_build()
+        builder.build()
     };
     assert!(matches!(
         open(None, LoadFailure::Refuse),
@@ -327,12 +325,12 @@ fn anchored(
     sink: &Arc<RolledBack>,
 ) -> Result<Bouncer, BouncerError> {
     Bouncer::builder()
-        .persistence(Box::new(store.clone()))
-        .version_anchor(Box::new(anchor.clone()))
+        .persistence(store.clone())
+        .version_anchor(anchor.clone())
         .on_load_failure(policy)
         .event_sink(sink.clone())
         .clock(clock.clone())
-        .try_build()
+        .build()
 }
 
 #[test]
@@ -463,16 +461,16 @@ fn test_file_persistence_restart_and_corruption() {
     let dir = temp_dir("file");
     {
         let b = Bouncer::builder()
-            .persistence(Box::new(FilePersistence::open(&dir, "bans").unwrap()))
-            .try_build()
+            .persistence(FilePersistence::open(&dir, "bans").unwrap())
+            .build()
             .unwrap();
         b.ban(ip("198.51.100.44")).unwrap();
         b.flush().unwrap();
     }
     let open = || {
         Bouncer::builder()
-            .persistence(Box::new(FilePersistence::open(&dir, "bans").unwrap()))
-            .try_build()
+            .persistence(FilePersistence::open(&dir, "bans").unwrap())
+            .build()
     };
     assert!(open().unwrap().door(ip("198.51.100.44")).is_err());
     assert!(dir.join("bans").exists());
@@ -496,14 +494,10 @@ fn kill_child() {
         return;
     };
     let b = Bouncer::builder()
-        .persistence(Box::new(
-            FilePersistence::open(dir.as_ref(), "bans").unwrap(),
-        ))
-        .version_anchor(Box::new(FileAnchor::open(
-            &PathBuf::from(&dir).join("bans.version"),
-        )))
+        .persistence(FilePersistence::open(dir.as_ref(), "bans").unwrap())
+        .version_anchor(FileAnchor::open(&PathBuf::from(&dir).join("bans.version")))
         .budgets(bouncer_io::Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     // Runs until the parent kills it.
     let mut i = 0u32;
@@ -573,9 +567,9 @@ fn test_kill_during_writes_always_loads_cleanly() {
         child.kill().unwrap();
         let _ = child.wait();
         let b = Bouncer::builder()
-            .persistence(Box::new(FilePersistence::open(&dir, "bans").unwrap()))
-            .version_anchor(Box::new(FileAnchor::open(&dir.join("bans.version"))))
-            .try_build()
+            .persistence(FilePersistence::open(&dir, "bans").unwrap())
+            .version_anchor(FileAnchor::open(&dir.join("bans.version")))
+            .build()
             .expect("the store loads after a kill");
         if let Some(n) = last {
             let addr = IpAddr::from((0x0a00_0000 | (n & 0x00ff_ffff)).to_be_bytes());

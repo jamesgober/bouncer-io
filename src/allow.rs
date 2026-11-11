@@ -40,7 +40,7 @@ pub enum AllowKind {
 ///             .immune("10.20.0.0/16".parse()?, "own infrastructure")
 ///             .exempt_budgets("192.0.2.200".parse()?, "health checks"),
 ///     )
-///     .try_build()?;
+///     .build()?;
 /// assert!(bouncer.ban("10.20.1.1".parse::<std::net::IpAddr>()?).is_err());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -71,7 +71,7 @@ impl AllowList {
     /// use bouncer_io::{AllowList, Bouncer, BouncerError};
     /// let bouncer = Bouncer::builder()
     ///     .allow(AllowList::new().immune("10.20.0.0/16".parse()?, "own infrastructure"))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let refused = bouncer.ban("10.20.1.1".parse::<std::net::IpAddr>()?);
     /// assert!(matches!(refused, Err(BouncerError::AllowListed { .. })));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -91,10 +91,10 @@ impl AllowList {
     /// use clock_lib::ManualClock;
     /// use std::sync::Arc;
     /// let bouncer = Bouncer::builder()
-    ///     .clock(Arc::new(ManualClock::new()))
+    ///     .clock(ManualClock::new())
     ///     .budgets(Budgets::off().door_rate(Rate::per_second(1), Rate::per_second(100)))
     ///     .allow(AllowList::new().exempt_budgets("192.0.2.200".parse()?, "health checks"))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let (checker, client) = ("192.0.2.200".parse()?, "192.0.2.7".parse()?);
     /// assert!(bouncer.door(checker).is_ok() && bouncer.door(checker).is_ok());
     /// assert!(bouncer.door(client).is_ok());

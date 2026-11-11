@@ -9,7 +9,8 @@
 use std::{hint::black_box, net::IpAddr};
 
 use bouncer_io::{
-    BanSpec, Bouncer, Budgets, Cidr, ConnId, Provenance, Rate, RequestId, SessionKey, Ticket,
+    Bouncer, Budgets, Cidr, ConnectionId, Directive, Provenance, Rate, RequestId, SessionKey,
+    Ticket,
 };
 
 /// Operations per gated function.
@@ -24,7 +25,7 @@ fn gate_door_admitted(b: &Bouncer, peers: &[IpAddr]) {
     let now = b.now();
     for (i, p) in peers.iter().enumerate() {
         black_box(
-            b.door_at(ConnId(i as u64), *p, Provenance::Socket, now)
+            b.door_at(ConnectionId(i as u64), *p, Provenance::Socket, now)
                 .is_ok(),
         );
     }
@@ -35,7 +36,7 @@ fn gate_door_banned(b: &Bouncer, peers: &[IpAddr]) {
     let now = b.now();
     for (i, p) in peers.iter().enumerate() {
         black_box(
-            b.door_at(ConnId(i as u64), *p, Provenance::Socket, now)
+            b.door_at(ConnectionId(i as u64), *p, Provenance::Socket, now)
                 .is_err(),
         );
     }
@@ -81,14 +82,14 @@ fn main() {
         .tickets(1 << 15)
         .seed([7; 32])
         .escalation(bouncer_io::EscalationPolicy::default().off())
-        .try_build()
+        .build()
         .unwrap();
     // 50,000 bans over the automatic lengths.
     for i in 0..25_000usize {
         let v4 = IpAddr::from([203, (i >> 16) as u8, (i >> 8) as u8, i as u8]);
-        let _ = b.ban(BanSpec::prefix(Cidr::new(v4, 32).unwrap()).permanent());
+        let _ = b.apply(Directive::ban(Cidr::new(v4, 32).unwrap()).permanent());
         let v6 = IpAddr::from([0x2001, 0xdb8, i as u16, 0, 0, 0, 0, 1]);
-        let _ = b.ban(BanSpec::prefix(Cidr::new(v6, 48).unwrap()).permanent());
+        let _ = b.apply(Directive::ban(Cidr::new(v6, 48).unwrap()).permanent());
     }
     let admitted: Vec<IpAddr> = (0..OPS).map(addr).collect();
     let banned: Vec<IpAddr> = (0..OPS)

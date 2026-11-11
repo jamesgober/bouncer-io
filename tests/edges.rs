@@ -10,7 +10,7 @@ use std::{
 };
 
 use bouncer_io::{
-    BanSpec, Bouncer, Budgets, CloseKind, ConnId, Directive, DurationPolicy, Ejector, Event,
+    Bouncer, Budgets, CloseKind, ConnectionId, Directive, DurationPolicy, Ejector, Event,
     EventSink, MaintainerState, Reason, RequestId, RevokeMode, SessionKey,
 };
 use clock_lib::ManualClock;
@@ -32,7 +32,7 @@ fn test_duration_arithmetic_at_the_limits() {
         let b = Bouncer::builder()
             .clock(clock.clone())
             .durations(policy.jitter(Duration::ZERO))
-            .try_build()
+            .build()
             .unwrap();
         let addr = ip("192.0.2.9");
         (0..rounds)
@@ -58,9 +58,9 @@ fn test_monotonic_expiry_ignores_the_wall_clock() {
     // Edge cases 57 and 60: a manual clock past the end admits; wall steps
     // (a leap second, an NTP step) change nothing in process.
     let clock = Arc::new(ManualClock::new());
-    let b = Bouncer::builder().clock(clock.clone()).try_build().unwrap();
+    let b = Bouncer::builder().clock(clock.clone()).build().unwrap();
     let addr = ip("198.51.100.3");
-    b.ban(BanSpec::address(addr).for_duration(Duration::from_secs(60)))
+    b.apply(Directive::ban(addr).for_duration(Duration::from_secs(60)))
         .unwrap();
     clock.step_wall_forward(Duration::from_secs(86_400));
     assert!(
@@ -81,7 +81,7 @@ fn test_hammering_one_shard_while_banning_and_lifting() {
             .shards(1)
             .tickets(4096)
             .budgets(Budgets::off())
-            .try_build()
+            .build()
             .unwrap(),
     );
     let stop = Arc::new(AtomicBool::new(false));
@@ -151,7 +151,7 @@ fn test_hammering_one_shard_while_banning_and_lifting() {
 /// An ejector that panics on the maintainer thread only.
 struct PanicsOnMaintainer;
 impl Ejector for PanicsOnMaintainer {
-    fn eject(&self, _conn: ConnId, _kind: CloseKind) {
+    fn eject(&self, _conn: ConnectionId, _kind: CloseKind) {
         if std::thread::current().name() == Some("bouncer-maintainer") {
             panic!("ejector failed on the maintainer");
         }
@@ -163,8 +163,8 @@ fn test_maintainer_death_leaves_enforcement_and_maintain() {
     // Edge case 70.
     let b = Bouncer::builder()
         .maintainer(true)
-        .ejector(Arc::new(PanicsOnMaintainer))
-        .try_build()
+        .ejector(PanicsOnMaintainer)
+        .build()
         .unwrap();
     let session = SessionKey::from_digest([6; 16]);
     let conn = b.door(ip("192.0.2.66")).unwrap();
@@ -202,9 +202,9 @@ impl EventSink for Slow {
 fn test_blocking_sink_never_slows_checkpoints() {
     // Edge case 71.
     let b = Bouncer::builder()
-        .event_sink(Arc::new(Slow))
+        .event_sink(Slow)
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let mut conn = b.door(ip("192.0.2.67")).unwrap();
     let mut req = conn.request(RequestId(1)).unwrap();
@@ -242,7 +242,7 @@ fn test_blocking_sink_slows_only_sampled_event_paths() {
         .clock(clock.clone())
         .event_sink(sink.clone())
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let started = Instant::now();
     for i in 0..10_000u32 {
@@ -292,7 +292,7 @@ impl EventSink for Ids {
 
 #[test]
 fn test_eviction_expiry_and_unresolved_proxy_hops_report() {
-    use bouncer_io::{Actor, Cidr, signals};
+    use bouncer_io::{Actor, Cidr, Directive, signals};
     let ids = Arc::new(Ids::default());
     let clock = Arc::new(ManualClock::new());
     let b = Bouncer::builder()
@@ -300,14 +300,14 @@ fn test_eviction_expiry_and_unresolved_proxy_hops_report() {
         .ban_capacity(16)
         .trusted_proxies(&["10.0.0.0/8".parse::<Cidr>().unwrap()])
         .event_sink(ids.clone())
-        .try_build()
+        .build()
         .unwrap();
     // Fill with evictable bans, one per /24, then one more: an eviction.
     for i in 0..17u8 {
-        let spec = BanSpec::address(IpAddr::from([198, 51, i, 1]))
+        let ban = Directive::ban(IpAddr::from([198, 51, i, 1]))
             .by(Actor::Local)
             .for_duration(Duration::from_secs(60 + u64::from(i)));
-        b.ban(spec).unwrap();
+        b.apply(ban).unwrap();
     }
     // Let them expire, then insert: the slot of an expired one is reclaimed.
     clock.advance(Duration::from_secs(200));

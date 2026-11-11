@@ -7,7 +7,7 @@ use std::{
 };
 
 use bouncer_io::{
-    AccountKey, Actor, AllowKind, AllowList, BanKey, BanSpec, Bouncer, Budgets, Cidr, Event,
+    AccountKey, Actor, AllowKind, AllowList, BanKey, Bouncer, Budgets, Cidr, Directive, Event,
     EventSink, Family, Filter, FingerprintKey, MaintainerState, Page, Posture, Rate, Reason,
     RequestId, SessionKey, StrikeKind, signals,
 };
@@ -41,7 +41,7 @@ fn test_explain_address_shows_every_covering_ban_and_state() {
     let b = Bouncer::builder()
         .clock(clock.clone())
         .budgets(Budgets::off().door_rate(Rate::per_second(2), Rate::per_second(100)))
-        .try_build()
+        .build()
         .unwrap();
     let addr = ip("203.0.113.7");
     assert!(b.explain(addr).admitted);
@@ -71,8 +71,8 @@ fn test_explain_address_shows_every_covering_ban_and_state() {
     drop((conn, second));
     // Edge case 52: a child ban and its parent; lift the child, the parent stands.
     b.ban(addr).unwrap();
-    b.ban(
-        BanSpec::prefix(c("203.0.113.0/24"))
+    b.apply(
+        Directive::ban(c("203.0.113.0/24"))
             .by(Actor::Admin(4))
             .for_duration(Duration::from_secs(3600)),
     )
@@ -109,7 +109,7 @@ fn test_explain_identity_allow_and_admin_prefix() {
                 .immune(c("10.20.0.0/16"), "infra")
                 .exempt_budgets(c("192.0.2.200/32"), "lb"),
         )
-        .try_build()
+        .build()
         .unwrap();
     let why = b.explain(ip("10.20.1.1"));
     assert_eq!(why.allow, Some(AllowKind::Immune));
@@ -120,13 +120,13 @@ fn test_explain_identity_allow_and_admin_prefix() {
         Some(AllowKind::ExemptBudgets)
     );
     let account = AccountKey(77);
-    b.ban(BanSpec::key(account).permanent()).unwrap();
+    b.apply(Directive::ban(account).permanent()).unwrap();
     let why = b.explain(account);
     assert!(!why.admitted);
     assert_eq!(why.bans[0].until, None);
     assert!(why.to_string().contains("banned permanently"));
     // An administrator prefix outside the automatic lengths.
-    b.ban(BanSpec::prefix(c("198.18.0.0/15")).by(Actor::Admin(1)))
+    b.apply(Directive::ban(c("198.18.0.0/15")).by(Actor::Admin(1)))
         .unwrap();
     assert!(!b.explain(ip("198.19.4.4")).admitted);
     assert_eq!(
@@ -141,18 +141,17 @@ fn test_list_filters_and_pages() {
     for i in 1..=7u8 {
         b.ban(IpAddr::from([198, 51, 100, i])).unwrap();
     }
-    b.ban(
-        BanSpec::prefix(c("2001:db8:1::/48"))
+    b.apply(
+        Directive::ban(c("2001:db8:1::/48"))
             .by(Actor::Admin(2))
             .permanent(),
     )
     .unwrap();
     let session = SessionKey::from_digest([4; 16]);
-    b.ban(BanSpec::key(session).because(Reason::LOGOUT))
+    b.apply(Directive::ban(session).because(Reason::LOGOUT))
         .unwrap();
     let fp = FingerprintKey::from_digest([9; 16]);
-    b.ban(BanSpec::key(BanKey::FingerprintIn(fp, c("192.0.2.0/24"))))
-        .unwrap();
+    b.ban(BanKey::FingerprintIn(fp, c("192.0.2.0/24"))).unwrap();
     assert_eq!(b.list(&Filter::all(), Page::first(100)).total, 10);
     assert_eq!(
         b.list(&Filter::all().family(Family::V6), Page::first(100))
@@ -206,13 +205,10 @@ fn test_list_filters_and_pages() {
 #[test]
 fn test_replace_allow_lifts_covered_bans_and_reports() {
     let sink = Arc::new(Sink::default());
-    let b = Bouncer::builder()
-        .event_sink(sink.clone())
-        .try_build()
-        .unwrap();
+    let b = Bouncer::builder().event_sink(sink.clone()).build().unwrap();
     b.ban(ip("10.20.3.4")).unwrap();
     b.ban(c("10.20.9.0/24")).unwrap();
-    b.ban(BanSpec::prefix(c("10.20.128.0/17")).by(Actor::Admin(1)))
+    b.apply(Directive::ban(c("10.20.128.0/17")).by(Actor::Admin(1)))
         .unwrap();
     b.ban(ip("10.30.0.1")).unwrap();
     let mut conn = b.door(ip("10.20.5.5")).unwrap();
@@ -272,7 +268,7 @@ fn test_health_reports_loads_tickets_and_maintainer() {
         .tickets(64)
         .ban_capacity(64)
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let h = b.health();
     assert!(h.is_ok());
@@ -297,7 +293,7 @@ fn test_health_reports_loads_tickets_and_maintainer() {
     b.set_posture(Posture::Strict);
     assert_eq!(b.health().posture, Posture::Strict);
 
-    let m = Bouncer::builder().maintainer(true).try_build().unwrap();
+    let m = Bouncer::builder().maintainer(true).build().unwrap();
     let state = m.health().maintainer;
     assert!(matches!(
         state,

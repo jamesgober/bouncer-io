@@ -28,10 +28,7 @@ fn session(round: u64, thread: usize) -> SessionKey {
 }
 
 fn run(threads: usize, total_checkpoints: u64) {
-    let b = Bouncer::builder()
-        .budgets(Budgets::off())
-        .try_build()
-        .unwrap();
+    let b = Bouncer::builder().budgets(Budgets::off()).build().unwrap();
     let barrier = Arc::new(Barrier::new(threads + 1));
     // The last round whose revocations have all returned.
     let revoked_round = Arc::new(AtomicU64::new(0));

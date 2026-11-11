@@ -19,7 +19,7 @@ use crate::{
     error::BouncerError,
     events::{self, Subject},
     format::{DenialFormat, Ejected},
-    keys::{AccountKey, ConnId, FingerprintKey, RequestId, SessionKey, TenantKey, normalize},
+    keys::{AccountKey, ConnectionId, FingerprintKey, RequestId, SessionKey, TenantKey, normalize},
     maintain::CloseKind,
     metrics::meter,
     registry::{
@@ -78,7 +78,7 @@ impl TicketKind {
 /// use bouncer_io::{Bouncer, Budgets, LaneClass, Rate, RequestId};
 /// let bouncer = Bouncer::builder()
 ///     .budgets(Budgets::off().lane_rate(LaneClass::Auth, Rate::per_minute(2)))
-///     .try_build()?;
+///     .build()?;
 /// let conn = bouncer.door("192.0.2.1".parse()?)?;
 /// for id in 0..2 {
 ///     assert!(conn.request(RequestId(id))?.bind_lane(LaneClass::Auth).is_pass());
@@ -241,7 +241,7 @@ impl TicketTag {
 /// let conn = bouncer.door("203.0.113.7".parse()?)?;
 /// let mut request = conn.request(RequestId(1))?;
 /// assert!(request.checkpoint().is_pass());
-/// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+/// bouncer.revoke(conn.connection(), Reason::ADMIN)?;
 /// assert!(request.checkpoint().is_deny());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -400,13 +400,13 @@ impl Ticket {
     /// let bouncer = bouncer_io::Bouncer::new();
     /// let conn = bouncer.door("192.0.2.5".parse()?)?;
     /// let request = conn.request(bouncer_io::RequestId(1))?;
-    /// assert_eq!(request.conn(), conn.conn());
-    /// assert_ne!(bouncer.door("192.0.2.5".parse()?)?.conn(), conn.conn());
+    /// assert_eq!(request.connection(), conn.connection());
+    /// assert_ne!(bouncer.door("192.0.2.5".parse()?)?.connection(), conn.connection());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[must_use]
-    pub fn conn(&self) -> ConnId {
-        ConnId(self.cell().conn.load(Ordering::Relaxed))
+    pub fn connection(&self) -> ConnectionId {
+        ConnectionId(self.cell().conn.load(Ordering::Relaxed))
     }
 
     /// The source address; `None` on a trusted proxy hop until the real
@@ -624,29 +624,6 @@ impl Ticket {
         verdict
     }
 
-    /// `true` when a checkpoint now would deny. For loops inside long
-    /// handlers, so a revoked request stops doing work, not only stops being
-    /// answered.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # let bouncer = bouncer_io::Bouncer::new();
-    /// # let conn = bouncer.door("192.0.2.33".parse()?)?;
-    /// # let mut request = conn.request(bouncer_io::RequestId(1))?;
-    /// for row in 0..100_000u32 {
-    ///     if row % 1024 == 0 && request.is_cancelled() { break; }
-    ///     // ... process the row ...
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn is_cancelled(&mut self) -> bool {
-        if self.cell().state.load(Ordering::Acquire) & F_CANCELLED != 0 {
-            return true;
-        }
-        self.checkpoint().is_deny()
-    }
-
     pub(crate) fn deny(&self, code: DenialCode) -> Verdict {
         Verdict::Deny(denial(self.shared(), self.index, self.generation, code))
     }
@@ -667,7 +644,7 @@ impl Ticket {
     /// ```
     /// use bouncer_io::{Bouncer, Cidr, Provenance, RequestId};
     ///
-    /// let bouncer = Bouncer::builder().trusted_proxies(&["10.0.0.0/8".parse::<Cidr>()?]).try_build()?;
+    /// let bouncer = Bouncer::builder().trusted_proxies(&["10.0.0.0/8".parse::<Cidr>()?]).build()?;
     /// let hop = bouncer.door("10.1.2.3".parse()?)?;          // our load balancer
     /// assert_eq!(hop.source(), None);
     /// let mut request = hop.request(RequestId(1))?;
@@ -765,10 +742,10 @@ impl Ticket {
     /// # Examples
     ///
     /// ```
-    /// use bouncer_io::{BanSpec, Bouncer, FingerprintKey};
+    /// use bouncer_io::{Bouncer, FingerprintKey};
     /// let bouncer = Bouncer::new();
     /// let fp = FingerprintKey::from_digest([3; 16]);
-    /// bouncer.ban(BanSpec::key(fp))?;                         // an administrator's bare fingerprint ban
+    /// bouncer.ban(fp)?;                         // an administrator's bare fingerprint ban
     /// let mut conn = bouncer.door("192.0.2.1".parse()?)?;
     /// assert!(conn.bind_fingerprint(fp).is_deny());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -837,9 +814,9 @@ impl Ticket {
     /// # Examples
     ///
     /// ```
-    /// use bouncer_io::{AccountKey, BanSpec, Bouncer, RequestId};
+    /// use bouncer_io::{AccountKey, Bouncer, RequestId};
     /// let bouncer = Bouncer::new();
-    /// bouncer.ban(BanSpec::key(AccountKey(13)))?;
+    /// bouncer.ban(AccountKey(13))?;
     /// let conn = bouncer.door("192.0.2.41".parse()?)?;
     /// let mut request = conn.request(RequestId(1))?;
     /// assert!(request.bind_account(AccountKey(13)).is_deny());
@@ -950,7 +927,7 @@ impl Ticket {
     /// use bouncer_io::{Bouncer, Budgets, DenialCode, LaneClass, Rate, RequestId, SessionKey, Verdict};
     /// let bouncer = Bouncer::builder()
     ///     .budgets(Budgets::off().lane_rate(LaneClass::Write, Rate::per_second(1)))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let conn = bouncer.door("192.0.2.70".parse()?)?;
     /// let session = SessionKey::from_digest([9; 16]);
     /// let mut first = conn.request(RequestId(1))?;
@@ -1177,7 +1154,7 @@ impl Ticket {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, Enforcement, StrikeKind, StrikeOutcome};
-    /// let bouncer = Bouncer::builder().enforcement(Enforcement::enforce_all()).try_build()?;
+    /// let bouncer = Bouncer::builder().enforcement(Enforcement::enforce_all()).build()?;
     /// let mut conn = bouncer.door("198.51.100.66".parse()?)?;
     /// let mut last = StrikeOutcome::Counted;
     /// for _ in 0..5 {
@@ -1322,7 +1299,7 @@ impl Ticket {
         let keep = st & F_KEEP_CONNECTION != 0;
         if !keep {
             if let Some(ejector) = shared.ejector.as_ref() {
-                let conn = ConnId(cell.conn.load(Ordering::Relaxed));
+                let conn = ConnectionId(cell.conn.load(Ordering::Relaxed));
                 let kind = if out.formatted {
                     CloseKind::AfterFlush {
                         deadline: core::time::Duration::from_millis(100),
@@ -1682,7 +1659,7 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
                     events::Emit {
                         reason: crate::directive::Reason::CONNECTION_CLOSED,
                         subject: Subject {
-                            conn: Some(ConnId(cell.conn.load(Ordering::Relaxed))),
+                            connection: Some(ConnectionId(cell.conn.load(Ordering::Relaxed))),
                             ..Subject::default()
                         },
                         count: old as u32,
@@ -1712,7 +1689,7 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
                 // adapter never called `bind_client`.
                 events::Emit {
                     subject: Subject {
-                        conn: Some(ConnId(cell.conn.load(Ordering::Relaxed))),
+                        connection: Some(ConnectionId(cell.conn.load(Ordering::Relaxed))),
                         ..Subject::default()
                     },
                     ..events::Emit::new(events::signals::DOOR_PROXY_HOP_UNRESOLVED)
@@ -1769,7 +1746,7 @@ pub(crate) fn subject_of(cell: &Cell) -> Subject {
         b
     };
     Subject {
-        conn: Some(ConnId(cell.conn.load(Ordering::Relaxed))),
+        connection: Some(ConnectionId(cell.conn.load(Ordering::Relaxed))),
         request: (present & P_REQUEST != 0).then(|| RequestId(two(K_REQUEST))),
         source: source_of(cell),
         prefix: None,
@@ -1828,7 +1805,7 @@ impl fmt::Debug for Ticket {
         f.debug_struct("Ticket")
             .field("id", &self.id())
             .field("kind", &self.kind)
-            .field("conn", &self.conn())
+            .field("conn", &self.connection())
             .finish_non_exhaustive()
     }
 }
@@ -1863,7 +1840,7 @@ mod tests {
         Bouncer::builder()
             .tickets(1)
             .budgets(Budgets::off())
-            .try_build()
+            .build()
             .unwrap()
     }
 
@@ -1928,7 +1905,7 @@ mod tests {
         assert_eq!(conn.tag().get(), conn.id().get());
         assert_eq!(conn.id().to_string().len(), 16);
         let r = conn.request(RequestId(5)).unwrap();
-        assert_eq!(r.conn(), conn.conn());
+        assert_eq!(r.connection(), conn.connection());
         assert_eq!(r.source(), conn.source());
         assert_ne!(r.index(), conn.index());
         let subject = subject_of(r.cell());

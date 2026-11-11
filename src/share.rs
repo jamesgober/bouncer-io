@@ -29,9 +29,9 @@ use crate::{
 ///
 /// ```
 /// use bouncer_io::{Bouncer, NodeId};
-/// let bouncer = Bouncer::builder().node(NodeId(3)).try_build()?;
+/// let bouncer = Bouncer::builder().node(NodeId(3)).build()?;
 /// # let _ = bouncer;
-/// assert!(Bouncer::builder().node(NodeId(0)).try_build().is_err());
+/// assert!(Bouncer::builder().node(NodeId(0)).build().is_err());
 /// # Ok::<(), bouncer_io::BouncerError>(())
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -72,10 +72,10 @@ impl Sequence {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, NodeId, Sequence};
-    /// let node = Bouncer::builder().node(NodeId(1)).try_build()?;
+    /// let node = Bouncer::builder().node(NodeId(1)).build()?;
     /// node.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
-    /// let stored = node.export_delta(Sequence::START)?.last().get();   // kept between runs
-    /// assert_eq!(Sequence::from_raw(stored), node.export_delta(Sequence::START)?.last());
+    /// let stored = node.export_delta(Sequence::START)?.last_sequence().get();   // kept between runs
+    /// assert_eq!(Sequence::from_raw(stored), node.export_delta(Sequence::START)?.last_sequence());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[must_use]
@@ -119,11 +119,11 @@ const SEEN: usize = 1 << 20;
 ///
 /// ```
 /// use bouncer_io::{Bouncer, Delta, NodeId, Sequence};
-/// let a = Bouncer::builder().node(NodeId(1)).try_build()?;
+/// let a = Bouncer::builder().node(NodeId(1)).build()?;
 /// a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
 /// let delta = a.export_delta(Sequence::START)?;
 /// let copy = Delta::from_bytes(delta.as_bytes())?;
-/// assert_eq!(copy.last(), delta.last());
+/// assert_eq!(copy.last_sequence(), delta.last_sequence());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,8 +142,8 @@ impl Delta {
     ///
     /// ```
     /// use bouncer_io::{Actor, Bouncer, Delta, NodeId, Sequence};
-    /// let a = Bouncer::builder().node(NodeId(1)).try_build()?;
-    /// let b = Bouncer::builder().node(NodeId(2)).try_build()?;
+    /// let a = Bouncer::builder().node(NodeId(1)).build()?;
+    /// let b = Bouncer::builder().node(NodeId(2)).build()?;
     /// a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
     /// let wire: Vec<u8> = a.export_delta(Sequence::START)?.as_bytes().to_vec();
     /// let _ = b.import(&Delta::from_bytes(&wire)?, Actor::Channel(1))?;
@@ -161,16 +161,16 @@ impl Delta {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, NodeId, Sequence};
-    /// let a = Bouncer::builder().node(NodeId(1)).try_build()?;
+    /// let a = Bouncer::builder().node(NodeId(1)).build()?;
     /// a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
     /// let first = a.export_delta(Sequence::START)?;
     /// a.ban("198.51.100.10".parse::<std::net::IpAddr>()?)?;
-    /// let next = a.export_delta(first.last())?;   // only what came after
-    /// assert!(next.last() > first.last());
+    /// let next = a.export_delta(first.last_sequence())?;   // only what came after
+    /// assert!(next.last_sequence() > first.last_sequence());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[must_use]
-    pub fn last(&self) -> Sequence {
+    pub fn last_sequence(&self) -> Sequence {
         self.last
     }
 
@@ -184,7 +184,7 @@ impl Delta {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, BouncerError, Delta, ImportError, NodeId, Sequence};
-    /// let a = Bouncer::builder().node(NodeId(1)).try_build()?;
+    /// let a = Bouncer::builder().node(NodeId(1)).build()?;
     /// a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
     /// let mut wire = a.export_delta(Sequence::START)?.as_bytes().to_vec();
     /// assert!(Delta::from_bytes(&wire).is_ok());

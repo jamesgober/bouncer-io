@@ -66,6 +66,13 @@ pub trait DenialFormat: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoFormat;
 
+/// A shared format.
+impl<T: DenialFormat + ?Sized> DenialFormat for std::sync::Arc<T> {
+    fn format(&self, denial: &Denial, out: &mut Collected) -> Result<(), FormatError> {
+        (**self).format(denial, out)
+    }
+}
+
 impl DenialFormat for NoFormat {
     fn format(&self, _denial: &Denial, _out: &mut Collected) -> Result<(), FormatError> {
         Ok(())

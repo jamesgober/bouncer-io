@@ -11,6 +11,30 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-11
+
+The API simplified after an audit against the simple-API rule (D-136, `dev/API-AUDIT-0.10.md`). A breaking release: `docs/release/v0.10.0.md` has the migration.
+
+### Added
+
+- `BouncerError::Refused(Refusal)` and `From<Refusal> for BouncerError`, so `bouncer.door(peer)?` works in a function that returns `BouncerError`.
+- `Target::FingerprintIn` and `From<BanKey> for Target`: a directive bans and lifts every key that `ban` and `lift` take. A revocation or a throttle of `FingerprintIn` is `InvalidTarget`.
+- Blanket impls of `EventSink`, `Ejector`, and `DenialFormat` for `Arc<T>`, and of `Persistence` and `VersionAnchor` for `Box<T>`.
+
+### Changed
+
+- `Bouncer::ban` and `Bouncer::lift` take a key (`impl Into<BanKey>`). A duration, an actor, a reason, or evidence goes through `apply(Directive::ban(key)...)` or `apply(Directive::lift(key)...)`.
+- `ConnId` is now `ConnectionId`, `Ticket::conn` is now `Ticket::connection`, and `Subject::conn` is now `Subject::connection`.
+- `BouncerBuilder::try_build` is now `build`.
+- The builder takes its plug-ins by value: `event_sink`, `ejector`, `denial_format`, `clock`, `persistence`, and `version_anchor` accept `impl Trait + 'static`. An `Arc` (or a `Box` of a store) still works.
+- `Delta::last` is now `Delta::last_sequence`.
+- The crate-level docs describe the crate as it is, Tier 1 first. `docs/API.md` lists every public item.
+
+### Removed
+
+- `BanSpec` and `LiftSpec` (use `Directive::ban` and `Directive::lift`).
+- `Ticket::is_cancelled` (use `checkpoint().is_deny()`).
+
 ## [0.9.3] - 2026-11-11
 
 ### Changed
@@ -401,7 +425,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/jamesgober/bouncer-io/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/jamesgober/bouncer-io/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/jamesgober/bouncer-io/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/jamesgober/bouncer-io/compare/v0.9.0...v0.9.1

@@ -47,14 +47,14 @@ fuzz_target!(|data: &[u8]| {
         .revocation_capacity(64)
         .tickets(64)
         .budgets(bouncer_io::Budgets::off())
-        .persistence(Box::new(Bytes(Some(bytes))));
+        .persistence(Bytes(Some(bytes)));
     if mode & 1 != 0 && !framed {
         builder = builder.mac_key([mode; 32]);
     }
     if mode & 2 != 0 {
         builder = builder.on_load_failure(LoadFailure::LoadEmpty);
     }
-    if let Ok(b) = builder.try_build() {
+    if let Ok(b) = builder.build() {
         let _ = b.door("192.0.2.1".parse().unwrap());
         let _ = b.health();
     }

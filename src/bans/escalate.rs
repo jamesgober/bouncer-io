@@ -26,7 +26,7 @@ const MAX_PARENTS: usize = 65_536;
 /// use std::time::Duration;
 /// let bouncer = Bouncer::builder()
 ///     .escalation(EscalationPolicy::default().ipv4_threshold(4).window(Duration::from_secs(600)))
-///     .try_build()?;
+///     .build()?;
 /// for i in 1..=4u8 {
 ///     bouncer.ban(std::net::IpAddr::from([198, 51, 100, i]))?;
 /// }
@@ -73,7 +73,7 @@ impl EscalationPolicy {
     /// use bouncer_io::{Bouncer, EscalationPolicy};
     /// let bouncer = Bouncer::builder()
     ///     .escalation(EscalationPolicy::default().ipv4_threshold(2))
-    ///     .try_build()?;
+    ///     .build()?;
     /// bouncer.ban("198.51.100.1".parse::<std::net::IpAddr>()?)?;
     /// assert!(bouncer.door("198.51.100.200".parse()?).is_ok());
     /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;
@@ -94,7 +94,7 @@ impl EscalationPolicy {
     /// use bouncer_io::{Bouncer, EscalationPolicy};
     /// let bouncer = Bouncer::builder()
     ///     .escalation(EscalationPolicy::default().ipv6_threshold(2))
-    ///     .try_build()?;
+    ///     .build()?;
     /// bouncer.ban("2001:db8:0:1::1".parse::<std::net::IpAddr>()?)?;
     /// bouncer.ban("2001:db8:0:2::1".parse::<std::net::IpAddr>()?)?;
     /// assert!(bouncer.door("2001:db8:0:3::1".parse()?).is_err());   // the /56 is banned
@@ -118,7 +118,7 @@ impl EscalationPolicy {
     /// let bouncer = Bouncer::builder()
     ///     .clock(clock.clone())
     ///     .escalation(EscalationPolicy::default().ipv4_threshold(2).window(Duration::from_secs(60)))
-    ///     .try_build()?;
+    ///     .build()?;
     /// bouncer.ban("198.51.100.1".parse::<std::net::IpAddr>()?)?;
     /// clock.advance(Duration::from_secs(120));
     /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;
@@ -142,7 +142,7 @@ impl EscalationPolicy {
     /// let bouncer = Bouncer::builder()
     ///     .durations(DurationPolicy::default().base(Duration::from_secs(600)).jitter(Duration::ZERO))
     ///     .escalation(EscalationPolicy::default().ipv4_threshold(2).factor(3))
-    ///     .try_build()?;
+    ///     .build()?;
     /// bouncer.ban("198.51.100.1".parse::<std::net::IpAddr>()?)?;
     /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;
     /// let listing = bouncer.list(&Filter::all(), Page::first(10));
@@ -165,7 +165,7 @@ impl EscalationPolicy {
     /// use bouncer_io::{Bouncer, EscalationPolicy};
     /// let bouncer = Bouncer::builder()
     ///     .escalation(EscalationPolicy::default().ipv4_threshold(2).widest_ipv4(32))
-    ///     .try_build()?;
+    ///     .build()?;
     /// bouncer.ban("198.51.100.1".parse::<std::net::IpAddr>()?)?;
     /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;
     /// assert!(bouncer.door("198.51.100.200".parse()?).is_ok());   // IPv4 bans stay at /32
@@ -185,7 +185,7 @@ impl EscalationPolicy {
     /// use bouncer_io::{Bouncer, EscalationPolicy};
     /// let bouncer = Bouncer::builder()
     ///     .escalation(EscalationPolicy::default().ipv6_threshold(2).widest_ipv6(64))
-    ///     .try_build()?;
+    ///     .build()?;
     /// bouncer.ban("2001:db8:0:1::1".parse::<std::net::IpAddr>()?)?;
     /// bouncer.ban("2001:db8:0:2::1".parse::<std::net::IpAddr>()?)?;
     /// assert!(bouncer.door("2001:db8:0:3::1".parse()?).is_ok());   // IPv6 bans stay at /64
@@ -206,7 +206,7 @@ impl EscalationPolicy {
     /// use bouncer_io::{Bouncer, EscalationPolicy};
     /// let bouncer = Bouncer::builder()
     ///     .escalation(EscalationPolicy::default().max_children_per_parent(1))
-    ///     .try_build()?;
+    ///     .build()?;
     /// bouncer.ban("198.51.100.1".parse::<std::net::IpAddr>()?)?;
     /// bouncer.ban("198.51.100.2".parse::<std::net::IpAddr>()?)?;   // a second child forces escalation
     /// assert!(bouncer.door("198.51.100.200".parse()?).is_err());
@@ -224,7 +224,7 @@ impl EscalationPolicy {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, EscalationPolicy};
-    /// let bouncer = Bouncer::builder().escalation(EscalationPolicy::default().off()).try_build()?;
+    /// let bouncer = Bouncer::builder().escalation(EscalationPolicy::default().off()).build()?;
     /// for i in 1..=16u8 {
     ///     bouncer.ban(std::net::IpAddr::from([198, 51, 100, i]))?;
     /// }
