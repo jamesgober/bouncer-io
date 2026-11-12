@@ -1707,12 +1707,13 @@ pub(crate) fn release_cell(shard: &Shard, index: u32, gen_: u32) -> bool {
             // The connection may still name it as its latest request; the
             // egress check sees it is no longer live.
             uncount_child(shared, pi, pg);
-            // A forwarded-header client's request holds door concurrency.
-            let charged = crate::budgets::Charged::from_flags(
-                st & F_CHARGED != 0,
-                st & crate::registry::F_CHARGED_PREFIX != 0,
-            );
-            if charged != crate::budgets::Charged::NONE {
+            // A forwarded-header client's request holds door concurrency:
+            // one mask test on the common path, where nothing was charged.
+            if st & (F_CHARGED | crate::registry::F_CHARGED_PREFIX) != 0 {
+                let charged = crate::budgets::Charged::from_flags(
+                    st & F_CHARGED != 0,
+                    st & crate::registry::F_CHARGED_PREFIX != 0,
+                );
                 shared
                     .budgets
                     .release_connection(source_present(cell, present_child), charged);
