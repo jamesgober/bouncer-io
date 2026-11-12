@@ -219,6 +219,15 @@ Status at 0.9.3:
 | net-io 0.7 | Not adopted (D-135): serve-net is on net-io 0.6 and the two must match; the feature moves to net-io 0.8 with serve-net 0.8 |
 | net-io 0.8's soft close and `close_after_flush` | Waiting for net-io 0.8 and a serve-net on it (D-135): closes the Windows denial lost to an abortive close and `NetIoEjector`'s aborts |
 
+Status at 0.10.0 (the simplicity audit James asked for, 2026-11-11):
+
+| Item | Status |
+|---|---|
+| Public API against the simple-API rule | Done (D-136, `dev/API-AUDIT-0.10.md`): nine findings, each fixed; seven items kept with their reasons |
+| `docs/API.md` lists every public item | Done: checked by a script against rustdoc's JSON output |
+| Independent security and performance review | Done (D-137 to D-143): one high, six medium, five low, three notes, every one fixed with a test that failed first; loom models and two fuzz targets re-run |
+| Release candidates | The count of release candidates with no API change starts again at 0.10.0 |
+
 Exit:
 - [ ] No API change needed by either consumer for two release candidates.
 

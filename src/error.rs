@@ -6,8 +6,10 @@ use crate::keys::{BanKey, Family};
 
 /// Everything that can go wrong in bouncer-io.
 ///
-/// Refusals at the door are not errors: [`Bouncer::door`](crate::Bouncer::door)
-/// returns a [`Refusal`](crate::Refusal) for those.
+/// [`Bouncer::door`](crate::Bouncer::door) returns the small
+/// [`Refusal`](crate::Refusal), which converts into
+/// [`BouncerError::Refused`], so `?` works in a function that returns this
+/// error.
 ///
 /// # Examples
 ///
@@ -102,6 +104,9 @@ pub enum BouncerError {
     Persist(PersistError),
     /// A delta was refused.
     Import(ImportError),
+    /// The door refused the peer: close the connection abortively, send
+    /// nothing.
+    Refused(crate::door::Refusal),
 }
 
 /// Why persisted state could not be loaded or written.
@@ -350,11 +355,41 @@ impl fmt::Display for BouncerError {
             ),
             Self::Persist(err) => write!(f, "{err}"),
             Self::Import(err) => write!(f, "{err}"),
+            Self::Refused(refusal) => write!(f, "{refusal}"),
         }
     }
 }
 
 impl std::error::Error for BouncerError {}
+
+/// `?` on [`Bouncer::door`](crate::Bouncer::door) in a function that returns
+/// `Result<_, BouncerError>`.
+///
+/// # Examples
+///
+/// ```
+/// use bouncer_io::{Bouncer, BouncerError, Refusal};
+///
+/// fn accept(bouncer: &Bouncer, peer: std::net::IpAddr) -> Result<(), BouncerError> {
+///     let _conn = bouncer.door(peer)?;
+///     Ok(())
+/// }
+///
+/// let bouncer = Bouncer::new();
+/// let peer = "198.51.100.4".parse()?;
+/// assert!(accept(&bouncer, peer).is_ok());
+/// bouncer.ban(peer)?;
+/// assert!(matches!(
+///     accept(&bouncer, peer),
+///     Err(BouncerError::Refused(Refusal::Banned { .. }))
+/// ));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+impl From<crate::door::Refusal> for BouncerError {
+    fn from(refusal: crate::door::Refusal) -> Self {
+        Self::Refused(refusal)
+    }
+}
 
 impl From<ConfigError> for BouncerError {
     fn from(err: ConfigError) -> Self {
@@ -369,7 +404,7 @@ impl From<ConfigError> for BouncerError {
 /// ```
 /// use bouncer_io::{Bouncer, BouncerError, ConfigProblem};
 ///
-/// let err = Bouncer::builder().tickets(0).try_build().unwrap_err();
+/// let err = Bouncer::builder().tickets(0).build().unwrap_err();
 /// match err {
 ///     BouncerError::Config(e) => {
 ///         assert_eq!(e.field, "tickets");

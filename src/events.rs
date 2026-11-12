@@ -12,7 +12,7 @@ use std::{net::IpAddr, time::SystemTime};
 use crate::{
     bouncer::Shared,
     directive::{Actor, Evidence, Reason},
-    keys::{AccountKey, Cidr, ConnId, FingerprintKey, RequestId, SessionKey, TenantKey},
+    keys::{AccountKey, Cidr, ConnectionId, FingerprintKey, RequestId, SessionKey, TenantKey},
     registry::Cell,
     strikes::Mode,
     time::Now,
@@ -42,7 +42,7 @@ pub const GENERATOR: u16 = 2;
 ///     }
 /// }
 /// let seen = Arc::new(Seen::default());
-/// let bouncer = Bouncer::builder().event_sink(seen.clone()).try_build()?;
+/// let bouncer = Bouncer::builder().event_sink(seen.clone()).build()?;
 /// bouncer.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
 /// assert!(seen.0.lock().unwrap().contains(&signals::BAN_ADDED.path()));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -58,12 +58,19 @@ pub trait EventSink: Send + Sync {
 ///
 /// ```
 /// use std::sync::Arc;
-/// let bouncer = bouncer_io::Bouncer::builder().event_sink(Arc::new(bouncer_io::NoSink)).try_build()?;
+/// let bouncer = bouncer_io::Bouncer::builder().event_sink(bouncer_io::NoSink).build()?;
 /// # let _ = bouncer;
 /// # Ok::<(), bouncer_io::BouncerError>(())
 /// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoSink;
+
+/// A shared sink: one `Arc` can feed several bouncers.
+impl<T: EventSink + ?Sized> EventSink for std::sync::Arc<T> {
+    fn event(&self, event: &Event<'_>) {
+        (**self).event(event);
+    }
+}
 
 impl EventSink for NoSink {
     fn event(&self, _event: &Event<'_>) {}
@@ -204,6 +211,7 @@ const fn catalog(id: u32) -> (&'static str, Category, f32) {
         26 => ("bouncer.ban.refused_allowlisted", Category::Policy, 3.0),
         30 => ("bouncer.strike", Category::Abuse, 2.0),
         31 => ("bouncer.threshold.reached", Category::Abuse, 4.0),
+        32 => ("bouncer.strike.table_full", Category::Abuse, 5.0),
         40 => ("bouncer.source.shared_suspected", Category::Anomaly, 1.0),
         50 => ("bouncer.persist.failed", Category::Integrity, 6.0),
         51 => ("bouncer.import.rejected", Category::Integrity, 5.0),
@@ -265,6 +273,9 @@ pub mod signals {
     pub const STRIKE: SignalId = SignalId::new(30);
     /// A local threshold was reached (observe or enforce).
     pub const THRESHOLD_REACHED: SignalId = SignalId::new(31);
+    /// The strike counters were full: a counter with fewer strikes gave up
+    /// its slot (sampled). Raise `strike_capacity`.
+    pub const STRIKE_TABLE_FULL: SignalId = SignalId::new(32);
     /// An address was flagged as shared.
     pub const SOURCE_SHARED_SUSPECTED: SignalId = SignalId::new(40);
     /// A persistence write or load failed.
@@ -286,7 +297,7 @@ pub mod signals {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Subject {
     /// The connection.
-    pub conn: Option<ConnId>,
+    pub connection: Option<ConnectionId>,
     /// The request.
     pub request: Option<RequestId>,
     /// The source address.
@@ -441,7 +452,7 @@ impl Sampler {
 /// The samplers of the sampled signals: door refusals (ban, budget,
 /// registry full), identity budget refusals, and expiries.
 #[derive(Default)]
-pub(crate) struct Samplers([Sampler; 5]);
+pub(crate) struct Samplers([Sampler; 6]);
 
 impl Samplers {
     fn get(&self, signal: SignalId) -> Option<&Sampler> {
@@ -451,6 +462,7 @@ impl Samplers {
             3 => 2,
             5 => 3,
             23 => 4,
+            32 => 5,
             _ => return None,
         };
         Some(&self.0[i])

@@ -605,11 +605,11 @@ fn hex(c: u8) -> u32 {
 /// # Examples
 ///
 /// ```
-/// let id = bouncer_io::ConnId(41);
+/// let id = bouncer_io::ConnectionId(41);
 /// assert_eq!(id.0, 41);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ConnId(pub u64);
+pub struct ConnectionId(pub u64);
 
 /// A request id, opaque to bouncer (a ULID from the request layer fits).
 ///

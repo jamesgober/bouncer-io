@@ -16,9 +16,9 @@
 </div>
 <br>
 
-The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every item lists its tier, its grade, the version that brings it, and what it costs. The rustdoc on [docs.rs](https://docs.rs/bouncer-io) becomes the exhaustive reference as each item lands; until then this file is the contract.
+The complete public API of `bouncer-io`. Every item lists its tier, its grade, the version that brought it, and what it costs. The rustdoc on [docs.rs](https://docs.rs/bouncer-io) has a runnable example for every public item; this file is the reference by topic. 0.10 simplified the API after an audit (`dev/API-AUDIT-0.10.md`); the migration from 0.9 is in `docs/release/v0.10.0.md`.
 
-> **Status: `0.9.3` (alpha).** Built and tested: everything of 0.4 (the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance), plus persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, and datagrams. The net-io feature arrived at 0.8; 0.9 is the pre-1.0 polish.
+> **Status: `0.10.0` (alpha).** Built and tested: the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance, persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, datagrams, and the net-io gate.
 
 **Reading the item headers.** *Tier 1* is the simple surface (one-line constructors, no builder), *Tier 2* is configuration, *Tier 3* is the full surface for integrations and other libraries. *P0* is required for the crate's job, *P1* is what users of the best existing tools expect, *P2* is high value for serious deployments, *P3* comes after 1.0. Costs are targets, marked `[est.]` until they are measured at 0.6.
 
@@ -31,7 +31,7 @@ The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every 
 - [`Bouncer`](#bouncer)
   - [`Bouncer::new`](#bouncernew) · [`Bouncer::builder`](#bouncerbuilder)
   - [`door`](#door) · [`door_at`](#door_at) · [`datagram`](#datagram)
-  - [`ban`](#ban) · [`lift`](#lift) · [`revoke`](#revoke) · [`apply`](#apply)
+  - [`ban`](#ban) · [`lift`](#lift) · [`revoke`](#revoke) · [`apply`](#apply) · [`apply_all`](#apply_all)
   - [`request`](#request) · [`egress`](#egress) · [`release`](#release)
   - [`replace_allow`](#replace_allow) · [`explain`](#explain) · [`list`](#list)
   - [`set_posture` and `posture`](#set_posture-and-posture) · [`health`](#health) · [`capacity`](#capacity)
@@ -40,12 +40,12 @@ The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every 
 - [`BouncerBuilder`](#bouncerbuilder-1)
 - [Keys](#keys)
   - [`Family`](#family) · [`Cidr`](#cidr) · [`normalize` and `prefix_of`](#normalize-and-prefix_of)
-  - [`ConnId`, `RequestId`, `AccountKey`, `TenantKey`](#connid-requestid-accountkey-tenantkey)
+  - [`ConnectionId`, `RequestId`, `AccountKey`, `TenantKey`](#connectionid-requestid-accountkey-tenantkey)
   - [`SessionKey` and `FingerprintKey`](#sessionkey-and-fingerprintkey) · [`BanKey`](#bankey)
 - [The door](#the-door)
   - [`Refusal`](#refusal) · [`Provenance`](#provenance) · [`DatagramVerdict`](#datagramverdict)
 - [`Ticket`](#ticket)
-  - [Accessors](#ticket-accessors) · [`request`](#ticketrequest) · [`checkpoint`](#ticketcheckpoint) · [`before_commit`](#ticketbefore_commit) · [`is_cancelled`](#ticketis_cancelled)
+  - [Accessors](#ticket-accessors) · [`request`](#ticketrequest) · [`checkpoint`](#ticketcheckpoint) · [`before_commit`](#ticketbefore_commit)
   - [`bind_client`](#ticketbind_client) · [`bind_fingerprint`](#ticketbind_fingerprint) · [`bind_session`, `bind_account`, `bind_tenant`](#ticketbind_session-bind_account-bind_tenant) · [`bind_lane`](#ticketbind_lane)
   - [`strike`](#ticketstrike) · [`deny_and_eject`](#ticketdeny_and_eject) · [`tag` and `into_tag`](#tickettag-and-into_tag) · [Release on drop](#release-on-drop)
   - [`TicketId`, `TicketKind`, `TicketTag`, `LaneClass`](#ticketid-ticketkind-tickettag-laneclass)
@@ -57,7 +57,7 @@ The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every 
 - [Revocation](#revocation)
   - [`Target`](#target) · [`RevokeMode`](#revokemode) · [`Revocation`](#revocation-1) · [`RevocationEpoch`](#revocationepoch)
 - [Bans and the allow list](#bans-and-the-allow-list)
-  - [`BanSpec`](#banspec) · [`BanDuration`](#banduration) · [`LiftSpec` and `Lifted`](#liftspec-and-lifted) · [`BanId` and `BanRecord`](#banid-and-banrecord)
+  - [`BanDuration`](#banduration) · [`Lifted`](#lifted) · [`BanId` and `BanRecord`](#banid-and-banrecord)
   - [`DurationPolicy`](#durationpolicy) · [`EscalationPolicy`](#escalationpolicy) · [`AllowList` and `AllowKind`](#allowlist-and-allowkind)
 - [Directives](#directives)
   - [`Directive`](#directive) · [`Action`](#action) · [`BanKeys`](#bankeys) · [`Actor`](#actor) · [`Reason`](#reason) · [`Evidence`](#evidence) · [`Applied`](#applied)
@@ -74,7 +74,7 @@ The complete public API of `bouncer-io`, locked at `0.2.0` (design lock). Every 
 - [Sharing across nodes](#sharing-across-nodes)
   - [`NodeId`](#nodeid) · [`Delta` and `Sequence`](#delta-and-sequence) · [`ImportReport`](#importreport) · [Merge rules](#merge-rules)
 - [Posture, time, maintenance, health](#posture-time-maintenance-health)
-  - [`Posture`](#posture) · [`Now`](#now-1) · [`MaintenanceReport`](#maintenancereport) · [`Health` and `Capacity`](#health-and-capacity)
+  - [`SharedAddresses`](#sharedaddresses) · [`Posture`](#posture) · [`Now`](#now-1) · [`MaintenanceReport`](#maintenancereport) · [`Health` and `Capacity`](#health-and-capacity)
 - [Metrics](#metrics-1)
 - [net-io integration](#net-io-integration)
 - [Errors](#errors)
@@ -102,7 +102,7 @@ Rate and concurrency budgets are one tool inside the door. They are not the purp
 | Checkpoint | Called by | Call | Cost while nothing is revoked |
 |---|---|---|---|
 | B1 door | the transport, right after accept | [`Bouncer::door`](#door) | ban lookups and budget check, under 100 ns p99 with 1,000,000 bans [est.] |
-| B1' real client | the transport after a trusted PROXY header; the protocol adapter after a trusted forwarded header | [`Ticket::bind_client`](#ticketbind_client) | same as the door |
+| B1' real client | the transport after a trusted PROXY header; the protocol adapter after a trusted forwarded header | [`Ticket::bind_client`](#ticketbind_client) | the door's allow, ban, and budget steps: a PROXY-protocol client is charged once for its connection, a forwarded-header client once per request |
 | B2 fingerprint | the TLS adapter after the ClientHello | [`Ticket::bind_fingerprint`](#ticketbind_fingerprint) | one hash probe |
 | B3 identity | the pipeline right after authentication | [`Ticket::bind_session`](#ticketbind_session-bind_account-bind_tenant) and friends | one probe per key |
 | B4 between stages | the pipeline, between every pair of stages | [`Ticket::checkpoint`](#ticketcheckpoint) | one atomic load and compare |
@@ -154,7 +154,7 @@ let mut reply = Collected::new();
 reply.extend_from_slice(b"account balance: 1,204.00")?;
 
 // Anywhere, any thread: an administrator throws this connection out.
-bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+bouncer.revoke(conn.connection(), Reason::ADMIN)?;
 
 // Between pipeline stages: one atomic load until something is revoked.
 if let Verdict::Deny(_) = request.checkpoint() {
@@ -238,7 +238,7 @@ let bouncer = Bouncer::builder()
     .tickets(262_144)
     .trusted_proxies(&["10.0.0.0/8".parse::<Cidr>()?])
     .enforcement(Enforcement::observe_all())
-    .try_build()?;
+    .build()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -279,7 +279,7 @@ assert!(bouncer.door("::ffff:203.0.113.7".parse()?).is_err());
 ### `door_at`
 
 ```rust
-pub fn door_at(&self, conn: ConnId, peer: IpAddr, provenance: Provenance, now: Now) -> Result<Ticket, Refusal>;
+pub fn door_at(&self, conn: ConnectionId, peer: IpAddr, provenance: Provenance, now: Now) -> Result<Ticket, Refusal>;
 ```
 
 Tier 3 · P0 · 0.3 · as `door`, minus one clock read
@@ -287,12 +287,12 @@ Tier 3 · P0 · 0.3 · as `door`, minus one clock read
 The door for transports that already number their connections and read the time at accept (net-io does both). `provenance` is normally `Provenance::Socket`; `Provenance::Local` is for in-process and Unix-socket peers.
 
 ```rust
-use bouncer_io::{Bouncer, ConnId, Provenance};
+use bouncer_io::{Bouncer, ConnectionId, Provenance};
 
 let bouncer = Bouncer::new();
 let now = bouncer.now();
-let ticket = bouncer.door_at(ConnId(41), "192.0.2.10".parse()?, Provenance::Socket, now)?;
-assert_eq!(ticket.conn(), ConnId(41));
+let ticket = bouncer.door_at(ConnectionId(41), "192.0.2.10".parse()?, Provenance::Socket, now)?;
+assert_eq!(ticket.connection(), ConnectionId(41));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -304,7 +304,7 @@ pub fn datagram(&self, source: IpAddr, verified: bool, now: Now) -> DatagramVerd
 
 Tier 2 · P2 · 0.5 · 30-60 ns [est.]
 
-Per-datagram door for UDP. The source is checked against ban memory, then the door rate budgets (no concurrency). `verified` says whether the source has proven it can receive (a completed handshake or a returned cookie). An unverified source is charged only at its prefix, never at its own client budget, and is never struck or banned, because UDP source addresses can be forged to frame a victim.
+Per-datagram door for UDP. The source is checked against ban memory, then the door rate budgets (no concurrency). `verified` says whether the source has proven it can receive (a completed handshake or a returned cookie). An unverified source is charged only at its prefix, never at its own client budget, and is never struck or banned, because UDP source addresses can be forged to frame a victim. For the same reason an unverified source earns no exemption from the allow list, and a source inside the trusted proxies is an ordinary source (a datagram carries no PROXY header).
 
 ```rust
 use bouncer_io::{Bouncer, DatagramVerdict};
@@ -318,23 +318,25 @@ assert_eq!(verdict, DatagramVerdict::Accept);
 ### `ban`
 
 ```rust
-pub fn ban(&self, spec: impl Into<BanSpec>) -> Result<BanId, BouncerError>;
+pub fn ban(&self, key: impl Into<BanKey>) -> Result<BanId, BouncerError>;
 ```
 
 Tier 1 · P0 · 0.3 · 200-500 ns [est.], takes the ban writer lock (cold path; never blocks the door)
 
-Adds a ban. An address or a `Cidr` converts directly (timed by the [duration policy](#durationpolicy), actor [`Actor::App`](#actor)); a [`BanSpec`](#banspec) sets duration, actor, reason, and evidence. Takes effect at the next door check on every thread. Connections already admitted are not touched: to throw them out too, use [`apply`](#apply) with `Directive::revoke_and_ban`.
+Bans a key: an address, a `Cidr`, or any [`BanKey`](#bankey), timed by the [duration policy](#durationpolicy), by [`Actor::App`](#actor), for [`Reason::ADMIN`](#reason). Takes effect at the next door check on every thread. Connections already admitted are not touched: to throw them out too, use [`apply`](#apply) with `Directive::revoke_and_ban`.
+
+For a duration, an actor, a reason, or evidence, send a [`Directive`](#directive) to [`apply`](#apply): `Directive::ban(key)` takes the same keys, and its `Applied::ban` is the ban's id. There is one options builder, the one every other layer of the stack sends.
 
 **Errors:** `AllowListed` (remove the allow entry first), `TrustedProxyTarget` (ban the real client instead), `InvalidPrefix`, `PermanentNotAllowed` (only administrators, the application, and definitive directives ban permanently), `InvalidDuration` (zero), `BanTableFull` (only permanent and administrator entries left to evict; raise `ban_capacity`).
 
 ```rust
-use bouncer_io::{Actor, BanSpec, Bouncer, Reason};
+use bouncer_io::{Actor, Bouncer, Directive, Reason};
 use std::time::Duration;
 
 let bouncer = Bouncer::new();
 bouncer.ban("203.0.113.0/24".parse::<bouncer_io::Cidr>()?)?;
-bouncer.ban(
-    BanSpec::address("198.51.100.9".parse()?)
+bouncer.apply(
+    Directive::ban("198.51.100.9".parse::<std::net::IpAddr>()?)
         .for_duration(Duration::from_secs(3600))
         .by(Actor::Admin(17))
         .because(Reason::ADMIN),
@@ -344,32 +346,36 @@ bouncer.ban(
 
 ```rust
 // Identity bans: the next request carrying this account is refused at B3.
-use bouncer_io::{AccountKey, BanSpec, Bouncer};
+use bouncer_io::{AccountKey, Bouncer, Directive};
 let bouncer = Bouncer::new();
-bouncer.ban(BanSpec::key(AccountKey(0x0192_0000_0000_7000_8000_0000_0000_0001)).permanent())?;
+bouncer.ban(AccountKey(0x0192_0000_0000_7000_8000_0000_0000_0002))?;
+bouncer.apply(Directive::ban(AccountKey(0x0192_0000_0000_7000_8000_0000_0000_0001)).permanent())?;
 # Ok::<(), bouncer_io::BouncerError>(())
 ```
 
 ### `lift`
 
 ```rust
-pub fn lift(&self, spec: impl Into<LiftSpec>) -> Result<Lifted, BouncerError>;
+pub fn lift(&self, key: impl Into<BanKey>) -> Result<Lifted, BouncerError>;
 ```
 
 Tier 1 · P0 · 0.3 · 200-500 ns [est.]
 
-Removes the bans on exactly this key and records the lift, so a ban that arrives later from another node with an older stamp does not bring it back. On a node that shares, an administrator's or the application's lift removes every node's ban on the key here, and an automated actor's lift only this node's own (see [Merge rules](#merge-rules) for how it reaches other nodes). A prefix ban that covers the key is not lifted: `explain` shows it. The lift is an event with actor and reason.
+Removes the bans on exactly this key and records the lift, so a ban that arrives later from another node with an older stamp does not bring it back. On a node that shares, an administrator's or the application's lift removes every node's ban on the key here, and an automated actor's lift only this node's own (see [Merge rules](#merge-rules) for how it reaches other nodes). A prefix ban that covers the key is not lifted: `explain` shows it. The lift is an event with actor and reason: [`Actor::App`](#actor) here, or whatever `Directive::lift(key).by(actor).because(reason)` sets through [`apply`](#apply).
 
 **Errors:** `NotFound` (nothing was banned under this key), `InvalidPrefix`.
 
 ```rust
-use bouncer_io::{Actor, Bouncer, LiftSpec, Reason};
+use bouncer_io::{Actor, Bouncer, Directive, Reason};
 
 let bouncer = Bouncer::new();
 let addr: std::net::IpAddr = "198.51.100.9".parse()?;
 bouncer.ban(addr)?;
-let lifted = bouncer.lift(LiftSpec::key(addr).by(Actor::Admin(17)).because(Reason::ADMIN))?;
-assert_eq!(lifted.removed, 1);
+assert_eq!(bouncer.lift(addr)?.removed, 1);
+
+bouncer.ban(addr)?;
+let applied = bouncer.apply(Directive::lift(addr).by(Actor::Admin(17)).because(Reason::ADMIN))?;
+assert_eq!(applied.lifted.map(|l| l.removed), Some(1));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -381,7 +387,7 @@ pub fn revoke(&self, target: impl Into<Target>, reason: Reason) -> Result<Revoca
 
 Tier 1 · P0 · 0.4 · under 1 µs [est.]; visible to every core within the hardware coherence time (tens of nanoseconds)
 
-Stops what is running now. Every ticket that carries the target key is denied at its next checkpoint; a checkpoint that begins after `revoke` has returned on any thread cannot miss it. A revocation is not a ban: a connection admitted after it is not reached (a key bound after it is refused by the bind), so use [`Directive::revoke_and_ban`](#directive) to keep a source out. The target converts from a [`ConnId`](#connid-requestid-accountkey-tenantkey), `RequestId`, `SessionKey`, `AccountKey`, `TenantKey`, `FingerprintKey`, `Cidr`, or address. The actor is [`Actor::App`](#actor), the mode is `AtCheckpoint`, a revoked request takes its connection with it, and no ban is added. For any other choice use [`apply`](#apply).
+Stops what is running now. Every ticket that carries the target key is denied at its next checkpoint; a checkpoint that begins after `revoke` has returned on any thread cannot miss it. A revocation is not a ban: a connection admitted after it is not reached (a key bound after it is refused by the bind), so use [`Directive::revoke_and_ban`](#directive) to keep a source out. The target converts from a [`ConnectionId`](#connectionid-requestid-accountkey-tenantkey), `RequestId`, `SessionKey`, `AccountKey`, `TenantKey`, `FingerprintKey`, `Cidr`, or address. The actor is [`Actor::App`](#actor), the mode is `AtCheckpoint`, a revoked request takes its connection with it, and no ban is added. For any other choice use [`apply`](#apply).
 
 A revocation is not a ban: it ends running work. A connection that comes back is judged at the door as usual unless a ban was also set.
 
@@ -400,7 +406,7 @@ bouncer.revoke(AccountKey(42), Reason::PASSWORD_CHANGED)?;
 // One connection, from an administrator console.
 let bouncer = bouncer_io::Bouncer::new();
 let conn = bouncer.door("192.0.2.5".parse()?)?;
-let receipt = bouncer.revoke(conn.conn(), bouncer_io::Reason::ADMIN)?;
+let receipt = bouncer.revoke(conn.connection(), bouncer_io::Reason::ADMIN)?;
 println!("revoked at epoch {}", receipt.epoch);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -445,6 +451,28 @@ bouncer.apply(
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+### `apply_all`
+
+```rust
+pub fn apply_all(&self, directives: impl IntoIterator<Item = Directive>) -> Vec<Result<Applied, BouncerError>>;
+```
+
+Tier 2 · P1 · 0.10 · one administrator-set build for the batch instead of one per prefix
+
+Applies directives in order, each as [`apply`](#apply) would, for bulk loads such as a blocklist of thousands of prefixes. A prefix at a length that is not automatic goes to the administrator set, which is compiled for lock-free reading; one by one, each such ban rebuilds the set, so a load of n prefixes costs n builds. Inside `apply_all` the set is built once, when the batch ends. A refused directive does not stop the rest; each result comes back in order. Bans from other threads during the batch publish as usual, with the batch's changes so far.
+
+```rust
+use bouncer_io::{Actor, Bouncer, Cidr, Directive, Reason};
+
+let bouncer = Bouncer::new();
+let blocklist: Vec<Cidr> = (0..64u8).map(|i| format!("10.{i}.0.0/20").parse()).collect::<Result<_, _>>()?;
+let results = bouncer.apply_all(
+    blocklist.iter().map(|&c| Directive::ban(c).by(Actor::Admin(1)).because(Reason::POLICY).permanent()),
+);
+assert!(results.iter().all(Result::is_ok));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ### `request`
 
 ```rust
@@ -463,7 +491,7 @@ use bouncer_io::{Bouncer, RequestId};
 let bouncer = Bouncer::new();
 let tag = bouncer.door("192.0.2.8".parse()?)?.into_tag();   // the transport keeps only this u64
 let request = bouncer.request(tag, RequestId(9))?;
-assert_eq!(request.conn(), bouncer.request(tag, RequestId(10))?.conn());
+assert_eq!(request.connection(), bouncer.request(tag, RequestId(10))?.connection());
 bouncer.release(tag);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -485,7 +513,7 @@ use bouncer_io::{Bouncer, Reason, Verdict};
 
 let bouncer = Bouncer::new();
 let ticket = bouncer.door("192.0.2.9".parse()?)?;
-let conn = ticket.conn();
+let conn = ticket.connection();
 let tag = ticket.into_tag();                   // the transport keeps only this
 assert!(bouncer.egress(tag).is_pass());
 bouncer.revoke(conn, Reason::ADMIN)?;
@@ -692,8 +720,8 @@ Sharing across nodes: bouncer provides the data, the caller provides the transpo
 ```rust
 use bouncer_io::{Actor, Bouncer, NodeId, Sequence};
 
-let a = Bouncer::builder().node(NodeId(1)).try_build()?;
-let b = Bouncer::builder().node(NodeId(2)).try_build()?;
+let a = Bouncer::builder().node(NodeId(1)).build()?;
+let b = Bouncer::builder().node(NodeId(2)).build()?;
 a.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
 
 let delta = a.export_delta(Sequence::START)?;
@@ -714,6 +742,8 @@ impl BouncerBuilder {
     pub fn shards(self, count: u16) -> Self;
     pub fn ban_capacity(self, entries: u32) -> Self;
     pub fn revocation_capacity(self, entries: u32) -> Self;
+    pub fn strike_capacity(self, entries: u32) -> Self;
+    pub fn shared_addresses(self, policy: SharedAddresses) -> Self;
     pub fn ipv4_lengths(self, lengths: &[u8]) -> Self;
     pub fn ipv6_lengths(self, lengths: &[u8]) -> Self;
     pub fn durations(self, policy: DurationPolicy) -> Self;
@@ -724,17 +754,17 @@ impl BouncerBuilder {
     pub fn strikes(self, rules: StrikeRules) -> Self;
     pub fn enforcement(self, modes: Enforcement) -> Self;
     pub fn denials(self, table: DenialTable) -> Self;
-    pub fn denial_format(self, format: Arc<dyn DenialFormat>) -> Self;
-    pub fn ejector(self, ejector: Arc<dyn Ejector>) -> Self;
-    pub fn event_sink(self, sink: Arc<dyn EventSink>) -> Self;
+    pub fn denial_format(self, format: impl DenialFormat + 'static) -> Self;
+    pub fn ejector(self, ejector: impl Ejector + 'static) -> Self;
+    pub fn event_sink(self, sink: impl EventSink + 'static) -> Self;
     pub fn epoch(self, epoch: Arc<RevocationEpoch>) -> Self;
-    pub fn clock(self, clock: Arc<dyn clock_lib::Clock>) -> Self;
+    pub fn clock(self, clock: impl clock_lib::Clock + 'static) -> Self;
     pub fn seed(self, seed: [u8; 32]) -> Self;
     pub fn max_unchecked(self, idle: Duration) -> Self;
     pub fn maintainer(self, spawn: bool) -> Self;
-    pub fn persistence(self, store: Box<dyn Persistence>) -> Self;
+    pub fn persistence(self, store: impl Persistence + 'static) -> Self;
     pub fn mac_key(self, key: [u8; 32]) -> Self;
-    pub fn version_anchor(self, anchor: Box<dyn VersionAnchor>) -> Self;
+    pub fn version_anchor(self, anchor: impl VersionAnchor + 'static) -> Self;
     pub fn on_load_failure(self, policy: LoadFailure) -> Self;
     pub fn node(self, id: NodeId) -> Self;
     pub fn strict_budget_divisor(self, divisor: u8) -> Self;
@@ -743,20 +773,22 @@ impl BouncerBuilder {
     pub fn strict_wall_jump(self, keep: bool) -> Self;
     pub fn revocation_rate_limit(self, per_second: u32) -> Self;
     pub fn max_clock_skew(self, skew: Duration) -> Self;
-    pub fn try_build(self) -> Result<Bouncer, BouncerError>;
+    pub fn build(self) -> Result<Bouncer, BouncerError>;
 }
 ```
 
-Tier 2 throughout, except `epoch`, `clock`, and `seed` (Tier 3). Every setter is optional; `try_build` validates everything at once, allocates every table, and loads persisted state before returning, so the first `door` already sees every ban.
+Tier 2 throughout, except `epoch`, `clock`, and `seed` (Tier 3). Plug-ins (the denial format, ejector, event sink, clock, store, and anchor) are passed by value; an `Arc<T>` of each works as well (and a `Box<T>` of a store or anchor), so a handle kept to read a sink's counters or to attach a transport to an ejector later stays shared. The epoch is an `Arc` because sharing it between bouncers is its purpose. Every setter is optional; `build` validates everything at once, allocates every table, and loads persisted state before returning, so the first `door` already sees every ban.
 
-| Setter | What it sets | Default | Errors at `try_build` | Grade | Ver |
+| Setter | What it sets | Default | Errors at `build` | Grade | Ver |
 |---|---|---|---|---|---|
 | `tickets` | registry capacity; one cell per connection and one per in-flight request; 128 B per cell; rounded up to a multiple of the shard count | 65,536 (8 MiB) | `Config(TooSmall/TooLarge)` | P0 | 0.3 |
 | `shards` | registry shards, rounded down to a power of two and to at most the ticket count | one per core, at most 256 | `Config(..)` for 0 or more than 256 | P0 | 0.3 |
 | `ban_capacity` | dynamic ban table entries | 1,048,576 (about 45 MiB [est.]) | `Config(..)` | P0 | 0.3 |
-| `revocation_capacity` | revocation table entries | 65,536 | `Config(..)` | P0 | 0.4 |
+| `revocation_capacity` | revocation table entries; a full table reclaims, inline, what no live ticket needs before it refuses | 65,536 | `Config(..)` | P0 | 0.4 |
+| `strike_capacity` | strike counter slots, 16 B each; a full probe path gives the slot of the counter with the fewest strikes to the newcomer, so strikes never switch off | 262,144 (4 MiB) | `Config(..)` | P0 | 0.10 |
+| `shared_addresses` | which addresses are shared by many people: detected by distinct accounts, named ranges, or off ([`SharedAddresses`](#sharedaddresses)) | `SharedAddresses::detect()` | `Config(TooLarge)` past 4,096 known ranges | P1 | 0.10 |
 | `ipv4_lengths` | automatic key lengths for IPv4; must include 32 | `[32, 24]` | `Config(InvalidLength)` | P0 | 0.3 |
-| `ipv6_lengths` | automatic key lengths for IPv6; 128 is refused (one host owns its whole /64) | `[64, 56, 48]` | `Config(InvalidLength)`, `Config(HostBansForbidden)` | P0 | 0.3 |
+| `ipv6_lengths` | automatic key lengths for IPv6; must include 64, where an address ban is kept; 128 is refused (one host owns its whole /64) | `[64, 56, 48]` | `Config(InvalidLength)`, `Config(HostBansForbidden)` | P0 | 0.3 |
 | `durations` | how long automatic bans last, growing for repeat offenders | [`DurationPolicy::default()`](#durationpolicy) | `Config(InvalidDuration)` | P0 | 0.3 |
 | `escalation` | prefix escalation | [`EscalationPolicy::default()`](#escalationpolicy) | `Config(..)` | P1 | 0.5 |
 | `allow` | the allow list, compiled at build | empty | `InvalidPrefix`, `Config(AllowListTooLarge)` | P0 | 0.3 |
@@ -792,9 +824,9 @@ use std::time::Duration;
 let bouncer = Bouncer::builder()
     .durations(DurationPolicy::default().base(Duration::from_secs(900)).max(Duration::from_secs(86_400)))
     .enforcement(Enforcement::observe_all().enforce(StrikeKind::ProxyViolation))
-    .persistence(Box::new(FilePersistence::open("/var/lib/gate".as_ref(), "bans")?))
+    .persistence(FilePersistence::open("/var/lib/gate".as_ref(), "bans")?)
     .maintainer(true)
-    .try_build()?;
+    .build()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -805,7 +837,7 @@ use clock_lib::ManualClock;
 use std::sync::Arc;
 
 let clock = Arc::new(ManualClock::new());
-let bouncer = Bouncer::builder().clock(clock.clone()).seed([1; 32]).try_build()?;
+let bouncer = Bouncer::builder().clock(clock.clone()).seed([1; 32]).build()?;
 # Ok::<(), bouncer_io::BouncerError>(())
 ```
 
@@ -890,10 +922,10 @@ assert_eq!(normalize(nat64), nat64);   // not 203.0.113.7
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-### `ConnId`, `RequestId`, `AccountKey`, `TenantKey`
+### `ConnectionId`, `RequestId`, `AccountKey`, `TenantKey`
 
 ```rust
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] pub struct ConnId(pub u64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] pub struct ConnectionId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] pub struct RequestId(pub u128);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] pub struct AccountKey(pub u128);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] pub struct TenantKey(pub u64);
@@ -901,7 +933,7 @@ assert_eq!(normalize(nat64), nat64);   // not 203.0.113.7
 
 Tier 1 · P0 · 0.3 (connection, request) / 0.4 (account, tenant)
 
-Plain identifiers. `ConnId` comes from the transport (net-io's `ConnectionId` is never reused in a process); `RequestId` is opaque to bouncer (a ULID from the request layer fits); `AccountKey` holds a user id (a UUIDv7 as `u128`); `TenantKey` holds the tenant number from the identity stamp.
+Plain identifiers. `ConnectionId` comes from the transport (net-io's `ConnectionId` is never reused in a process); `RequestId` is opaque to bouncer (a ULID from the request layer fits); `AccountKey` holds a user id (a UUIDv7 as `u128`); `TenantKey` holds the tenant number from the identity stamp.
 
 ```rust
 use bouncer_io::{AccountKey, RequestId, TenantKey};
@@ -964,7 +996,6 @@ pub enum Refusal {
     Banned { reference: Reference },
     OverBudget { retry_after: Duration },
     RegistryFull,
-    Posture,
 }
 impl Display for Refusal; impl std::error::Error for Refusal;
 ```
@@ -1020,7 +1051,7 @@ A connection ticket comes from [`Bouncer::door`](#door). A request ticket comes 
 impl Ticket {
     pub fn id(&self) -> TicketId;
     pub fn kind(&self) -> TicketKind;
-    pub fn conn(&self) -> ConnId;
+    pub fn connection(&self) -> ConnectionId;
     pub fn source(&self) -> Option<IpAddr>;
     pub fn provenance(&self) -> Provenance;
 }
@@ -1080,7 +1111,20 @@ for stage in ["route", "authorize", "load", "render"] {
     // ... run the stage ...
     # let _ = stage;
 }
-# bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+# bouncer.revoke(conn.connection(), Reason::ADMIN)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Inside a long handler (a report, a large query, an upload), check every so often, so a revoked request stops doing work, not only stops being answered:
+
+```rust
+# let bouncer = bouncer_io::Bouncer::new();
+# let conn = bouncer.door("192.0.2.33".parse()?)?;
+# let mut request = conn.request(bouncer_io::RequestId(1))?;
+for row in 0..1_000_000u32 {
+    if row % 1024 == 0 && request.checkpoint().is_deny() { break; }
+    // ... process the row ...
+}
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -1106,27 +1150,6 @@ if request.before_commit().is_pass() {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-### `Ticket::is_cancelled`
-
-```rust
-pub fn is_cancelled(&mut self) -> bool;
-```
-
-Tier 1 · P0 · 0.4 · as `checkpoint`
-
-`true` when a checkpoint now would deny. For loops inside long handlers (reports, large queries, uploads), so a revoked request stops doing work, not only stops being answered.
-
-```rust
-# let bouncer = bouncer_io::Bouncer::new();
-# let conn = bouncer.door("192.0.2.33".parse()?)?;
-# let mut request = conn.request(bouncer_io::RequestId(1))?;
-for row in 0..1_000_000u32 {
-    if row % 1024 == 0 && request.is_cancelled() { break; }
-    // ... process the row ...
-}
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
 ### `Ticket::bind_client`
 
 ```rust
@@ -1135,7 +1158,7 @@ for row in 0..1_000_000u32 {
 
 Tier 2 · P0 · 0.3 · about the cost of the door
 
-Checkpoint B1'. Sets the real client address learned from a trusted proxy and runs the door's allow, ban, and budget steps on it; the connection's concurrency count moves from the proxy to the client.
+Checkpoint B1'. Sets the real client address learned from a trusted proxy and runs the door's allow, ban, and budget steps on it. A PROXY-protocol client is charged the door budgets once, for its connection. A client named by a forwarded header is charged once per request, since each request stands in for a connection behind an HTTP proxy, and its concurrency slot returns when the request ends.
 
 - **PROXY protocol:** the transport calls it on the connection ticket with `Provenance::ProxyProtocol` after the header is read under the handshake deadline.
 - **Forwarded headers:** the protocol adapter calls it on each request ticket with `Provenance::ForwardedHeader`, because a proxy may carry different clients' requests over one pooled connection.
@@ -1145,7 +1168,7 @@ Until a client is bound under a trusted proxy hop, the request carries a pending
 ```rust
 use bouncer_io::{Bouncer, Cidr, Provenance, RequestId};
 
-let bouncer = Bouncer::builder().trusted_proxies(&["10.0.0.0/8".parse::<Cidr>()?]).try_build()?;
+let bouncer = Bouncer::builder().trusted_proxies(&["10.0.0.0/8".parse::<Cidr>()?]).build()?;
 let hop = bouncer.door("10.1.2.3".parse()?)?;          // our load balancer
 assert_eq!(hop.source(), None);
 let mut request = hop.request(RequestId(1))?;
@@ -1333,6 +1356,11 @@ What the protocol adapter formats: a code from a fixed set, the application code
 ```rust
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DenialCode { Unavailable, NotFound, TooManyRequests, Unauthorized, Forbidden }
+impl DenialCode {
+    pub const fn number(self) -> u16;                       // 1 Unavailable to 5 Forbidden, what a transport carries
+    pub const fn http_status(self) -> u16;                  // 503, 404, 429, 401, 403
+    pub const fn from_http_status(status: u16) -> Option<DenialCode>;
+}
 ```
 
 Tier 1 · P0 · 0.4
@@ -1366,13 +1394,13 @@ impl Default for DenialTable;   // plain messages: "Service unavailable.", "Not 
 
 Tier 2 · P0 · 0.4
 
-Fixed at build so a denial can never carry text made from the request. Messages longer than 256 bytes are refused at `try_build` (`Config(MessageTooLong)`).
+Fixed at build so a denial can never carry text made from the request. Messages longer than 256 bytes are refused at `build` (`Config(MessageTooLong)`).
 
 ```rust
 use bouncer_io::{Bouncer, DenialCode, DenialTable};
 let bouncer = Bouncer::builder()
     .denials(DenialTable::new().message(DenialCode::Forbidden, "Request refused.").app_code(DenialCode::Forbidden, 4031))
-    .try_build()?;
+    .build()?;
 # Ok::<(), bouncer_io::BouncerError>(())
 ```
 
@@ -1491,7 +1519,7 @@ impl DenialFormat for Http {
 
 ```rust
 pub trait Ejector: Send + Sync {
-    fn eject(&self, conn: ConnId, kind: CloseKind);
+    fn eject(&self, conn: ConnectionId, kind: CloseKind);
 }
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseKind { Abort, AfterFlush { deadline: Duration } }
@@ -1521,17 +1549,18 @@ What `deny_and_eject` did. `ejected` is `false` when no `Ejector` is configured:
 ```rust
 #[non_exhaustive] #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Target {
-    Connection(ConnId), Request(RequestId), Session(SessionKey), Account(AccountKey),
+    Connection(ConnectionId), Request(RequestId), Session(SessionKey), Account(AccountKey),
     Tenant(TenantKey), Source(Cidr), Fingerprint(FingerprintKey),
+    FingerprintIn(FingerprintKey, Cidr),
 }
-impl From<ConnId> for Target; impl From<RequestId> for Target; impl From<SessionKey> for Target;
+impl From<ConnectionId> for Target; impl From<RequestId> for Target; impl From<SessionKey> for Target;
 impl From<AccountKey> for Target; impl From<TenantKey> for Target; impl From<Cidr> for Target;
-impl From<IpAddr> for Target; impl From<FingerprintKey> for Target;
+impl From<IpAddr> for Target; impl From<FingerprintKey> for Target; impl From<BanKey> for Target;
 ```
 
 Tier 1 · P0 · 0.4
 
-What to revoke. `Source` covers every ticket whose source falls inside the prefix; a trusted proxy inside it is not revoked, its real clients are.
+What a revocation or a directive acts on. `Source` covers every ticket whose source falls inside the prefix; a trusted proxy inside it is not revoked, its real clients are. Every [`BanKey`](#bankey) converts, so a directive bans whatever [`ban`](#ban) bans. `FingerprintIn` is the compound key automation bans a fingerprint with: a ban or a lift of it works, and a revocation or a throttle of it is `InvalidTarget`.
 
 ### `RevokeMode`
 
@@ -1572,7 +1601,7 @@ use bouncer_io::{Bouncer, RevocationEpoch};
 use std::sync::Arc;
 
 let epoch = Arc::new(RevocationEpoch::new());          // owned by the security core
-let bouncer = Bouncer::builder().epoch(epoch.clone()).try_build()?;
+let bouncer = Bouncer::builder().epoch(epoch.clone()).build()?;
 let before = epoch.current();
 bouncer.revoke(bouncer_io::AccountKey(1), bouncer_io::Reason::ADMIN)?;
 assert!(epoch.current() > before);
@@ -1585,28 +1614,6 @@ assert!(epoch.current() > before);
 
 Ban memory has two structures: a dynamic table (one keyed hash table per prefix length in use, plus identity keys) for automatic and directive bans, which change often; and a compiled prefix set for administrator lists, imported feeds, and the allow list, which change rarely and are rebuilt and swapped whole. Expiry is lazy: an expired entry reads as absent and is reclaimed by the next writer or by maintenance. No timer exists per ban.
 
-### `BanSpec`
-
-```rust
-#[non_exhaustive] #[derive(Clone, Debug)]
-pub struct BanSpec { pub key: BanKey, pub duration: BanDuration, pub actor: Actor, pub reason: Reason, pub evidence: Evidence<'static> }
-impl BanSpec {
-    pub fn key(key: impl Into<BanKey>) -> BanSpec;
-    pub fn address(addr: IpAddr) -> BanSpec;
-    pub fn prefix(cidr: Cidr) -> BanSpec;
-    pub fn for_duration(self, duration: Duration) -> BanSpec;
-    pub fn permanent(self) -> BanSpec;
-    pub fn by(self, actor: Actor) -> BanSpec;
-    pub fn because(self, reason: Reason) -> BanSpec;
-    pub fn evidence(self, evidence: Evidence<'static>) -> BanSpec;
-}
-impl From<IpAddr> for BanSpec; impl From<Cidr> for BanSpec; impl From<BanKey> for BanSpec;
-```
-
-Tier 1 · P0 · 0.3
-
-Describes a ban. The defaults are the duration policy, `Actor::App`, and `Reason::ADMIN`. `permanent` is refused at `ban` time for `Actor::Local`, `Actor::Policy`, `Actor::Gate`, and `Actor::Channel` (`PermanentNotAllowed`); administrators, the application, and sentinel may ban permanently. A decoy touch bans at once whatever the mode, for the duration policy's length, not permanently.
-
 ### `BanDuration`
 
 ```rust
@@ -1616,19 +1623,18 @@ pub enum BanDuration { #[default] Policy, Fixed(Duration), Permanent }
 
 Tier 2 · P0 · 0.3 · `Fixed(Duration::ZERO)` is refused (`InvalidDuration`)
 
-### `LiftSpec` and `Lifted`
+Set through a directive: `Directive::ban(key).for_duration(d)` is `Fixed(d)`, `.permanent()` is `Permanent`, and neither is `Policy`. `permanent` is refused for `Actor::Local`, `Actor::Policy`, `Actor::Gate`, and `Actor::Channel` (`PermanentNotAllowed`); administrators, the application, and sentinel may ban permanently. A decoy touch bans at once whatever the mode, for the duration policy's length, not permanently.
+
+### `Lifted`
 
 ```rust
-#[non_exhaustive] #[derive(Clone, Copy, Debug)]
-pub struct LiftSpec { pub key: BanKey, pub actor: Actor, pub reason: Reason }
-impl LiftSpec { pub fn key(key: impl Into<BanKey>) -> LiftSpec; pub fn by(self, actor: Actor) -> LiftSpec; pub fn because(self, reason: Reason) -> LiftSpec; }
-impl From<IpAddr> for LiftSpec; impl From<Cidr> for LiftSpec; impl From<BanKey> for LiftSpec;
-
 #[non_exhaustive] #[derive(Clone, Copy, Debug)]
 pub struct Lifted { pub removed: u32, pub tombstone: BanId }
 ```
 
 Tier 1 · P0 · 0.3
+
+What [`lift`](#lift) returns, and `Applied::lifted` after `Directive::lift`: how many bans were removed, and the tombstone that keeps an older ban from another node from bringing the key back.
 
 ### `BanId` and `BanRecord`
 
@@ -1756,11 +1762,11 @@ A decision made elsewhere, carried to [`Bouncer::apply`](#apply). Reads as a sen
 | `confidence` | below 30 (under the Medium band) a directive cannot ban by itself; it is applied as a throttle and an event records why | absent: treated as Medium for explicit actors |
 
 ```rust
-use bouncer_io::{Actor, BanKeys, Bouncer, ConnId, DenialCode, Directive, Reason};
+use bouncer_io::{Actor, BanKeys, Bouncer, ConnectionId, DenialCode, Directive, Reason};
 
 let bouncer = Bouncer::new();
 bouncer.apply(
-    Directive::revoke_and_ban(ConnId(77))
+    Directive::revoke_and_ban(ConnectionId(77))
         .by(Actor::Admin(3))
         .because(Reason::ADMIN)
         .ban_keys(BanKeys::SOURCE | BanKeys::ACCOUNT)
@@ -1856,6 +1862,7 @@ pub struct Evidence<'a> { /* borrowed pairs */ }
 impl<'a> Evidence<'a> {
     pub const fn none() -> Evidence<'static>;
     pub const fn new(pairs: &'a [(&'static str, EvidenceValue<'a>)]) -> Evidence<'a>;
+    pub const fn pairs(&self) -> &'a [(&'static str, EvidenceValue<'a>)];
 }
 #[non_exhaustive] #[derive(Clone, Copy, Debug)]
 pub enum EvidenceValue<'a> { Number(u64), Text(&'a str), Address(IpAddr), Duration(Duration), Flag(bool) }
@@ -1965,7 +1972,7 @@ let bouncer = Bouncer::builder()
             .enforce(StrikeKind::ProxyViolation)
             .strict(&[StrikeKind::Malformed, StrikeKind::LoginFailed]),
     )
-    .try_build()?;
+    .build()?;
 # Ok::<(), bouncer_io::BouncerError>(())
 ```
 
@@ -2019,7 +2026,7 @@ let bouncer = Bouncer::builder()
             .tenant_plan(TenantKey(7), Rate::per_second(2_000).burst(4_000))
             .tenant_in_flight(64),
     )
-    .try_build()?;
+    .build()?;
 # Ok::<(), bouncer_io::BouncerError>(())
 ```
 
@@ -2125,7 +2132,7 @@ struct Print;
 impl EventSink for Print {
     fn event(&self, e: &Event<'_>) { eprintln!("{} {} x{}", e.signal, e.path, e.count); }
 }
-let bouncer = Bouncer::builder().event_sink(Arc::new(Print)).try_build()?;
+let bouncer = Bouncer::builder().event_sink(Print).build()?;
 # Ok::<(), bouncer_io::BouncerError>(())
 ```
 
@@ -2152,6 +2159,11 @@ Fixed size, no allocation. `severity` is the catalog default on the 0-10 scale; 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SignalId { pub generator: u16, pub id: u32, pub revision: u16 }
+impl SignalId {
+    pub const fn path(&self) -> &'static str;      // "bouncer.ban.added"
+    pub const fn category(&self) -> Category;      // Category::Access for a door refusal
+    pub const fn severity(&self) -> f32;
+}
 impl Display for SignalId;   // "bouncer/11 r1"
 pub const GENERATOR: u16 = 2;
 
@@ -2160,7 +2172,7 @@ pub enum Category { Unknown, Recon, Access, Auth, Injection, Abuse, Privilege, E
 
 #[non_exhaustive] #[derive(Clone, Copy, Debug, Default)]
 pub struct Subject {
-    pub conn: Option<ConnId>, pub request: Option<RequestId>, pub source: Option<IpAddr>, pub prefix: Option<Cidr>,
+    pub connection: Option<ConnectionId>, pub request: Option<RequestId>, pub source: Option<IpAddr>, pub prefix: Option<Cidr>,
     pub session: Option<SessionKey>, pub account: Option<AccountKey>, pub tenant: Option<TenantKey>,
     pub fingerprint: Option<FingerprintKey>,
 }
@@ -2198,6 +2210,7 @@ pub mod signals { pub const DOOR_REFUSED_BAN: SignalId; /* one constant per row 
 | 26 | `BAN_REFUSED_ALLOWLISTED` | `bouncer.ban.refused_allowlisted` | policy | 3.0 | automation tried to act on an allow-listed key |
 | 30 | `STRIKE` | `bouncer.strike` | per kind | per kind | strike received |
 | 31 | `THRESHOLD_REACHED` | `bouncer.threshold.reached` | per kind | per kind | a local threshold fired (observe or enforce) |
+| 32 | `STRIKE_TABLE_FULL` | `bouncer.strike.table_full` | abuse | 5.0 | the strike counters were full and a counter with fewer strikes gave up its slot (sampled); raise `strike_capacity` |
 | 40 | `SOURCE_SHARED_SUSPECTED` | `bouncer.source.shared_suspected` | anomaly | 1.0 | an address was flagged shared |
 | 50 | `PERSIST_FAILED` | `bouncer.persist.failed` | integrity | 6.0 | write or load failure |
 | 51 | `IMPORT_REJECTED` | `bouncer.import.rejected` | integrity | 5.0 | a delta or one of its records was refused |
@@ -2277,7 +2290,7 @@ pub enum LoadFailure { #[default] Refuse, LoadEmpty }
 
 Tier 2 · P1 · 0.5
 
-`Refuse` (fail closed): a corrupt, tampered, or rolled-back snapshot makes `try_build` return `Persist(..)` and the service does not start without its bans. `LoadEmpty` starts with empty memory and reports the failure. A torn journal tail (the last record cut short by a crash) is not a failure: replay stops there and the event says how much was lost.
+`Refuse` (fail closed): a corrupt, tampered, or rolled-back snapshot makes `build` return `Persist(..)` and the service does not start without its bans. `LoadEmpty` starts with empty memory and reports the failure. A torn journal tail (the last record cut short by a crash) is not a failure: replay stops there and the event says how much was lost.
 
 ### `PersistError`
 
@@ -2326,7 +2339,7 @@ impl Sequence { pub const START: Sequence; pub const fn next(self) -> Sequence; 
 
 Tier 3 · P2 · 0.5 · the decoder is fuzzed
 
-A delta holds ban, lift, offender, and revocation records (an escalation travels as the parent's ban), each stamped with its origin node, origin sequence, and a hybrid logical clock stamp (Unix milliseconds in the top 48 bits, a counter in the low 16). Pass `delta.last()` as `since` next time; when `since` is older than the outbound log keeps (65,536 records), `export_delta` returns everything instead. Revocations of connection and request ids stay on their node.
+A delta holds ban, lift, offender, and revocation records (an escalation travels as the parent's ban), each stamped with its origin node, origin sequence, and a hybrid logical clock stamp (Unix milliseconds in the top 48 bits, a counter in the low 16). Pass `delta.last_sequence()` as `since` next time; when `since` is older than the outbound log keeps (65,536 records), `export_delta` returns everything instead. Revocations of connection and request ids stay on their node.
 
 ### `ImportReport`
 
@@ -2355,6 +2368,47 @@ Each rule is commutative, associative, and idempotent, so any order and any repe
 ---
 
 ## Posture, time, maintenance, health
+
+### `SharedAddresses`
+
+```rust
+#[non_exhaustive] #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAddresses { /* detect, known ranges */ }
+impl SharedAddresses {
+    pub fn detect() -> SharedAddresses;                 // the default
+    pub fn off() -> SharedAddresses;
+    pub fn known(self, ranges: &[Cidr]) -> SharedAddresses;
+}
+impl Default for SharedAddresses;                       // detect()
+```
+
+Tier 2 · P1 · 0.10 · `BouncerBuilder::shared_addresses`
+
+Which addresses bouncer treats as shared by many people (an office, a mobile carrier, a carrier-grade NAT). For a shared address, a strike threshold throttles the address and bans the identities instead of banning everyone behind it.
+
+- **`detect()`** (the default) counts distinct accounts bound from an address in an hour: about 32 make it shared for a day. Sessions never count, because a client mints them at will (a login, a dropped cookie).
+- **`known(ranges)`** names ranges that are shared whatever the evidence (at most 4,096), such as a carrier's NAT pools.
+- **`off()`** never treats an address as shared unless `known` names it.
+
+A shared address keeps ceilings, so shared never means unlimited:
+
+- the door holds it to its prefix's budgets;
+- a throttle on it slows it at the door, its factor carried to the prefix tier;
+- a second threshold while it is throttled bans it;
+- its strikes do not count toward a prefix ban.
+
+Escalation and prefix strike bans stop at known ranges only. A detected address does not stop them, so a client that earned the flag cannot shield its whole /24 or /48.
+
+```rust
+use bouncer_io::{Bouncer, Cidr, SharedAddresses};
+
+let pools: [Cidr; 1] = ["100.64.0.0/10".parse()?];
+let bouncer = Bouncer::builder()
+    .shared_addresses(SharedAddresses::detect().known(&pools))
+    .build()?;
+assert!(bouncer.explain("100.64.9.9".parse::<std::net::IpAddr>()?).shared_source);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 ### `Posture`
 
@@ -2401,7 +2455,7 @@ impl Health { pub fn is_ok(&self) -> bool; }
 pub enum MaintainerState { NotStarted, Parked, Running, Stopped }
 
 #[non_exhaustive] #[derive(Clone, Copy, Debug)]
-pub struct Capacity { pub tickets: u32, pub bans: u32, pub revocations: u32, pub budget_keys: u32, pub table_bytes: u64, pub total_bytes: u64 }
+pub struct Capacity { pub tickets: u32, pub bans: u32, pub revocations: u32, pub budget_keys: u32, pub strike_counters: u32, pub table_bytes: u64, pub total_bytes: u64 }
 ```
 
 Tier 2 · P1 · 0.5 (`Capacity` 0.3)
@@ -2416,7 +2470,7 @@ Tier 2 · P1 · 0.5 (`Capacity` 0.3)
 #[cfg(feature = "metrics")]
 #[non_exhaustive] #[derive(Clone, Copy, Debug, Default)]
 pub struct MetricsSnapshot {
-    pub admitted: u64, pub refused_ban: u64, pub refused_budget: u64, pub refused_registry_full: u64, pub refused_posture: u64,
+    pub admitted: u64, pub refused_ban: u64, pub refused_budget: u64, pub refused_registry_full: u64,
     pub checkpoints_fast: u64, pub checkpoints_slow: u64, pub revocations: u64, pub denials: u64, pub ejections: u64,
     pub commits_blocked: u64, pub egress_blocked: u64,
     pub bans_active: u64, pub bans_added: u64, pub bans_expired: u64, pub bans_evicted: u64, pub bans_escalated: u64, pub bans_lifted: u64,
@@ -2437,7 +2491,7 @@ Feature `net-io`, version 0.8 (net-io 0.6 from bouncer 0.9; 0.8 used net-io 0.3)
 #[cfg(feature = "net-io")] impl net_io::Gate for Bouncer { type Ticket = ConnectionGate; }
 #[cfg(feature = "net-io")] pub struct ConnectionGate { /* the connection Ticket and its tag */ }
 #[cfg(feature = "net-io")] impl ConnectionGate { pub fn ticket(&mut self) -> &mut Ticket; pub fn tag(&self) -> TicketTag; }
-#[cfg(feature = "net-io")] impl From<net_io::ConnectionId> for ConnId;
+#[cfg(feature = "net-io")] impl From<net_io::ConnectionId> for ConnectionId;
 #[cfg(feature = "net-io")] impl From<TicketTag> for net_io::GateTag;
 #[cfg(feature = "net-io")] impl From<net_io::GateTag> for TicketTag;
 #[cfg(feature = "net-io")] impl From<net_io::Cidr> for Cidr;
@@ -2455,7 +2509,7 @@ use bouncer_io::{Bouncer, NetIoEjector};
 use net_io::{ListenerSpec, ServerBuilder};
 
 let ejector = Arc::new(NetIoEjector::new());
-let bouncer = Bouncer::builder().ejector(ejector.clone()).try_build()?;
+let bouncer = Bouncer::builder().ejector(ejector.clone()).build()?;
 let server = ServerBuilder::new()
     .listener(ListenerSpec::tcp("127.0.0.1:8080"))
     .handler(|conn: &mut net_io::TcpConnection| { /* ... */ Ok(()) })
@@ -2506,9 +2560,12 @@ pub enum BouncerError {
     Config(ConfigError),
     Persist(PersistError),
     Import(ImportError),
+    Refused(Refusal),
     Spawn(std::io::ErrorKind),
 }
 impl Display for BouncerError; impl std::error::Error for BouncerError;
+impl From<Refusal> for BouncerError; impl From<ConfigError> for BouncerError;
+impl From<PersistError> for BouncerError; impl From<ImportError> for BouncerError;
 ```
 
 Tier 1 · P0 · variants arrive with the feature that raises them
@@ -2519,7 +2576,7 @@ Every message says what to do, and none prints key bytes.
 |---|---|---|
 | `RegistryFull` | `Ticket::request`, `Bouncer::request` | answer `Unavailable`; raise `tickets` or shed load upstream |
 | `BanTableFull` | `ban`, `apply` | raise `ban_capacity`; check escalation thresholds |
-| `RevocationTableFull` | `revoke`, `apply` | the revocation still reached live tickets; check the maintainer is running; raise `revocation_capacity` |
+| `RevocationTableFull` | `revoke`, `apply` | the table is full of entries live tickets still need (it reclaimed the rest first); the revocation still reached live tickets; raise `revocation_capacity` |
 | `InvalidPrefix` | key constructors, `ban`, `lift`, `revoke` | fix the length or clear the host bits |
 | `ParseCidr` | `Cidr::parse` | fix the text at `position` |
 | `AllowListed` | `ban`, `revoke`, `apply` | remove the allow entry first |
@@ -2528,16 +2585,17 @@ Every message says what to do, and none prints key bytes.
 | `InvalidDuration` | `ban`, `apply` | use a duration above zero |
 | `NotFound` | `lift` | nothing to lift; `explain` shows covering prefix bans |
 | `NotAConnectionTicket` | `request` | issue requests from the connection ticket |
-| `InvalidTarget` | `apply` | the action does not fit the target (a lift or throttle aimed at a connection or request id); target the key instead |
+| `InvalidTarget` | `apply`, `revoke` | the action does not fit the target (a lift or throttle aimed at a connection or request id, a revocation or throttle of `FingerprintIn`); target the key instead |
 | `Revoked` | `request` | the connection is revoked: deny and eject |
 | `Stale` | `Bouncer::request` | the connection was released; treat as closed |
 | `CollectedFull` | `Collected` | raise the limit, or stream the response |
 | `InvalidCommit` | `Collected::commit` | commit at most what `spare` gave |
 | `NodeIdUnset` | `export_delta`, `export_snapshot` | set `BouncerBuilder::node` |
-| `Config` | `try_build`, `Rate::new`, `Collected::with_capacity` | see [`ConfigError`](#configerror) |
-| `Persist` | `try_build`, `flush` | see [`PersistError`](#persisterror) |
+| `Config` | `build`, `Rate::new`, `Collected::with_capacity` | see [`ConfigError`](#configerror) |
+| `Persist` | `build`, `flush` | see [`PersistError`](#persisterror) |
 | `Import` | `import`, `Delta::from_bytes` | see [`ImportError`](#importerror) |
-| `Spawn` | `try_build` with `maintainer(true)` | the OS refused a thread; call `maintain` yourself |
+| `Spawn` | `build` with `maintainer(true)` | the OS refused a thread; call `maintain` yourself |
+| `Refused` | `?` on `door` in a function returning `BouncerError` | close the connection abortively and send nothing, as for the [`Refusal`](#refusal) itself |
 
 ### `ConfigError`
 
@@ -2578,6 +2636,7 @@ pub const VERSION: &str;                                 // env!("CARGO_PKG_VERS
 pub const DEFAULT_TICKETS: u32 = 65_536;
 pub const DEFAULT_BAN_CAPACITY: u32 = 1_048_576;
 pub const DEFAULT_REVOCATION_CAPACITY: u32 = 65_536;
+pub const DEFAULT_STRIKE_CAPACITY: u32 = 262_144;
 pub const DEFAULT_IPV4_LENGTHS: &[u8] = &[32, 24];
 pub const DEFAULT_IPV6_LENGTHS: &[u8] = &[64, 56, 48];
 pub const MAX_DENIAL_BYTES: usize = 1024;

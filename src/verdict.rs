@@ -38,7 +38,7 @@ impl Verdict {
     /// let conn = bouncer.door("192.0.2.5".parse()?)?;
     /// let mut request = conn.request(RequestId(1))?;
     /// assert!(request.checkpoint().is_pass());
-    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// bouncer.revoke(conn.connection(), Reason::ADMIN)?;
     /// assert!(!request.checkpoint().is_pass());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -57,7 +57,7 @@ impl Verdict {
     /// let conn = bouncer.door("192.0.2.5".parse()?)?;
     /// let mut request = conn.request(RequestId(1))?;
     /// assert!(!request.checkpoint().is_deny());
-    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// bouncer.revoke(conn.connection(), Reason::ADMIN)?;
     /// assert!(request.checkpoint().is_deny());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -76,7 +76,7 @@ impl Verdict {
     /// let conn = bouncer.door("192.0.2.5".parse()?)?;
     /// let mut request = conn.request(RequestId(1))?;
     /// assert!(request.checkpoint().denial().is_none());
-    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// bouncer.revoke(conn.connection(), Reason::ADMIN)?;
     /// let verdict = request.checkpoint();
     /// assert_eq!(verdict.denial().map(|d| d.code), Some(DenialCode::Forbidden));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -280,7 +280,7 @@ impl Reference {
     /// let bouncer = Bouncer::new();
     /// let conn = bouncer.door("192.0.2.5".parse()?)?;
     /// let mut request = conn.request(RequestId(1))?;
-    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// bouncer.revoke(conn.connection(), Reason::ADMIN)?;
     /// let verdict = request.checkpoint();
     /// let reference = verdict.denial().ok_or("not denied")?.reference;
     /// assert_eq!(format!("{:016x}", reference.get()), reference.to_string());
@@ -307,7 +307,7 @@ impl fmt::Display for Reference {
 /// use bouncer_io::{Bouncer, DenialCode, DenialTable};
 /// let bouncer = Bouncer::builder()
 ///     .denials(DenialTable::new().message(DenialCode::Forbidden, "Request refused.").app_code(DenialCode::Forbidden, 4031))
-///     .try_build()?;
+///     .build()?;
 /// # let _ = bouncer;
 /// # Ok::<(), bouncer_io::BouncerError>(())
 /// ```
@@ -339,10 +339,10 @@ impl DenialTable {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, DenialTable, Reason, RequestId};
-    /// let bouncer = Bouncer::builder().denials(DenialTable::new()).try_build()?;
+    /// let bouncer = Bouncer::builder().denials(DenialTable::new()).build()?;
     /// let conn = bouncer.door("192.0.2.5".parse()?)?;
     /// let mut request = conn.request(RequestId(1))?;
-    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// bouncer.revoke(conn.connection(), Reason::ADMIN)?;
     /// let verdict = request.checkpoint();
     /// let d = verdict.denial().ok_or("not denied")?;
     /// assert_eq!((d.message, d.app_code), ("Forbidden.", 0));
@@ -360,10 +360,10 @@ impl DenialTable {
     /// ```
     /// use bouncer_io::{Bouncer, DenialCode, DenialTable, Reason, RequestId};
     /// let table = DenialTable::new().message(DenialCode::Forbidden, "Request refused.");
-    /// let bouncer = Bouncer::builder().denials(table).try_build()?;
+    /// let bouncer = Bouncer::builder().denials(table).build()?;
     /// let conn = bouncer.door("192.0.2.5".parse()?)?;
     /// let mut request = conn.request(RequestId(1))?;
-    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// bouncer.revoke(conn.connection(), Reason::ADMIN)?;
     /// let verdict = request.checkpoint();
     /// assert_eq!(verdict.denial().map(|d| d.message), Some("Request refused."));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -381,10 +381,10 @@ impl DenialTable {
     /// ```
     /// use bouncer_io::{Bouncer, DenialCode, DenialTable, Reason, RequestId};
     /// let table = DenialTable::new().app_code(DenialCode::Forbidden, 4031);
-    /// let bouncer = Bouncer::builder().denials(table).try_build()?;
+    /// let bouncer = Bouncer::builder().denials(table).build()?;
     /// let conn = bouncer.door("192.0.2.5".parse()?)?;
     /// let mut request = conn.request(RequestId(1))?;
-    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// bouncer.revoke(conn.connection(), Reason::ADMIN)?;
     /// let verdict = request.checkpoint();
     /// assert_eq!(verdict.denial().map(|d| d.app_code), Some(4031));
     /// # Ok::<(), Box<dyn std::error::Error>>(())

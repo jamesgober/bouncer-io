@@ -1,13 +1,15 @@
-//! Shared-address detection: an address showing many distinct sessions or
-//! accounts is likely a NAT (an office, a mobile carrier, carrier-grade NAT
-//! in RFC 6598 space), so automation prefers identity keys and throttling
-//! over banning everyone behind it.
+//! Shared addresses: an address many people use (an office, a mobile
+//! carrier, a carrier-grade NAT), where automation prefers identity keys and
+//! throttling over banning everyone behind it.
 //!
-//! Per client (IPv4 address, IPv6 /64): a 64-bit bitmap of hashed identities
-//! seen within the window, and the end of the shared flag. One `fetch_or`
-//! per identity bind; 16 bytes per tracked address plus its claim word.
+//! An address is shared when the deployment names it (`SharedAddresses::known`)
+//! or, with detection on, when many distinct accounts bind from it within an
+//! hour. Sessions do not count: a client mints them at will (D-137). Per
+//! client (IPv4 address, IPv6 /64): a 64-bit bitmap of hashed accounts seen
+//! within the window, and the end of the shared flag. One `fetch_or` per
+//! account bind; 16 bytes per tracked address plus its claim word.
 
-use std::{collections::VecDeque, net::IpAddr, sync::Mutex};
+use std::net::IpAddr;
 
 use crate::{
     claims::Claims,
@@ -16,22 +18,119 @@ use crate::{
     sync::{AtomicU64, Ordering},
 };
 
-/// Distinct identities (bits set) above which an address is shared.
-pub(crate) const SHARED_THRESHOLD: u32 = 16;
+/// Distinct accounts (bits set of 64) above which an address is shared:
+/// about 32 accounts in an hour.
+pub(crate) const SHARED_THRESHOLD: u32 = 24;
+/// Most known shared ranges a deployment can name.
+pub(crate) const MAX_KNOWN: usize = 4096;
+
+/// Which addresses bouncer treats as shared by many people (a NAT), where a
+/// threshold throttles the address and bans the identities instead of
+/// banning everyone behind it.
+///
+/// Detection, the default, counts distinct accounts bound from an address in
+/// an hour: about 32 make it shared for a day. A shared address still has
+/// ceilings: the door holds it to its prefix's budgets, a throttle on it
+/// slows it at the door, and a second threshold while it is throttled bans
+/// it. Ranges named with [`known`](Self::known) are shared whatever the
+/// evidence, and also keep prefix escalation and prefix strike bans off the
+/// prefixes they cover; a detected address does neither.
+///
+/// # Examples
+///
+/// ```
+/// use bouncer_io::{Bouncer, Cidr, SharedAddresses};
+/// let carrier: Cidr = "100.64.0.0/10".parse()?;
+/// let bouncer = Bouncer::builder()
+///     .shared_addresses(SharedAddresses::detect().known(&[carrier]))
+///     .build()?;
+/// assert!(bouncer.explain("100.64.1.2".parse::<std::net::IpAddr>()?).shared_source);
+///
+/// let strict = Bouncer::builder().shared_addresses(SharedAddresses::off()).build()?;
+/// # let _ = strict;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedAddresses {
+    pub(crate) detect: bool,
+    pub(crate) known: Vec<Cidr>,
+}
+
+impl SharedAddresses {
+    /// Detection by distinct accounts, and no known ranges (the default).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::SharedAddresses;
+    /// assert_eq!(SharedAddresses::detect(), SharedAddresses::default());
+    /// ```
+    #[must_use]
+    pub fn detect() -> SharedAddresses {
+        SharedAddresses {
+            detect: true,
+            known: Vec::new(),
+        }
+    }
+
+    /// No address is ever shared, unless named with [`known`](Self::known):
+    /// every address is held to its own budgets and banned at its
+    /// thresholds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, SharedAddresses};
+    /// let bouncer = Bouncer::builder().shared_addresses(SharedAddresses::off()).build()?;
+    /// # let _ = bouncer;
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
+    #[must_use]
+    pub fn off() -> SharedAddresses {
+        SharedAddresses {
+            detect: false,
+            known: Vec::new(),
+        }
+    }
+
+    /// Ranges known to be shared (a carrier's NAT pools, an office's egress),
+    /// at most 4,096. Replaces any set before.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Cidr, SharedAddresses};
+    /// let pools: [Cidr; 2] = ["100.64.0.0/10".parse()?, "2001:db8:ca7::/48".parse()?];
+    /// let shared = SharedAddresses::off().known(&pools);
+    /// # let _ = shared;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn known(mut self, ranges: &[Cidr]) -> SharedAddresses {
+        self.known = ranges.to_vec();
+        self
+    }
+}
+
+impl Default for SharedAddresses {
+    fn default() -> SharedAddresses {
+        SharedAddresses::detect()
+    }
+}
 /// The window identities are counted in.
 const WINDOW_SECS: u64 = 3600;
 /// How long the shared flag lasts.
 const FLAG_SECS: u64 = 24 * 3600;
-/// Flagged addresses remembered for "is any inside this prefix".
-const FLAGGED_LIST: usize = 4096;
 
 pub(crate) struct Sources {
+    detect: bool,
+    known: Vec<Cidr>,
     key: HashKey,
     claims: Claims,
     bits: Box<[AtomicU64]>,
     /// window start secs (32) | flagged until secs (32)
     meta: Box<[AtomicU64]>,
-    flagged: Mutex<VecDeque<(Cidr, u64)>>,
 }
 
 /// The client prefix of an address: IPv4 /32, IPv6 /64.
@@ -44,23 +143,23 @@ fn client(addr: IpAddr) -> Cidr {
 }
 
 impl Sources {
-    pub(crate) fn new(capacity: u32, key: HashKey) -> Sources {
+    pub(crate) fn new(capacity: u32, key: HashKey, policy: &SharedAddresses) -> Sources {
         let claims = Claims::new(capacity);
         let n = claims.len();
         Sources {
+            detect: policy.detect,
+            known: policy.known.clone(),
             key,
             bits: (0..n).map(|_| AtomicU64::new(0)).collect(),
             meta: (0..n).map(|_| AtomicU64::new(0)).collect(),
             claims,
-            // Sized once, so flagging on the bind path never allocates.
-            flagged: Mutex::new(VecDeque::with_capacity(FLAGGED_LIST)),
         }
     }
 
     pub(crate) fn bytes(&self) -> u64 {
         self.claims.bytes()
             + (self.bits.len() * 16) as u64
-            + (FLAGGED_LIST * core::mem::size_of::<(Cidr, u64)>()) as u64
+            + (self.known.len() * core::mem::size_of::<Cidr>()) as u64
     }
 
     fn slot_key(&self, c: &Cidr) -> u64 {
@@ -74,6 +173,9 @@ impl Sources {
     /// Notes an identity (its two words) seen from `addr`. Returns `true`
     /// when this note flagged the address as shared.
     pub(crate) fn note(&self, addr: IpAddr, k0: u64, k1: u64, now_secs: u64) -> bool {
+        if !self.detect {
+            return false;
+        }
         let c = client(addr);
         let key = self.slot_key(&c);
         let (bits, meta) = (&self.bits, &self.meta);
@@ -129,34 +231,30 @@ impl Sources {
         {
             return false;
         }
-        let mut list = self
-            .flagged
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        list.retain(|&(f, end)| f != c && end > now_secs);
-        if list.len() >= FLAGGED_LIST {
-            list.pop_front();
-        }
-        list.push_back((c, until));
         true
     }
 
-    /// Whether `addr` is flagged as shared now.
+    /// Whether `addr` is shared now: named, or flagged by detection.
     pub(crate) fn is_shared(&self, addr: IpAddr, now_secs: u64) -> bool {
+        if self.known.iter().any(|k| k.contains(addr)) {
+            return true;
+        }
+        if !self.detect {
+            return false;
+        }
         let c = client(addr);
         self.claims
             .find(self.slot_key(&c))
             .is_some_and(|slot| (self.meta[slot].load(Ordering::Acquire) & 0xffff_ffff) > now_secs)
     }
 
-    /// Whether any flagged address lies inside `prefix` (escalation stops
-    /// there).
-    pub(crate) fn any_within(&self, prefix: &Cidr, now_secs: u64) -> bool {
-        self.flagged
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Whether a known shared range overlaps `prefix`: escalation and prefix
+    /// strike bans stop there. A detected address does not stop them, or a
+    /// client that earned the flag would shield its whole prefix (D-137).
+    pub(crate) fn known_within(&self, prefix: &Cidr) -> bool {
+        self.known
             .iter()
-            .any(|&(c, end)| end > now_secs && (prefix.covers(&c) || c.covers(prefix)))
+            .any(|k| prefix.covers(k) || k.covers(prefix))
     }
 }
 
@@ -167,7 +265,7 @@ mod tests {
     #[test]
     fn test_many_identities_flag_an_address_then_expire() {
         // Edge case 56: set and expired.
-        let s = Sources::new(64, HashKey::new(7, 8));
+        let s = Sources::new(64, HashKey::new(7, 8), &SharedAddresses::detect());
         let a: IpAddr = "198.51.100.1".parse().unwrap();
         let mut flagged = false;
         for i in 0..200u64 {
@@ -178,15 +276,14 @@ mod tests {
         }
         assert!(flagged);
         assert!(s.is_shared(a, 10));
-        assert!(s.any_within(&"198.51.100.0/24".parse().unwrap(), 10));
+        assert!(!s.known_within(&"198.51.100.0/24".parse().unwrap()));
         assert!(!s.is_shared("198.51.100.2".parse().unwrap(), 10));
         assert!(!s.is_shared(a, 10 + FLAG_SECS));
-        assert!(!s.any_within(&"198.51.100.0/24".parse().unwrap(), 10 + FLAG_SECS));
     }
 
     #[test]
     fn test_few_identities_do_not_flag() {
-        let s = Sources::new(64, HashKey::new(7, 8));
+        let s = Sources::new(64, HashKey::new(7, 8), &SharedAddresses::detect());
         let a: IpAddr = "2001:db8::1".parse().unwrap();
         for i in 0..8u64 {
             assert!(!s.note(a, i, 0, 5));

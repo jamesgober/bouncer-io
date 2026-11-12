@@ -43,6 +43,9 @@ pub struct Collected {
     len: usize,
     limit: usize,
     spare: usize,
+    /// The furthest byte that may hold data: what `spare` handed out is
+    /// written by the caller whether or not it is committed (F-9).
+    dirty: usize,
 }
 
 impl Default for Collected {
@@ -69,6 +72,7 @@ impl Collected {
             len: 0,
             limit: DEFAULT_LIMIT,
             spare: 0,
+            dirty: 0,
         }
     }
 
@@ -100,6 +104,7 @@ impl Collected {
             len: 0,
             limit,
             spare: 0,
+            dirty: 0,
         })
     }
 
@@ -205,6 +210,7 @@ impl Collected {
         next[..self.len].copy_from_slice(&self.buf[..self.len]);
         let mut old = core::mem::replace(&mut self.buf, next);
         crypt_io::wipe(&mut old);
+        self.dirty = self.len;
         Ok(())
     }
 
@@ -230,6 +236,7 @@ impl Collected {
         self.reserve(bytes.len())?;
         self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
         self.len += bytes.len();
+        self.dirty = self.dirty.max(self.len);
         self.spare = 0;
         Ok(())
     }
@@ -254,6 +261,7 @@ impl Collected {
     pub fn spare(&mut self, want: usize) -> Result<&mut [u8], BouncerError> {
         self.reserve(want)?;
         self.spare = want;
+        self.dirty = self.dirty.max(self.len + want);
         Ok(&mut self.buf[self.len..self.len + want])
     }
 
@@ -283,7 +291,9 @@ impl Collected {
         Ok(())
     }
 
-    /// Keeps the first `len` bytes and wipes the rest of what was collected.
+    /// Keeps the first `len` bytes and wipes the rest of what was collected,
+    /// with anything written through [`spare`](Self::spare) but not
+    /// committed.
     ///
     /// # Examples
     ///
@@ -295,14 +305,18 @@ impl Collected {
     /// # Ok::<(), bouncer_io::BouncerError>(())
     /// ```
     pub fn truncate(&mut self, len: usize) {
-        if len < self.len {
-            crypt_io::wipe(&mut self.buf[len..self.len]);
-            self.len = len;
+        let keep = len.min(self.len);
+        if keep < self.dirty {
+            crypt_io::wipe(&mut self.buf[keep..self.dirty]);
         }
+        self.len = keep;
+        self.dirty = keep;
         self.spare = 0;
     }
 
-    /// Wipes what was collected and keeps the capacity, for reuse.
+    /// Wipes what was collected, and anything written through
+    /// [`spare`](Self::spare) but not committed, and keeps the capacity, for
+    /// reuse.
     ///
     /// # Examples
     ///
@@ -316,8 +330,9 @@ impl Collected {
     /// # Ok::<(), bouncer_io::BouncerError>(())
     /// ```
     pub fn clear(&mut self) {
-        crypt_io::wipe(&mut self.buf[..self.len]);
+        crypt_io::wipe(&mut self.buf[..self.dirty]);
         self.len = 0;
+        self.dirty = 0;
         self.spare = 0;
     }
 
@@ -336,6 +351,7 @@ impl Collected {
     pub fn wipe(&mut self) {
         crypt_io::wipe(&mut self.buf);
         self.len = 0;
+        self.dirty = 0;
         self.spare = 0;
     }
 }

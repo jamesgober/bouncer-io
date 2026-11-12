@@ -21,7 +21,7 @@
         <strong>bouncer-io</strong> is the door guy. Every connection that comes in goes past it, and everything that goes back out goes past it again. At the door it knows who is banned (by address, prefix, client fingerprint, session, or account) and refuses them before a byte of their traffic is read.
     </p>
     <p>
-        Inside, it does not care where a request has got to. If the request, its session, its account, or its source is flagged while it is still being handled, the next checkpoint it crosses wipes everything it collected, replaces the response with a denial, throws the connection out, and remembers the offender so the next attempt dies at the door. A checkpoint costs one atomic load until something is actually revoked.
+        Inside, it does not care where a request has got to. If the request, its session, its account, or its source is flagged while it is still being handled, the next checkpoint it crosses wipes everything it collected, replaces the response with a denial, and throws the connection out. A revocation that also bans (`revoke_and_ban`, or a strike threshold) keeps the offender out at the door next time. A checkpoint costs one atomic load until something is actually revoked.
     </p>
     <br>
     <hr>
@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: <code>0.9.3</code> (alpha).</strong> Works behind a real server: the <code>net-io</code> feature makes bouncer net-io's gate, and <a href="./examples/guarded_http.rs"><code>examples/guarded_http.rs</code></a> runs it on serve-net. 0.8 redesigned the ban table (a third less memory per ban, the door 19% faster) and replayed hostile traffic against it; 0.9 was the pre-1.0 polish, which fixed a revocation that could miss a running request and concurrency budgets that lost counts (measurements in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>, threats and defences in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>). 1.0 waits on the decisions in <a href="./docs/READINESS-1.0.md"><code>docs/READINESS-1.0.md</code></a>. See <a href="./docs/API.md"><code>docs/API.md</code></a>, <a href="./docs/INTEGRATION.md"><code>docs/INTEGRATION.md</code></a>, <a href="./docs/ARCHITECTURE.md"><code>docs/ARCHITECTURE.md</code></a>, and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: <code>0.10.0</code> (alpha).</strong> Works behind a real server: the <code>net-io</code> feature makes bouncer net-io's gate, and <a href="./examples/guarded_http.rs"><code>examples/guarded_http.rs</code></a> runs it on serve-net. 0.8 redesigned the ban table (a third less memory per ban, the door 19% faster) and replayed hostile traffic against it; 0.9 was the pre-1.0 polish, which fixed a revocation that could miss a running request and concurrency budgets that lost counts (measurements in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>, threats and defences in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>). 1.0 waits on the decisions in <a href="./docs/READINESS-1.0.md"><code>docs/READINESS-1.0.md</code></a>. See <a href="./docs/API.md"><code>docs/API.md</code></a>, <a href="./docs/INTEGRATION.md"><code>docs/INTEGRATION.md</code></a>, <a href="./docs/ARCHITECTURE.md"><code>docs/ARCHITECTURE.md</code></a>, and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -63,11 +63,11 @@ let mut request = conn.request(RequestId(1))?;
 let mut reply = Collected::new();
 
 // Anywhere, any thread: an administrator throws this connection out.
-bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+bouncer.revoke(conn.connection(), Reason::ADMIN)?;
 
 // Between pipeline stages: one atomic load until something is revoked.
 if let Verdict::Deny(_) = request.checkpoint() {
-    request.deny_and_eject(&mut reply);   // wipe, replace, eject, remember
+    request.deny_and_eject(&mut reply);   // wipe, replace, eject
 }
 ```
 
@@ -76,6 +76,20 @@ Banning is one line, and a logout stops the session's running requests:
 ```rust
 bouncer.ban("2001:db8:7::/48".parse::<bouncer_io::Cidr>()?)?;
 bouncer.revoke(session_key, Reason::LOGOUT)?;
+```
+
+Anything more than the key (who decided, why, for how long) is a directive, the same message every other layer of the stack sends:
+
+```rust
+use bouncer_io::{Actor, Directive};
+use std::time::Duration;
+
+bouncer.apply(
+    Directive::ban(addr)
+        .for_duration(Duration::from_secs(3600))
+        .by(Actor::Admin(17))
+        .because(Reason::ADMIN),
+)?;
 ```
 
 <hr>

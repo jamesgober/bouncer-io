@@ -38,7 +38,7 @@ fuzz_target!(|data: &[u8]| {
         .escalation(EscalationPolicy::default().off())
         .tickets(256)
         .ban_capacity(64)
-        .try_build()
+        .build()
         .unwrap();
     let mut banned = [false; ADDRS];
     let mut revoked_sessions = [false; SESSIONS];
@@ -106,7 +106,7 @@ fuzz_target!(|data: &[u8]| {
             4 => {
                 if !live.is_empty() {
                     let i = arg % live.len();
-                    let conn = live[i].conn.conn();
+                    let conn = live[i].conn.connection();
                     let _ = b.revoke(conn, Reason::ADMIN);
                     live[i].revoked = true;
                 }

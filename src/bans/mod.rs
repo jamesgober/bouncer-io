@@ -77,10 +77,14 @@ impl BanId {
 /// # Examples
 ///
 /// ```
-/// use bouncer_io::{BanDuration, BanSpec};
+/// use bouncer_io::{Bouncer, Directive, Filter, Page};
 /// use std::time::Duration;
-/// let spec = BanSpec::address("192.0.2.1".parse()?).for_duration(Duration::from_secs(60));
-/// assert_eq!(spec.duration, BanDuration::Fixed(Duration::from_secs(60)));
+/// let bouncer = Bouncer::new();
+/// bouncer.apply(
+///     Directive::ban("192.0.2.1".parse::<std::net::IpAddr>()?).for_duration(Duration::from_secs(60)),
+/// )?;
+/// let listed = bouncer.list(&Filter::all(), Page::first(10));
+/// assert!(listed.items[0].until.is_some());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[non_exhaustive]
@@ -98,26 +102,10 @@ pub enum BanDuration {
 /// Describes a ban: key, duration, actor, reason, evidence.
 ///
 /// The defaults are the duration policy, [`Actor::App`], and
-/// [`Reason::ADMIN`]. An address or prefix converts directly.
-///
-/// # Examples
-///
-/// ```
-/// use bouncer_io::{Actor, BanSpec, Bouncer, Reason};
-/// use std::time::Duration;
-///
-/// let bouncer = Bouncer::new();
-/// bouncer.ban(
-///     BanSpec::address("198.51.100.9".parse()?)
-///         .for_duration(Duration::from_secs(3600))
-///         .by(Actor::Admin(17))
-///         .because(Reason::ADMIN),
-/// )?;
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
+/// [`Reason::ADMIN`]. Internal: callers set these through a `Directive`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
-pub struct BanSpec {
+pub(crate) struct BanSpec {
     /// What is banned.
     pub key: BanKey,
     /// For how long.
@@ -132,19 +120,8 @@ pub struct BanSpec {
 
 impl BanSpec {
     /// A ban of any key.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bouncer_io::{BanSpec, Bouncer, SessionKey};
-    /// let bouncer = Bouncer::new();
-    /// let session = SessionKey::from_digest([7; 16]);
-    /// bouncer.ban(BanSpec::key(session))?;
-    /// assert!(!bouncer.explain(session).admitted);
-    /// # Ok::<(), bouncer_io::BouncerError>(())
-    /// ```
     #[must_use]
-    pub fn key(key: impl Into<BanKey>) -> BanSpec {
+    pub(crate) fn key(key: impl Into<BanKey>) -> BanSpec {
         BanSpec {
             key: key.into().normalized(),
             duration: BanDuration::Policy,
@@ -155,133 +132,50 @@ impl BanSpec {
     }
 
     /// A ban of one client: an IPv4 address, or an IPv6 address's /64.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bouncer_io::{BanSpec, Bouncer};
-    /// let bouncer = Bouncer::new();
-    /// bouncer.ban(BanSpec::address("2001:db8:0:1::1".parse()?))?;
-    /// assert!(bouncer.door("2001:db8:0:1::ffff".parse()?).is_err());   // same /64
-    /// assert!(bouncer.door("2001:db8:0:2::1".parse()?).is_ok());
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
     #[must_use]
-    pub fn address(addr: IpAddr) -> BanSpec {
+    pub(crate) fn address(addr: IpAddr) -> BanSpec {
         BanSpec::key(BanKey::Address(normalize(addr)))
     }
 
     /// A ban of a prefix.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bouncer_io::{BanSpec, Bouncer};
-    /// let bouncer = Bouncer::new();
-    /// bouncer.ban(BanSpec::prefix("203.0.113.0/24".parse()?))?;
-    /// assert!(bouncer.door("203.0.113.77".parse()?).is_err());
-    /// assert!(bouncer.door("203.0.114.1".parse()?).is_ok());
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
     #[must_use]
-    pub fn prefix(cidr: Cidr) -> BanSpec {
+    pub(crate) fn prefix(cidr: Cidr) -> BanSpec {
         BanSpec::key(BanKey::Prefix(cidr))
     }
 
     /// Lasts exactly `duration`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bouncer_io::{BanSpec, Bouncer};
-    /// use clock_lib::ManualClock;
-    /// use std::{sync::Arc, time::Duration};
-    /// let clock = Arc::new(ManualClock::new());
-    /// let bouncer = Bouncer::builder().clock(clock.clone()).try_build()?;
-    /// let addr = "198.51.100.9".parse()?;
-    /// bouncer.ban(BanSpec::address(addr).for_duration(Duration::from_secs(60)))?;
-    /// assert!(bouncer.door(addr).is_err());
-    /// clock.advance(Duration::from_secs(61));
-    /// assert!(bouncer.door(addr).is_ok());
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
+    #[cfg(all(test, not(bouncer_loom)))]
     #[must_use]
-    pub fn for_duration(mut self, duration: Duration) -> BanSpec {
+    pub(crate) fn for_duration(mut self, duration: Duration) -> BanSpec {
         self.duration = BanDuration::Fixed(duration);
         self
     }
 
     /// Lasts until lifted.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bouncer_io::{Actor, BanSpec, Bouncer, BouncerError};
-    /// let bouncer = Bouncer::new();
-    /// let addr = "198.51.100.9".parse()?;
-    /// bouncer.ban(BanSpec::address(addr).permanent())?;
-    /// assert_eq!(bouncer.explain(addr).bans[0].until, None);
-    /// // Automated actors other than Sentinel may not ban permanently.
-    /// let refused = bouncer.ban(BanSpec::address("198.51.100.10".parse()?).permanent().by(Actor::Policy(3)));
-    /// assert!(matches!(refused, Err(BouncerError::PermanentNotAllowed)));
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
+    #[cfg(all(test, not(bouncer_loom)))]
     #[must_use]
-    pub fn permanent(mut self) -> BanSpec {
+    pub(crate) fn permanent(mut self) -> BanSpec {
         self.duration = BanDuration::Permanent;
         self
     }
 
     /// Who decided.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bouncer_io::{Actor, ActorKind, BanSpec, Bouncer};
-    /// let bouncer = Bouncer::new();
-    /// let addr = "198.51.100.9".parse()?;
-    /// bouncer.ban(BanSpec::address(addr).by(Actor::Admin(17)))?;
-    /// assert_eq!(bouncer.explain(addr).bans[0].actor, ActorKind::Admin);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
     #[must_use]
-    pub fn by(mut self, actor: Actor) -> BanSpec {
+    pub(crate) fn by(mut self, actor: Actor) -> BanSpec {
         self.actor = actor;
         self
     }
 
     /// Why.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bouncer_io::{BanSpec, Bouncer, Reason};
-    /// let bouncer = Bouncer::new();
-    /// let addr = "198.51.100.9".parse()?;
-    /// bouncer.ban(BanSpec::address(addr).because(Reason::DECOY))?;
-    /// assert_eq!(bouncer.explain(addr).bans[0].reason, Reason::DECOY);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
     #[must_use]
-    pub fn because(mut self, reason: Reason) -> BanSpec {
+    pub(crate) fn because(mut self, reason: Reason) -> BanSpec {
         self.reason = reason;
         self
     }
 
     /// Supporting evidence.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bouncer_io::{BanSpec, Bouncer, Evidence, EvidenceValue};
-    /// let spec = BanSpec::address("198.51.100.9".parse()?)
-    ///     .evidence(Evidence::new(&[("failed_logins", EvidenceValue::Number(40))]));
-    /// assert_eq!(spec.evidence.pairs().len(), 1);
-    /// Bouncer::new().ban(spec)?;
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
     #[must_use]
-    pub fn evidence(mut self, evidence: Evidence<'static>) -> BanSpec {
+    pub(crate) fn evidence(mut self, evidence: Evidence<'static>) -> BanSpec {
         self.evidence = evidence;
         self
     }
@@ -304,21 +198,9 @@ impl From<BanKey> for BanSpec {
 }
 
 /// Describes a lift: key, actor, reason.
-///
-/// # Examples
-///
-/// ```
-/// use bouncer_io::{Actor, Bouncer, LiftSpec, Reason};
-/// let bouncer = Bouncer::new();
-/// let addr: std::net::IpAddr = "198.51.100.9".parse()?;
-/// bouncer.ban(addr)?;
-/// let lifted = bouncer.lift(LiftSpec::key(addr).by(Actor::Admin(17)).because(Reason::ADMIN))?;
-/// assert_eq!(lifted.removed, 1);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
-pub struct LiftSpec {
+pub(crate) struct LiftSpec {
     /// What is lifted: bans on exactly this key.
     pub key: BanKey,
     /// Who decided.
@@ -329,20 +211,8 @@ pub struct LiftSpec {
 
 impl LiftSpec {
     /// A lift of any key, by [`Actor::App`] for [`Reason::ADMIN`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bouncer_io::{Bouncer, Cidr, LiftSpec};
-    /// let bouncer = Bouncer::new();
-    /// let prefix: Cidr = "203.0.113.0/24".parse()?;
-    /// bouncer.ban(prefix)?;
-    /// assert_eq!(bouncer.lift(LiftSpec::key(prefix))?.removed, 1);
-    /// assert!(bouncer.door("203.0.113.7".parse()?).is_ok());
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
     #[must_use]
-    pub fn key(key: impl Into<BanKey>) -> LiftSpec {
+    pub(crate) fn key(key: impl Into<BanKey>) -> LiftSpec {
         LiftSpec {
             key: key.into().normalized(),
             actor: Actor::App,
@@ -351,41 +221,15 @@ impl LiftSpec {
     }
 
     /// Who decided.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bouncer_io::{Actor, Bouncer, LiftSpec};
-    /// let bouncer = Bouncer::new();
-    /// let addr: std::net::IpAddr = "198.51.100.9".parse()?;
-    /// bouncer.ban(addr)?;
-    /// let spec = LiftSpec::key(addr).by(Actor::Admin(17));
-    /// assert_eq!(spec.actor, Actor::Admin(17));
-    /// assert_eq!(bouncer.lift(spec)?.removed, 1);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
     #[must_use]
-    pub fn by(mut self, actor: Actor) -> LiftSpec {
+    pub(crate) fn by(mut self, actor: Actor) -> LiftSpec {
         self.actor = actor;
         self
     }
 
     /// Why.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bouncer_io::{Bouncer, LiftSpec, Reason};
-    /// let bouncer = Bouncer::new();
-    /// let addr: std::net::IpAddr = "198.51.100.9".parse()?;
-    /// bouncer.ban(addr)?;
-    /// let spec = LiftSpec::key(addr).because(Reason::custom(900));
-    /// assert_eq!(spec.reason, Reason::custom(900));
-    /// assert_eq!(bouncer.lift(spec)?.removed, 1);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
     #[must_use]
-    pub fn because(mut self, reason: Reason) -> LiftSpec {
+    pub(crate) fn because(mut self, reason: Reason) -> LiftSpec {
         self.reason = reason;
         self
     }
@@ -468,7 +312,7 @@ impl DurationPolicy {
     /// #     Ok(r.until.ok_or("permanent")?.duration_since(r.issued)?.as_secs())
     /// # }
     /// let policy = DurationPolicy::default().base(Duration::from_secs(300)).jitter(Duration::ZERO);
-    /// let bouncer = Bouncer::builder().durations(policy).try_build()?;
+    /// let bouncer = Bouncer::builder().durations(policy).build()?;
     /// let addr = "198.51.100.9".parse()?;
     /// bouncer.ban(addr)?;
     /// assert_eq!(length(&bouncer, addr)?, 300);
@@ -492,7 +336,7 @@ impl DurationPolicy {
     /// #     Ok(r.until.ok_or("permanent")?.duration_since(r.issued)?.as_secs())
     /// # }
     /// let policy = DurationPolicy::default().base(Duration::from_secs(60)).factor(3).jitter(Duration::ZERO);
-    /// let bouncer = Bouncer::builder().durations(policy).try_build()?;
+    /// let bouncer = Bouncer::builder().durations(policy).build()?;
     /// let addr = "198.51.100.9".parse()?;
     /// bouncer.ban(addr)?;
     /// bouncer.lift(addr)?;
@@ -518,7 +362,7 @@ impl DurationPolicy {
     /// #     Ok(r.until.ok_or("permanent")?.duration_since(r.issued)?.as_secs())
     /// # }
     /// let policy = DurationPolicy::default().base(Duration::from_secs(60)).step_cap(1).jitter(Duration::ZERO);
-    /// let bouncer = Bouncer::builder().durations(policy).try_build()?;
+    /// let bouncer = Bouncer::builder().durations(policy).build()?;
     /// let addr = "198.51.100.9".parse()?;
     /// for _ in 0..3 {
     ///     bouncer.ban(addr)?;
@@ -550,7 +394,7 @@ impl DurationPolicy {
     ///     .factor(10)
     ///     .max(Duration::from_secs(300))
     ///     .jitter(Duration::ZERO);
-    /// let bouncer = Bouncer::builder().durations(policy).try_build()?;
+    /// let bouncer = Bouncer::builder().durations(policy).build()?;
     /// let addr = "198.51.100.9".parse()?;
     /// bouncer.ban(addr)?;
     /// bouncer.lift(addr)?;
@@ -576,7 +420,7 @@ impl DurationPolicy {
     /// #     Ok(r.until.ok_or("permanent")?.duration_since(r.issued)?.as_secs())
     /// # }
     /// let policy = DurationPolicy::default().base(Duration::from_secs(300)).jitter(Duration::from_secs(30));
-    /// let bouncer = Bouncer::builder().durations(policy).try_build()?;
+    /// let bouncer = Bouncer::builder().durations(policy).build()?;
     /// let addr = "198.51.100.9".parse()?;
     /// bouncer.ban(addr)?;
     /// assert!((300..=330).contains(&length(&bouncer, addr)?));
@@ -607,7 +451,7 @@ impl DurationPolicy {
     ///     .jitter(Duration::ZERO)
     ///     .half_life(Duration::from_secs(600));
     /// let clock = Arc::new(ManualClock::new());
-    /// let bouncer = Bouncer::builder().durations(policy).clock(clock.clone()).try_build()?;
+    /// let bouncer = Bouncer::builder().durations(policy).clock(clock.clone()).build()?;
     /// let addr = "198.51.100.9".parse()?;
     /// bouncer.ban(addr)?;
     /// bouncer.lift(addr)?;
@@ -728,7 +572,9 @@ struct Writer {
     counts_v4: [u32; 33],
     counts_v6: [u32; 129],
     counts_ident: [u32; 16],
-    admin: Vec<(Cidr, AdminEntry)>,
+    /// Administrator prefixes by prefix: a lookup, insert, or removal is
+    /// O(log n), so a bulk load is not quadratic (F-7).
+    admin: std::collections::BTreeMap<Cidr, AdminEntry>,
     /// The originals of compound fingerprint keys (stored as digests), by
     /// (length, digest words): for listings, persistence, and sharing.
     compound: HashMap<(u8, u64, u64), (crate::keys::FingerprintKey, Cidr)>,
@@ -739,10 +585,41 @@ struct Writer {
 }
 
 /// The per-thread cache of the administrator set: bouncer id, version, set.
-type AdminCache = Option<(u64, u64, Arc<PrefixSet<DoorAdmin>>)>;
+/// Slots per thread: a thread serving up to four bouncers keeps each one's
+/// set without reloading it on every lookup (F-15).
+const CACHE_SLOTS: usize = 4;
+type AdminCache = [Option<(u64, u64, Arc<PrefixSet<DoorAdmin>>)>; CACHE_SLOTS];
 
 thread_local! {
-    static ADMIN_CACHE: RefCell<AdminCache> = const { RefCell::new(None) };
+    /// Set while this thread applies a batch: administrator-set changes are
+    /// published once, when the batch ends.
+    static DEFER_ADMIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with administrator-set publishing deferred on this thread, then
+/// publishes once if anything changed. Other threads' bans publish as
+/// usual, and each publish includes the batch's changes so far.
+pub(crate) fn batched<T>(bans: &BanMemory, f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DEFER_ADMIN.with(|d| d.set(self.0));
+        }
+    }
+    let outer = DEFER_ADMIN.with(|d| d.replace(true));
+    let out = {
+        let _reset = Reset(outer);
+        f()
+    };
+    if !outer && bans.admin_dirty.load(std::sync::atomic::Ordering::Acquire) {
+        let w = bans.lock();
+        bans.publish_admin(&w.admin);
+    }
+    out
+}
+
+thread_local! {
+    static ADMIN_CACHE: RefCell<AdminCache> = const { RefCell::new([None, None, None, None]) };
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -778,6 +655,8 @@ pub(crate) struct BanMemory {
     present_ident: AtomicU64,
     admin_version: AtomicU64,
     admin_count: AtomicU64,
+    /// An administrator-set change waits to be published (inside a batch).
+    admin_dirty: std::sync::atomic::AtomicBool,
     admin: RwLock<Arc<PrefixSet<DoorAdmin>>>,
     /// The key of ban references (the bouncer's).
     references: HashKey,
@@ -869,6 +748,7 @@ impl BanMemory {
             present_ident: AtomicU64::new(0),
             admin_version: AtomicU64::new(0),
             admin_count: AtomicU64::new(0),
+            admin_dirty: std::sync::atomic::AtomicBool::new(false),
             admin: RwLock::new(Arc::new(PrefixSet::empty())),
             references,
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -878,7 +758,7 @@ impl BanMemory {
                 counts_v4: [0; 33],
                 counts_v6: [0; 129],
                 counts_ident: [0; 16],
-                admin: Vec::new(),
+                admin: std::collections::BTreeMap::new(),
                 compound: HashMap::new(),
                 rng,
                 next_id: 1,
@@ -1242,9 +1122,10 @@ impl BanMemory {
                     reason: spec.reason,
                 };
                 let writer = &mut *w;
-                writer.admin.retain(|(_, e)| !e.expired(now_secs));
-                let id = match writer.admin.iter_mut().find(|(c, _)| *c == cidr) {
-                    Some((_, existing)) => {
+                // Expired entries read as expired at the door, and are
+                // dropped when the set is full.
+                let id = match writer.admin.get_mut(&cidr) {
+                    Some(existing) => {
                         existing.until = longer(existing.until, until);
                         existing.actor = actor;
                         existing.reason = spec.reason;
@@ -1252,11 +1133,14 @@ impl BanMemory {
                     }
                     None => {
                         if writer.admin.len() >= MAX_ADMIN_PREFIXES {
+                            writer.admin.retain(|_, e| !e.expired(now_secs));
+                        }
+                        if writer.admin.len() >= MAX_ADMIN_PREFIXES {
                             return Err(BouncerError::BanTableFull {
                                 capacity: MAX_ADMIN_PREFIXES as u32,
                             });
                         }
-                        writer.admin.push((cidr, entry));
+                        writer.admin.insert(cidr, entry);
                         id
                     }
                 };
@@ -1430,9 +1314,7 @@ impl BanMemory {
                 None => 0,
             },
             Placement::Admin(cidr) => {
-                let before = writer.admin.len();
-                writer.admin.retain(|(c, _)| *c != cidr);
-                let n = (before - writer.admin.len()) as u32;
+                let n = u32::from(writer.admin.remove(&cidr).is_some());
                 if n > 0 {
                     self.publish_admin(&writer.admin);
                 }
@@ -1475,7 +1357,15 @@ impl BanMemory {
         self.place(&key.normalized(), actor).is_ok()
     }
 
-    fn publish_admin(&self, list: &[(Cidr, AdminEntry)]) {
+    fn publish_admin(&self, list: &std::collections::BTreeMap<Cidr, AdminEntry>) {
+        // Inside a batch the set is built once, at its end (F-7).
+        if DEFER_ADMIN.with(std::cell::Cell::get) {
+            self.admin_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        self.admin_dirty
+            .store(false, std::sync::atomic::Ordering::Release);
         let door: Vec<(Cidr, DoorAdmin)> = list
             .iter()
             .map(|(c, e)| {
@@ -1945,14 +1835,10 @@ impl BanMemory {
                 != 0
             {
                 let host = Cidr::host(src);
-                let lengths: Vec<u8> = match host.family() {
-                    Family::V4 => (0..=32u8)
-                        .filter(|&l| self.is_auto(Family::V4, l))
-                        .collect(),
-                    Family::V6 => (0..=128u8)
-                        .filter(|&l| self.is_auto(Family::V6, l))
-                        .collect(),
-                };
+                let family = host.family();
+                // The automatic lengths, read from their bitmaps: no
+                // allocation per bind (F-14).
+                let lengths = (0..=family.max_len()).filter(|&l| self.is_auto(family, l));
                 for len in lengths {
                     if let Some(p) = host.parent(len) {
                         match self.table.find(&self.fingerprint_in_key(fp, &p), now_secs) {
@@ -1974,7 +1860,8 @@ impl BanMemory {
         let mut f = Some(f);
         let cached = ADMIN_CACHE
             .try_with(|cell| {
-                let mut slot = cell.try_borrow_mut().ok()?;
+                let mut slots = cell.try_borrow_mut().ok()?;
+                let slot = &mut slots[(self.uid as usize) % CACHE_SLOTS];
                 let fresh =
                     matches!(&*slot, Some((uid, v, _)) if *uid == self.uid && *v == version);
                 if !fresh {

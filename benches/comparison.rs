@@ -39,7 +39,7 @@ use std::{
     },
 };
 
-use bouncer_io::{Bouncer, Budgets, ConnId, DatagramVerdict, Provenance, Rate, RequestId};
+use bouncer_io::{Bouncer, Budgets, ConnectionId, DatagramVerdict, Provenance, Rate, RequestId};
 use compose::{EqualJob, LookupOnly};
 use criterion::{Criterion, criterion_group, criterion_main};
 use fixture::{Mix, fixture};
@@ -96,7 +96,7 @@ fn door(c: &mut Criterion) {
             b.iter(|| {
                 i = (i + 1) % n;
                 let t = f.bouncer.door_at(
-                    ConnId(i as u64),
+                    ConnectionId(i as u64),
                     black_box(probes[i]),
                     Provenance::Socket,
                     now,
@@ -131,7 +131,7 @@ fn budget(c: &mut Criterion) {
         .budgets(Budgets::off().door_rate(rate, rate))
         .tickets(64)
         .ban_capacity(1024)
-        .try_build()
+        .build()
         .unwrap();
     let limiter = RateLimiter::keyed(Quota::per_second(NonZeroU32::new(1_000_000_000).unwrap()));
     let mut m = Mix(5);
@@ -160,7 +160,7 @@ fn checkpoint(c: &mut Criterion) {
         .budgets(Budgets::off())
         .tickets(64)
         .ban_capacity(1024)
-        .try_build()
+        .build()
         .unwrap();
     let conn = b.door("192.0.2.1".parse().unwrap()).unwrap();
     let mut req = conn.request(RequestId(1)).unwrap();
@@ -191,7 +191,7 @@ fn parts(c: &mut Criterion) {
         .budgets(Budgets::off())
         .tickets(4096)
         .ban_capacity(1024)
-        .try_build()
+        .build()
         .unwrap();
     let f = fixture();
     let now = f.bouncer.now();
@@ -203,7 +203,7 @@ fn parts(c: &mut Criterion) {
             black_box(
                 empty
                     .door_at(
-                        ConnId(i as u64),
+                        ConnectionId(i as u64),
                         black_box(f.admitted[i]),
                         Provenance::Socket,
                         now,

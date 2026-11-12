@@ -42,7 +42,7 @@ fn test_strict_posture_halves_door_rate_and_concurrency() {
                 .door_rate(Rate::per_second(8).burst(8), Rate::per_second(10_000))
                 .door_concurrency(1_000, 10_000),
         )
-        .try_build()
+        .build()
         .unwrap();
     let admitted = |b: &Bouncer, addr: &str| {
         let mut held = Vec::new();
@@ -68,7 +68,7 @@ fn test_strict_posture_halves_door_rate_and_concurrency() {
     let b = Bouncer::builder()
         .budgets(Budgets::off().door_concurrency(6, 1_000))
         .strict_budget_divisor(3)
-        .try_build()
+        .build()
         .unwrap();
     b.set_posture(Posture::Strict);
     assert_eq!(admitted(&b, "198.51.100.4"), 2, "concurrency 6 / 3");
@@ -81,7 +81,7 @@ fn test_strict_posture_enforces_strict_kinds_and_reports() {
         .budgets(Budgets::off())
         .enforcement(Enforcement::observe_all().strict(&[StrikeKind::Malformed]))
         .event_sink(sink.clone())
-        .try_build()
+        .build()
         .unwrap();
     let conn = b.door(ip("203.0.113.1")).unwrap();
     let mut last = conn.strike(StrikeKind::Malformed);
@@ -116,7 +116,7 @@ fn test_strict_revokes_unauthenticated_requests_only_when_asked() {
         let b = Bouncer::builder()
             .budgets(Budgets::off())
             .strict_revokes_unauthenticated(revoke)
-            .try_build()
+            .build()
             .unwrap();
         let mut conn = b.door(ip("192.0.2.1")).unwrap();
         let mut anonymous = conn.request(RequestId(1)).unwrap();
@@ -132,12 +132,7 @@ fn test_strict_revokes_unauthenticated_requests_only_when_asked() {
         assert!(conn.checkpoint().is_pass(), "connections are not revoked");
         assert!(conn.request(RequestId(3)).is_ok());
     }
-    assert!(
-        Bouncer::builder()
-            .strict_budget_divisor(0)
-            .try_build()
-            .is_err()
-    );
+    assert!(Bouncer::builder().strict_budget_divisor(0).build().is_err());
 }
 
 #[test]
@@ -146,7 +141,7 @@ fn test_lane_budget_per_session_else_client() {
     let b = Bouncer::builder()
         .clock(clock.clone())
         .budgets(Budgets::off().lane_rate(LaneClass::Auth, Rate::per_second(2)))
-        .try_build()
+        .build()
         .unwrap();
     let conn = b.door(ip("192.0.2.10")).unwrap();
     let lane = |id: u128, session: Option<u8>| {
@@ -180,7 +175,7 @@ fn test_lane_denial_keeps_connection_and_reports() {
     let b = Bouncer::builder()
         .budgets(Budgets::off().lane_rate(LaneClass::Write, Rate::per_second(1)))
         .event_sink(sink.clone())
-        .try_build()
+        .build()
         .unwrap();
     let mut conn = b.door(ip("192.0.2.11")).unwrap();
     let mut first = conn.request(RequestId(1)).unwrap();
@@ -208,7 +203,7 @@ fn test_tenant_rate_plans_and_in_flight() {
                 .tenant_plan(TenantKey(7), Rate::per_second(5))
                 .tenant_in_flight(3),
         )
-        .try_build()
+        .build()
         .unwrap();
     let conn = b.door(ip("192.0.2.20")).unwrap();
     let bind = |id: u128, tenant: u64| {
@@ -258,7 +253,7 @@ fn test_identity_throttles_divide_lane_and_tenant() {
                 .lane_rate(LaneClass::Normal, Rate::per_second(8))
                 .tenant_rate(Rate::per_second(8)),
         )
-        .try_build()
+        .build()
         .unwrap();
     let conn = b.door(ip("192.0.2.30")).unwrap();
     b.apply(Directive::throttle(AccountKey(5), 4, Duration::from_secs(60)).because(Reason::POLICY))
@@ -290,8 +285,12 @@ fn test_identity_throttles_divide_lane_and_tenant() {
     assert!(r.bind_tenant(TenantKey(9)).is_deny());
     // Connections and requests are not throttle targets.
     assert!(
-        b.apply(Directive::throttle(conn.conn(), 2, Duration::from_secs(1)))
-            .is_err()
+        b.apply(Directive::throttle(
+            conn.connection(),
+            2,
+            Duration::from_secs(1)
+        ))
+        .is_err()
     );
 }
 
@@ -302,7 +301,7 @@ fn test_tenant_revoked_at_its_in_flight_cap() {
     // goes below zero.
     let b = Bouncer::builder()
         .budgets(Budgets::off().tenant_in_flight(2))
-        .try_build()
+        .build()
         .unwrap();
     let remaining = || {
         b.explain(TenantKey(9))

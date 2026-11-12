@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bouncer_io::{BanSpec, Bouncer, Cidr, ConnId, Provenance, RequestId};
+use bouncer_io::{Bouncer, Cidr, ConnectionId, Directive, Provenance, RequestId};
 
 fn v6(bits: u128) -> IpAddr {
     IpAddr::V6(std::net::Ipv6Addr::from(bits))
@@ -60,7 +60,7 @@ fn main() {
         .ban_capacity(1_100_000)
         .tickets(4096)
         .seed([9; 32])
-        .try_build()
+        .build()
         .unwrap();
     let mut m = Mix(1);
     let mut banned = Vec::new();
@@ -77,7 +77,7 @@ fn main() {
             } else {
                 IpAddr::from((m.next() as u32 | 0x8000_0000).to_be_bytes())
             };
-            if b.ban(BanSpec::prefix(Cidr::new(addr, len).unwrap()).permanent())
+            if b.apply(Directive::ban(Cidr::new(addr, len).unwrap()).permanent())
                 .is_ok()
                 && banned.len() < 100_000
             {
@@ -138,7 +138,7 @@ fn main() {
         let mut adm = Vec::with_capacity(n);
         for (i, &peer) in admitted.iter().enumerate() {
             let t0 = Instant::now();
-            let t = b.door_at(ConnId(i as u64), peer, Provenance::Socket, now);
+            let t = b.door_at(ConnectionId(i as u64), peer, Provenance::Socket, now);
             adm.push(t0.elapsed());
             drop(t);
         }
@@ -146,7 +146,7 @@ fn main() {
         for i in 0..n {
             let peer = banned[i % banned.len()];
             let t0 = Instant::now();
-            let r = b.door_at(ConnId(i as u64), peer, Provenance::Socket, now);
+            let r = b.door_at(ConnectionId(i as u64), peer, Provenance::Socket, now);
             ban.push(t0.elapsed());
             assert!(r.is_err());
         }

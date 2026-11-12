@@ -12,10 +12,10 @@ use std::{
 };
 
 use bouncer_io::{
-    AccountKey, Actor, AllowList, BanKey, BanKeys, BanSpec, Bouncer, BouncerError, Budgets, Cidr,
-    CloseKind, ConnId, DenialCode, Directive, Ejector, Enforcement, Event, EventSink,
-    FingerprintKey, IgnoredBecause, Provenance, Rate, Reason, Refusal, RequestId, RevocationEpoch,
-    SessionKey, StrikeKind, StrikeOutcome, Target, TenantKey, Verdict, signals,
+    AccountKey, Actor, AllowList, BanKey, BanKeys, Bouncer, BouncerError, Budgets, Cidr, CloseKind,
+    ConnectionId, DenialCode, Directive, Ejector, Enforcement, Event, EventSink, FingerprintKey,
+    IgnoredBecause, Provenance, Rate, Reason, Refusal, RequestId, RevocationEpoch, SessionKey,
+    StrikeKind, StrikeOutcome, Target, TenantKey, Verdict, signals,
 };
 use clock_lib::ManualClock;
 
@@ -31,7 +31,7 @@ fn plain() -> Bouncer {
     Bouncer::builder()
         .budgets(Budgets::off())
         .seed([4; 32])
-        .try_build()
+        .build()
         .unwrap()
 }
 
@@ -58,9 +58,9 @@ impl Events {
 }
 
 #[derive(Default)]
-struct Kills(Mutex<Vec<ConnId>>);
+struct Kills(Mutex<Vec<ConnectionId>>);
 impl Ejector for Kills {
-    fn eject(&self, conn: ConnId, _kind: CloseKind) {
+    fn eject(&self, conn: ConnectionId, _kind: CloseKind) {
         self.0.lock().unwrap().push(conn);
     }
 }
@@ -73,7 +73,7 @@ fn test_revoke_every_target_denies_at_checkpoint() {
     let session = SessionKey::from_digest([1; 16]);
     let fp = FingerprintKey::from_digest([2; 16]);
     let targets: [Target; 7] = [
-        Target::Connection(ConnId(0)), // replaced below with the live connection's id
+        Target::Connection(ConnectionId(0)), // replaced below with the live connection's id
         Target::Request(RequestId(77)),
         Target::Session(session),
         Target::Account(AccountKey(5)),
@@ -90,7 +90,7 @@ fn test_revoke_every_target_denies_at_checkpoint() {
         assert!(req.bind_tenant(TenantKey(9)).is_pass());
         assert!(req.checkpoint().is_pass());
         let target = match target {
-            Target::Connection(_) => Target::Connection(conn.conn()),
+            Target::Connection(_) => Target::Connection(conn.connection()),
             t => t,
         };
         b.revoke(target, Reason::ADMIN).unwrap();
@@ -101,7 +101,7 @@ fn test_revoke_every_target_denies_at_checkpoint() {
         );
         assert!(req.checkpoint().is_deny(), "stays denied: {target:?}");
         assert!(req.before_commit().is_deny(), "{target:?}");
-        assert!(req.is_cancelled(), "{target:?}");
+        assert!(req.checkpoint().is_deny(), "{target:?}");
         // The request's revocation takes its connection with it.
         assert!(
             conn.checkpoint().is_deny(),
@@ -148,7 +148,7 @@ fn test_revoke_twice_one_entry_strongest_code() {
     let b = Bouncer::builder()
         .budgets(Budgets::off())
         .event_sink(events.clone())
-        .try_build()
+        .build()
         .unwrap();
     let conn = b.door(ip("192.0.2.1")).unwrap();
     let mut r = conn.request(RequestId(1)).unwrap();
@@ -172,18 +172,18 @@ fn test_revoke_never_issued_connection_reclaimed() {
     // Edge case 32: a connection id never issued, and one already
     // released: a receipt, nothing matched, the entries cleaned up.
     let b = plain();
-    let receipt = b.revoke(ConnId(123_456), Reason::ADMIN).unwrap();
+    let receipt = b.revoke(ConnectionId(123_456), Reason::ADMIN).unwrap();
     assert!(receipt.epoch > 0);
     let mut live = b.door(ip("192.0.2.1")).unwrap();
     assert!(live.checkpoint().is_pass());
     assert_eq!(b.maintain(b.now()).reclaimed, 1);
     let gone = b.door(ip("192.0.2.2")).unwrap();
-    let gone_id = gone.conn();
+    let gone_id = gone.connection();
     drop(gone);
     let receipt = b.revoke(gone_id, Reason::ADMIN).unwrap();
     assert!(receipt.epoch > 0);
     let mut next = b.door(ip("192.0.2.2")).unwrap();
-    assert_ne!(next.conn(), gone_id);
+    assert_ne!(next.connection(), gone_id);
     assert!(next.checkpoint().is_pass(), "a new connection is not hit");
     assert!(live.checkpoint().is_pass());
     assert_eq!(b.maintain(b.now()).reclaimed, 1);
@@ -197,7 +197,7 @@ fn test_cleanup_keeps_a_revocation_a_pending_request_owes() {
     let b = Bouncer::builder()
         .trusted_proxies(&[c("198.51.100.1/32")])
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let mut hop = b.door(ip("198.51.100.1")).unwrap();
     let mut pending = hop.request(RequestId(1)).unwrap();
@@ -219,7 +219,7 @@ fn test_revoke_source_covering_trusted_proxy() {
     let b = Bouncer::builder()
         .trusted_proxies(&[c("198.51.100.1/32")])
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let mut hop = b.door(ip("198.51.100.1")).unwrap();
     let mut inside = hop.request(RequestId(1)).unwrap();
@@ -257,7 +257,7 @@ fn test_revoke_allowlisted_source_refused_for_automation_only() {
     let b = Bouncer::builder()
         .allow(AllowList::new().immune(c("10.0.0.0/8"), "infra"))
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let r = b.apply(Directive::revoke(c("10.1.0.0/16")).by(Actor::Policy(1)));
     assert!(matches!(r, Err(BouncerError::AllowListed { .. })));
@@ -311,7 +311,7 @@ fn test_bind_after_revoke_and_ban_checks() {
         conn.request(RequestId(2)).err(),
         Some(BouncerError::Revoked)
     );
-    b.ban(BanSpec::key(AccountKey(8))).unwrap();
+    b.ban(AccountKey(8)).unwrap();
     let conn2 = b.door(ip("192.0.2.2")).unwrap();
     let mut r2 = conn2.request(RequestId(2)).unwrap();
     assert_eq!(
@@ -326,10 +326,10 @@ fn test_bind_fingerprint_compound_ban() {
     let b = plain();
     let fp = FingerprintKey::from_digest([6; 16]);
     assert_eq!(
-        b.ban(BanSpec::key(fp).by(Actor::Local)).err(),
+        b.apply(Directive::ban(fp).by(Actor::Local)).err(),
         Some(BouncerError::InvalidTarget)
     );
-    b.ban(BanSpec::key(BanKey::FingerprintIn(fp, c("203.0.113.0/24"))).by(Actor::Local))
+    b.apply(Directive::ban(BanKey::FingerprintIn(fp, c("203.0.113.0/24"))).by(Actor::Local))
         .unwrap();
     let mut inside = b.door(ip("203.0.113.9")).unwrap();
     assert!(inside.bind_fingerprint(fp).is_deny());
@@ -347,7 +347,7 @@ fn test_tags_request_egress_release() {
     // Edge cases 27 and 28.
     let b = plain();
     let conn = b.door(ip("192.0.2.1")).unwrap();
-    let id = conn.conn();
+    let id = conn.connection();
     let tag = conn.into_tag();
     let mut req = b.request(tag, RequestId(1)).unwrap();
     assert!(b.egress(tag).is_pass());
@@ -380,7 +380,7 @@ fn test_egress_after_revoke_writes_only_denial() {
     for round in 0..50u64 {
         let b = Arc::new(plain());
         let conn = b.door(ip("192.0.2.1")).unwrap();
-        let id = conn.conn();
+        let id = conn.connection();
         let tag = conn.into_tag();
         let written = Arc::new(AtomicU64::new(0));
         let writer = {
@@ -506,20 +506,25 @@ fn test_no_checkpoint_after_revoke_returned_passes() {
 
 #[test]
 fn test_revocation_table_full_still_reaches_live_tickets() {
-    // Edge case 35, threat T-13.
+    // Edge case 35, threat T-13. A full table first gives back what no live
+    // ticket needs (F-6); here a proxied request still waiting for its
+    // client needs every entry born after it, so the table stays full.
     let b = Bouncer::builder()
         .revocation_capacity(4)
         .budgets(Budgets::off())
-        .try_build()
+        .trusted_proxies(&[c("10.0.0.1/32")])
+        .build()
         .unwrap();
+    let hop = b.door(ip("10.0.0.1")).unwrap();
+    let _pending = hop.request(RequestId(77)).unwrap();
     for i in 0..4u64 {
-        b.revoke(ConnId(900 + i), Reason::ADMIN).unwrap();
+        b.revoke(ConnectionId(900 + i), Reason::ADMIN).unwrap();
     }
     let conn = b.door(ip("192.0.2.1")).unwrap();
     let mut r = conn.request(RequestId(1)).unwrap();
     let mut err = None;
     for i in 4..64u64 {
-        if let Err(e) = b.revoke(ConnId(900 + i), Reason::ADMIN) {
+        if let Err(e) = b.revoke(ConnectionId(900 + i), Reason::ADMIN) {
             err = Some(e);
             break;
         }
@@ -529,7 +534,7 @@ fn test_revocation_table_full_still_reaches_live_tickets() {
         "{err:?}"
     );
     assert!(matches!(
-        b.revoke(conn.conn(), Reason::ADMIN),
+        b.revoke(conn.connection(), Reason::ADMIN),
         Err(BouncerError::RevocationTableFull { .. })
     ));
     assert!(
@@ -545,13 +550,15 @@ fn test_eject_now_closes_idle_connections() {
     let b = Bouncer::builder()
         .ejector(kills.clone())
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let idle = b.door(ip("192.0.2.1")).unwrap();
     let other = b.door(ip("192.0.2.2")).unwrap();
-    let r = b.apply(Directive::revoke(idle.conn()).eject_now()).unwrap();
+    let r = b
+        .apply(Directive::revoke(idle.connection()).eject_now())
+        .unwrap();
     assert_eq!(r.revocation.unwrap().matched_live, Some(1));
-    assert_eq!(*kills.0.lock().unwrap(), vec![idle.conn()]);
+    assert_eq!(*kills.0.lock().unwrap(), vec![idle.connection()]);
     drop(other);
 }
 
@@ -567,7 +574,7 @@ fn test_idle_ticket_checked_on_its_behalf_and_reported() {
         .event_sink(events.clone())
         .max_unchecked(Duration::from_secs(30))
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let ws = b.door(ip("192.0.2.1")).unwrap(); // a parked WebSocket: never checks
     let s = SessionKey::from_digest([9; 16]);
@@ -580,7 +587,7 @@ fn test_idle_ticket_checked_on_its_behalf_and_reported() {
     clock.advance(Duration::from_secs(31));
     let second = b.maintain(b.now());
     assert!(second.idle_checked >= 1);
-    assert_eq!(*kills.0.lock().unwrap(), vec![ws.conn()]);
+    assert_eq!(*kills.0.lock().unwrap(), vec![ws.connection()]);
     assert!(events.count(signals::CHECKPOINT_MISSING.id) >= 1);
     assert!(req.checkpoint().is_deny());
     drop(req);
@@ -598,7 +605,7 @@ fn test_maintainer_thread_parks_and_cleans_up() {
     let b = Bouncer::builder()
         .maintainer(true)
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     b.revoke(AccountKey(1), Reason::ADMIN).unwrap();
     let mut done = false;
@@ -635,7 +642,7 @@ fn test_strikes_observe_by_default_then_enforce() {
     let b = Bouncer::builder()
         .event_sink(events.clone())
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let mut conn = b.door(ip("198.51.100.1")).unwrap();
     let outcomes: Vec<_> = (0..6).map(|_| conn.strike(StrikeKind::Malformed)).collect();
@@ -660,7 +667,7 @@ fn test_strikes_observe_by_default_then_enforce() {
     let b = Bouncer::builder()
         .enforcement(Enforcement::observe_all().enforce(StrikeKind::LoginFailed))
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let mut conn = b.door(ip("198.51.100.2")).unwrap();
     let mut last = conn.strike(StrikeKind::LoginFailed);
@@ -682,7 +689,7 @@ fn test_strike_on_proxy_hop_ignored_and_real_client_struck() {
         .trusted_proxies(&[c("10.0.0.1/32")])
         .enforcement(Enforcement::enforce_all())
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let hop = b.door(ip("10.0.0.1")).unwrap();
     assert_eq!(
@@ -717,7 +724,7 @@ fn test_strike_on_allowlisted_ignored_and_decoy_definitive() {
     let b = Bouncer::builder()
         .allow(AllowList::new().immune(c("10.9.0.0/16"), "infra"))
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let infra = b.door(ip("10.9.1.1")).unwrap();
     assert_eq!(
@@ -742,7 +749,7 @@ fn test_strike_on_allowlisted_ignored_and_decoy_definitive() {
 fn test_apply_low_confidence_ban_becomes_throttle() {
     let b = Bouncer::builder()
         .budgets(Budgets::off().door_rate(Rate::per_second(8).burst(8), Rate::per_second(1000)))
-        .try_build()
+        .build()
         .unwrap();
     let a = b
         .apply(
@@ -793,7 +800,7 @@ fn test_apply_lift_and_invalid_targets() {
     let a = b.apply(Directive::lift(ip("198.51.100.7"))).unwrap();
     assert_eq!(a.lifted.unwrap().removed, 1);
     assert_eq!(
-        b.apply(Directive::lift(ConnId(1))).err(),
+        b.apply(Directive::lift(ConnectionId(1))).err(),
         Some(BouncerError::InvalidTarget)
     );
     // Identity throttles work from 0.5; connections and requests are never
@@ -828,7 +835,7 @@ fn test_door_budgets_rate_and_concurrency() {
                 .door_concurrency(2, 100)
                 .door_rate(Rate::per_second(100), Rate::per_second(1000)),
         )
-        .try_build()
+        .build()
         .unwrap();
     let a = b.door(ip("192.0.2.1")).unwrap();
     let a2 = b.door(ip("192.0.2.1")).unwrap();
@@ -841,7 +848,7 @@ fn test_door_budgets_rate_and_concurrency() {
     drop((a2, a3));
     let rate = Bouncer::builder()
         .budgets(Budgets::off().door_rate(Rate::per_second(1).burst(3), Rate::per_second(1000)))
-        .try_build()
+        .build()
         .unwrap();
     let ok = (0..10)
         .filter(|_| rate.door(ip("192.0.2.2")).is_ok())
@@ -855,7 +862,7 @@ fn test_budget_exempt_and_proxy_hops_not_charged() {
         .allow(AllowList::new().exempt_budgets(c("192.0.2.200/32"), "health checks"))
         .trusted_proxies(&[c("10.0.0.1/32")])
         .budgets(Budgets::off().door_concurrency(1, 100))
-        .try_build()
+        .build()
         .unwrap();
     let held: Vec<_> = (0..5).map(|_| b.door(ip("192.0.2.200")).unwrap()).collect();
     let hops: Vec<_> = (0..5).map(|_| b.door(ip("10.0.0.1")).unwrap()).collect();
@@ -889,12 +896,12 @@ fn test_events_reported_for_actions() {
     let b = Bouncer::builder()
         .event_sink(events.clone())
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     b.ban(ip("198.51.100.8")).unwrap();
     let _ = b.door(ip("198.51.100.8"));
     let tag = b.door(ip("192.0.2.1")).unwrap().into_tag();
-    let conn = ConnId(b.request(tag, RequestId(1)).unwrap().conn().0);
+    let conn = ConnectionId(b.request(tag, RequestId(1)).unwrap().connection().0);
     b.revoke(conn, Reason::ADMIN).unwrap();
     assert!(b.egress(tag).is_deny());
     b.lift(ip("198.51.100.8")).unwrap();
@@ -916,7 +923,7 @@ fn test_shared_epoch_word() {
     let b = Bouncer::builder()
         .epoch(epoch.clone())
         .budgets(Budgets::off())
-        .try_build()
+        .build()
         .unwrap();
     let before = epoch.current();
     b.revoke(AccountKey(1), Reason::ADMIN).unwrap();
@@ -936,13 +943,13 @@ fn test_strike_ban_into_a_full_table_still_denies_and_ejects() {
         .enforcement(Enforcement::enforce_all())
         .event_sink(events.clone())
         .ejector(kills.clone())
-        .try_build()
+        .build()
         .unwrap();
     let mut full = false;
     for i in 0..10_000u32 {
         let a = IpAddr::from((0x0a00_0000 + (i << 8)).to_be_bytes());
         if matches!(
-            b.ban(BanSpec::address(a).permanent()),
+            b.apply(Directive::ban(a).permanent()),
             Err(BouncerError::BanTableFull { .. })
         ) {
             full = true;
@@ -961,7 +968,7 @@ fn test_strike_ban_into_a_full_table_still_denies_and_ejects() {
     );
     assert!(events.count(signals::BAN_TABLE_FULL.id) > before);
     assert!(conn.checkpoint().is_deny(), "denied without the ban");
-    let id = conn.conn();
+    let id = conn.connection();
     let out = conn.deny_and_eject(&mut bouncer_io::Collected::new());
     assert!(out.ejected && !out.remembered);
     assert!(kills.0.lock().unwrap().contains(&id), "and ejected");
@@ -1046,9 +1053,9 @@ fn test_revocation_storm_applies_every_revocation_and_reports_the_excess() {
     // reported in Observe mode.
     let events = Arc::new(Events::default());
     let b = Bouncer::builder()
-        .clock(Arc::new(ManualClock::new()))
+        .clock(ManualClock::new())
         .event_sink(events.clone())
-        .try_build()
+        .build()
         .unwrap();
     let conn = b.door(ip("192.0.2.5")).unwrap();
     for i in 0..10_050u128 {

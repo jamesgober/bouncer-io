@@ -57,7 +57,7 @@ fn main() {
         Bouncer::builder()
             .budgets(Budgets::off())
             .tickets(1024)
-            .try_build()
+            .build()
             .unwrap(),
     );
     let conn = b.door("192.0.2.1".parse().unwrap()).unwrap();
@@ -116,7 +116,7 @@ fn main() {
     let many = Bouncer::builder()
         .budgets(Budgets::off())
         .tickets(4096)
-        .try_build()
+        .build()
         .unwrap();
     let c = many.door("198.51.100.1".parse().unwrap()).unwrap();
     let mut fp_conn = many.door("198.51.100.2".parse().unwrap()).unwrap();

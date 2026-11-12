@@ -47,8 +47,6 @@ pub enum Refusal {
     /// No free ticket: bouncer cannot track the connection, so it refuses.
     /// Never a ban.
     RegistryFull,
-    /// The strict posture refuses this source.
-    Posture,
 }
 
 /// The answer of [`Bouncer::datagram`](crate::Bouncer::datagram).
@@ -87,7 +85,6 @@ impl fmt::Display for Refusal {
             Refusal::RegistryFull => {
                 f.write_str("registry full: raise `tickets` or shed load upstream")
             }
-            Refusal::Posture => f.write_str("refused by the strict posture"),
         }
     }
 }
@@ -265,6 +262,5 @@ mod tests {
             .to_string()
             .contains("5 ms")
         );
-        assert!(Refusal::Posture.to_string().contains("strict"));
     }
 }

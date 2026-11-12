@@ -7,7 +7,7 @@
 
 use std::net::IpAddr;
 
-use bouncer_io::{AllowList, BanSpec, Bouncer, Budgets, Cidr};
+use bouncer_io::{AllowList, Bouncer, Budgets, Cidr, Directive};
 
 /// The allow list both sides of a comparison hold (immune entries).
 pub const ALLOW: [&str; 2] = ["198.18.0.0/15", "fd00::/8"];
@@ -67,7 +67,7 @@ pub fn build(budgets: Budgets, admin_prefixes: usize) -> Fixture {
         .trusted_proxies(&cidrs(&PROXIES))
         .escalation(bouncer_io::EscalationPolicy::default().off())
         .seed([9; 32])
-        .try_build()
+        .build()
         .unwrap();
     let mut m = Mix(1);
     let mut prefixes = Vec::with_capacity(1_010_000);
@@ -87,7 +87,7 @@ pub fn build(budgets: Budgets, admin_prefixes: usize) -> Fixture {
                 IpAddr::from((m.next() as u32 | 0x8000_0000).to_be_bytes())
             };
             let cidr = Cidr::new(addr, len).unwrap();
-            if bouncer.ban(BanSpec::prefix(cidr).permanent()).is_ok() {
+            if bouncer.apply(Directive::ban(cidr).permanent()).is_ok() {
                 prefixes.push(cidr);
                 if banned.len() < 4096 {
                     banned.push(addr);

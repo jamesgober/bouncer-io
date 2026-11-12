@@ -9,8 +9,8 @@ use std::{
 };
 
 use bouncer_io::{
-    Actor, BanKey, BanSpec, Bouncer, Budgets, Cidr, Event, EventSink, Filter, FingerprintKey, Page,
-    Reason, RequestId, SessionKey,
+    Actor, BanKey, Bouncer, Budgets, Cidr, Directive, Event, EventSink, Filter, FingerprintKey,
+    Page, Reason, RequestId, SessionKey,
 };
 
 const SESSION: [u8; 16] = [
@@ -65,7 +65,7 @@ fn test_debug_never_prints_key_bytes() {
         .budgets(Budgets::off())
         .event_sink(sink.clone())
         .seed([3; 32])
-        .try_build()
+        .build()
         .unwrap();
     let session = SessionKey::from_digest(SESSION);
     let fp = FingerprintKey::from_digest(FINGERPRINT);
@@ -84,15 +84,15 @@ fn test_debug_never_prints_key_bytes() {
             BanKey::FingerprintIn(fp, prefix),
             BanKey::FingerprintIn(fp, prefix)
         ),
-        format!("{:?}", BanSpec::key(session)),
+        format!("{:?}", Directive::ban(session)),
     ];
 
     // A refused automated fingerprint ban: the error.
-    let refused = b.ban(BanSpec::key(fp).by(Actor::Local)).unwrap_err();
+    let refused = b.apply(Directive::ban(fp).by(Actor::Local)).unwrap_err();
     shown.push(format!("{refused} {refused:?}"));
 
-    b.ban(BanSpec::key(session)).unwrap();
-    b.ban(BanSpec::key(BanKey::FingerprintIn(fp, prefix)).by(Actor::Local))
+    b.ban(session).unwrap();
+    b.apply(Directive::ban(BanKey::FingerprintIn(fp, prefix)).by(Actor::Local))
         .unwrap();
 
     // Binds that are refused, a revocation in flight, and the tickets.

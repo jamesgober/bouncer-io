@@ -18,7 +18,7 @@ use crate::{
     error::{BouncerError, ConfigError, ConfigProblem},
     events::{self, Emit, EventSink},
     hash::{HashKey, Seeds},
-    keys::{BanKey, Cidr, ConnId, RequestId, normalize},
+    keys::{BanKey, Cidr, ConnectionId, RequestId, normalize},
     maintain::{self, Ejector, Maintenance, MaintenanceReport},
     metrics::{Meters, meter},
     published::Published,
@@ -55,6 +55,8 @@ pub(crate) struct Shared {
     pub(crate) allow: Published<PrefixSet<AllowKind>>,
     /// Entries in the allow list now: the door skips the list when zero.
     pub(crate) allow_len: AtomicU32,
+    /// Serializes `replace_allow` (F-8).
+    pub(crate) allow_writer: std::sync::Mutex<()>,
     /// The latest whole second the door has seen: a clock reading for
     /// coarse uses (shared-address windows) without reading the clock.
     seen_secs: AtomicU64,
@@ -329,7 +331,7 @@ impl Shared {
             };
             let blocked = self.allow.with(|s| s.overlaps(&parent))
                 || self.proxies.overlaps(&parent)
-                || self.sources.any_within(&parent, secs);
+                || self.sources.known_within(&parent);
             if blocked {
                 self.bans.refuse_escalation(&plan, secs);
                 Emit {
@@ -439,7 +441,7 @@ impl Drop for Inner {
 /// let conn = bouncer.door("203.0.113.7".parse()?)?;
 /// let mut request = conn.request(RequestId(1))?;
 /// assert!(request.checkpoint().is_pass());
-/// bouncer.revoke(conn.conn(), Reason::ADMIN)?;               // from any thread
+/// bouncer.revoke(conn.connection(), Reason::ADMIN)?;               // from any thread
 /// assert!(request.checkpoint().is_deny());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -500,8 +502,13 @@ impl Bouncer {
     /// A bouncer with safe defaults: 65,536 tickets, 1,048,576 ban entries,
     /// 65,536 revocation entries, automatic keys at IPv4 /32 and /24 and IPv6
     /// /64, /56, /48, door budgets of 20 connections per second (burst 40)
-    /// and 64 concurrent per address, local heuristics in observe mode, no
-    /// event sink, no ejector, no maintainer thread.
+    /// and 64 concurrent per address, local heuristics in observe mode (they
+    /// report what they would ban and ban nothing until a deployment turns
+    /// enforcement on), shared addresses detected by their accounts, no event
+    /// sink, no ejector, and no maintainer thread (a full revocation table
+    /// reclaims what it can inline). Its tables take about 81 MB, reserved at
+    /// once; [`capacity`](Self::capacity) reports the exact figure, and the
+    /// builder sizes each table.
     ///
     /// # Examples
     ///
@@ -526,7 +533,7 @@ impl Bouncer {
     /// let bouncer = Bouncer::builder()
     ///     .tickets(262_144)
     ///     .trusted_proxies(&["10.0.0.0/8".parse::<Cidr>()?])
-    ///     .try_build()?;
+    ///     .build()?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn builder() -> BouncerBuilder {
@@ -563,7 +570,11 @@ impl Bouncer {
     }
 
     /// The door for transports that number their connections and read the
-    /// time at accept.
+    /// time at accept. `now` must come from [`now`](Self::now) or the same
+    /// clock: ban expiry is judged by it, so a time from another clock (one
+    /// ahead of the bouncer's) would make timed bans look expired. Reading
+    /// the clock once per accept and passing it here saves the door's own
+    /// clock read (about a fifth of its cost).
     ///
     /// # Errors
     ///
@@ -572,17 +583,17 @@ impl Bouncer {
     /// # Examples
     ///
     /// ```
-    /// use bouncer_io::{Bouncer, ConnId, Provenance};
+    /// use bouncer_io::{Bouncer, ConnectionId, Provenance};
     /// let bouncer = Bouncer::new();
     /// let now = bouncer.now();
-    /// let ticket = bouncer.door_at(ConnId(41), "192.0.2.10".parse()?, Provenance::Socket, now)?;
-    /// assert_eq!(ticket.conn(), ConnId(41));
+    /// let ticket = bouncer.door_at(ConnectionId(41), "192.0.2.10".parse()?, Provenance::Socket, now)?;
+    /// assert_eq!(ticket.connection(), ConnectionId(41));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[inline]
     pub fn door_at(
         &self,
-        conn: ConnId,
+        conn: ConnectionId,
         peer: IpAddr,
         provenance: Provenance,
         now: Now,
@@ -592,7 +603,7 @@ impl Bouncer {
 
     fn enter(
         &self,
-        conn: Option<ConnId>,
+        conn: Option<ConnectionId>,
         peer: IpAddr,
         provenance: Provenance,
         now: Now,
@@ -676,7 +687,6 @@ impl Bouncer {
             Refusal::Banned { .. } => meter!(shared.meters, refused_ban),
             Refusal::OverBudget { .. } => meter!(shared.meters, refused_budget),
             Refusal::RegistryFull => meter!(shared.meters, refused_registry_full),
-            Refusal::Posture => meter!(shared.meters, refused_posture),
         }
         if shared.sink.is_none() {
             return;
@@ -688,7 +698,6 @@ impl Bouncer {
                 events::signals::DOOR_REFUSED_REGISTRY_FULL,
                 Reference::new(0),
             ),
-            _ => return,
         };
         let subject = events::Subject {
             source: Some(peer),
@@ -702,11 +711,14 @@ impl Bouncer {
         .send(shared);
     }
 
-    /// Adds a ban. An address or `Cidr` converts directly (timed by the
-    /// duration policy, actor [`Actor::App`](crate::Actor::App)); a
-    /// [`BanSpec`] sets the rest. Takes effect at the next door check on every
-    /// thread; connections already admitted are not touched (use
-    /// [`apply`](Self::apply) with `Directive::revoke_and_ban` for that).
+    /// Bans a key: an address, a [`Cidr`], or an identity key, timed by the
+    /// duration policy, by [`Actor::App`](crate::Actor::App). Takes effect at
+    /// the next door check on every thread; connections already admitted are
+    /// not touched.
+    ///
+    /// For an actor, a reason, a duration, or evidence, send a directive
+    /// instead: `bouncer.apply(Directive::ban(key).for_duration(d).by(actor))`.
+    /// `Directive::revoke_and_ban` also ends what the key has open.
     ///
     /// # Errors
     ///
@@ -725,12 +737,14 @@ impl Bouncer {
     /// assert!(bouncer.door("2001:db8:7:1::9".parse()?).is_err());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn ban(&self, spec: impl Into<BanSpec>) -> Result<BanId, BouncerError> {
-        self.inner.shared.ban(&spec.into(), None)
+    pub fn ban(&self, key: impl Into<BanKey>) -> Result<BanId, BouncerError> {
+        self.inner.shared.ban(&BanSpec::key(key), None)
     }
 
-    /// Removes the bans on exactly this key. A wider prefix ban that covers
-    /// it is not lifted.
+    /// Removes the bans on exactly this key, by
+    /// [`Actor::App`](crate::Actor::App). A wider prefix ban that covers it is
+    /// not lifted. For an actor and a reason, send `Directive::lift(key)` to
+    /// [`apply`](Self::apply).
     ///
     /// # Errors
     ///
@@ -746,9 +760,12 @@ impl Bouncer {
     /// assert!(bouncer.door(addr).is_ok());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn lift(&self, spec: impl Into<LiftSpec>) -> Result<Lifted, BouncerError> {
+    pub fn lift(&self, key: impl Into<BanKey>) -> Result<Lifted, BouncerError> {
+        self.lift_spec(LiftSpec::key(key))
+    }
+
+    fn lift_spec(&self, spec: LiftSpec) -> Result<Lifted, BouncerError> {
         let shared = &self.inner.shared;
-        let spec = spec.into();
         let result = if shared.ledger.is_some() {
             shared.lift_shared(&spec)
         } else {
@@ -841,6 +858,8 @@ impl Bouncer {
                 }
                 Target::Source(c)
             }
+            // A compound ban key; no ticket is revoked by it.
+            Target::FingerprintIn(..) => return Err(BouncerError::InvalidTarget),
             t => t,
         };
         if actor.is_automated() {
@@ -867,7 +886,19 @@ impl Bouncer {
             reason,
         };
         let reference = shared.reference(shared.epoch.next() ^ 0x5eed);
-        let epoch = match shared.revocations.insert(&record, &shared.epoch) {
+        // A full table first gives back what no live ticket needs, so a
+        // bouncer with no maintainer thread does not stay full (F-6).
+        let inserted = shared
+            .revocations
+            .insert(&record, &shared.epoch)
+            .or_else(|()| {
+                if maintain::reclaim_now(shared) > 0 {
+                    shared.revocations.insert(&record, &shared.epoch)
+                } else {
+                    Err(())
+                }
+            });
+        let epoch = match inserted {
             Ok(e) => e,
             Err(()) => {
                 maintain::direct_sweep(shared, &target, code, keep_connection);
@@ -943,6 +974,15 @@ impl Bouncer {
         let mut applied = Applied::default();
         match d.action {
             Action::Throttle { factor, duration } => {
+                // Automation never touches an allow-listed key, a throttle
+                // included (it would have no effect and report success).
+                if let Target::Source(c) = d.target {
+                    if d.actor.is_automated() && self.inner.shared.immune_covers(&c) {
+                        return Err(BouncerError::AllowListed {
+                            key: host_or_prefix(c),
+                        });
+                    }
+                }
                 self.throttle(&d.target, factor, duration)?;
                 applied.throttled = true;
             }
@@ -993,12 +1033,47 @@ impl Bouncer {
                     Target::Account(k) => BanKey::Account(k),
                     Target::Tenant(k) => BanKey::Tenant(k),
                     Target::Fingerprint(k) => BanKey::Fingerprint(k),
+                    Target::FingerprintIn(k, c) => BanKey::FingerprintIn(k, c),
                     _ => return Err(BouncerError::InvalidTarget),
                 };
-                applied.lifted = Some(self.lift(LiftSpec::key(key).by(d.actor).because(d.reason))?);
+                applied.lifted =
+                    Some(self.lift_spec(LiftSpec::key(key).by(d.actor).because(d.reason))?);
             }
         }
         Ok(applied)
+    }
+
+    /// Applies directives in order, as [`apply`](Self::apply) does one by
+    /// one, for bulk loads (a blocklist of thousands of prefixes): the
+    /// administrator prefix set is rebuilt once for the batch instead of once
+    /// per prefix, so loading n prefixes costs one build rather than n. Each
+    /// directive's result is returned in order; a refused one does not stop
+    /// the rest.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Actor, Bouncer, Cidr, Directive, Reason};
+    /// let bouncer = Bouncer::new();
+    /// let blocklist: Vec<Cidr> = (0..64u8)
+    ///     .map(|i| format!("10.{i}.0.0/20").parse())
+    ///     .collect::<Result<_, _>>()?;
+    /// let results = bouncer.apply_all(
+    ///     blocklist
+    ///         .iter()
+    ///         .map(|&c| Directive::ban(c).by(Actor::Admin(1)).because(Reason::POLICY).permanent()),
+    /// );
+    /// assert!(results.iter().all(Result::is_ok));
+    /// assert!(bouncer.door("10.7.1.1".parse()?).is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn apply_all(
+        &self,
+        directives: impl IntoIterator<Item = Directive>,
+    ) -> Vec<Result<Applied, BouncerError>> {
+        crate::bans::batched(&self.inner.shared.bans, || {
+            directives.into_iter().map(|d| self.apply(d)).collect()
+        })
     }
 
     /// Whether `d` would ban a shared address on automation's word alone.
@@ -1036,6 +1111,9 @@ impl Bouncer {
             Target::Account(k) => record(shared.ban(&spec(BanKey::Account(k)), None)),
             Target::Tenant(k) => record(shared.ban(&spec(BanKey::Tenant(k)), None)),
             Target::Fingerprint(k) => record(shared.ban(&spec(BanKey::Fingerprint(k)), None)),
+            Target::FingerprintIn(k, c) => {
+                record(shared.ban(&spec(BanKey::FingerprintIn(k, c)), None))
+            }
             Target::Connection(_) | Target::Request(_) => {
                 let keys = d.ban_keys.unwrap_or(BanKeys::SOURCE);
                 let weak = weak_word(d);
@@ -1146,7 +1224,9 @@ impl Bouncer {
                 let (k0, k1) = k.words();
                 identity(IdentityKind::Fingerprint, k0, k1);
             }
-            Target::Connection(_) | Target::Request(_) => return Err(BouncerError::InvalidTarget),
+            Target::Connection(_) | Target::Request(_) | Target::FingerprintIn(..) => {
+                return Err(BouncerError::InvalidTarget);
+            }
         }
         Ok(())
     }
@@ -1165,7 +1245,7 @@ impl Bouncer {
     /// let bouncer = Bouncer::new();
     /// let tag = bouncer.door("192.0.2.8".parse()?)?.into_tag();
     /// let request = bouncer.request(tag, RequestId(9))?;
-    /// assert_eq!(request.conn(), bouncer.request(tag, RequestId(10))?.conn());
+    /// assert_eq!(request.connection(), bouncer.request(tag, RequestId(10))?.connection());
     /// # drop(request);
     /// bouncer.release(tag);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1188,7 +1268,7 @@ impl Bouncer {
     /// use bouncer_io::{Bouncer, Reason, Verdict};
     /// let bouncer = Bouncer::new();
     /// let ticket = bouncer.door("192.0.2.9".parse()?)?;
-    /// let conn = ticket.conn();
+    /// let conn = ticket.connection();
     /// let tag = ticket.into_tag();                   // the transport keeps only this
     /// assert!(bouncer.egress(tag).is_pass());
     /// bouncer.revoke(conn, Reason::ADMIN)?;
@@ -1309,7 +1389,10 @@ impl Bouncer {
     /// (no concurrency). `verified` says the source has proven it receives
     /// (a completed handshake, a returned cookie). An unverified source is
     /// never struck or banned, and is charged only at its prefix, because a
-    /// UDP source address can be forged to frame a victim.
+    /// UDP source address can be forged to frame a victim. For the same
+    /// reason an unverified source earns no exemption from the allow list,
+    /// and a source inside the trusted proxies is an ordinary source: a
+    /// datagram carries no PROXY header.
     ///
     /// # Examples
     ///
@@ -1324,13 +1407,16 @@ impl Bouncer {
         let shared = &self.inner.shared;
         let source = normalize(source);
         match shared.judge(source, Provenance::Socket, now) {
-            Judgement::ProxyHop => DatagramVerdict::Accept,
             Judgement::Refuse(_) => {
                 meter!(shared.meters, refused_ban);
                 DatagramVerdict::Drop
             }
-            Judgement::Admit { exempt: true, .. } => DatagramVerdict::Accept,
-            Judgement::Admit { .. } => {
+            // An exemption is earned by the address, and a UDP source
+            // address is forgeable until the protocol has verified it (F-5).
+            Judgement::Admit { exempt: true, .. } if verified => DatagramVerdict::Accept,
+            // A trusted proxy hop means nothing for a datagram (no PROXY
+            // header names a client): an ordinary source.
+            Judgement::ProxyHop | Judgement::Admit { .. } => {
                 match shared
                     .budgets
                     .datagram(source, verified, now, shared.door_divisor())
@@ -1354,7 +1440,7 @@ impl Bouncer {
     /// use clock_lib::ManualClock;
     /// use std::{sync::Arc, time::Duration};
     /// let clock = Arc::new(ManualClock::new());
-    /// let bouncer = Bouncer::builder().clock(clock.clone()).try_build()?;
+    /// let bouncer = Bouncer::builder().clock(clock.clone()).build()?;
     /// let start = bouncer.now();
     /// clock.advance(Duration::from_secs(2));
     /// assert_eq!(bouncer.now().as_nanos() - start.as_nanos(), 2_000_000_000);
@@ -1400,7 +1486,7 @@ impl Bouncer {
     /// # Examples
     ///
     /// ```
-    /// let cap = bouncer_io::Bouncer::builder().tickets(1024).ban_capacity(4096).try_build()?.capacity();
+    /// let cap = bouncer_io::Bouncer::builder().tickets(1024).ban_capacity(4096).build()?.capacity();
     /// assert!(cap.tickets >= 1024);
     /// assert_eq!(cap.bans, 4096);
     /// assert!(cap.total_bytes >= cap.table_bytes);
@@ -1468,6 +1554,8 @@ pub struct Capacity {
     pub revocations: u32,
     /// Budget keys per tier.
     pub budget_keys: u32,
+    /// Strike counter slots.
+    pub strike_counters: u32,
     /// Bytes of the dynamic ban table.
     pub table_bytes: u64,
     /// Bytes of every table together (on a node that shares, its ledger of
@@ -1475,7 +1563,7 @@ pub struct Capacity {
     pub total_bytes: u64,
 }
 
-/// Configuration for a [`Bouncer`]. Every setter is optional; `try_build`
+/// Configuration for a [`Bouncer`]. Every setter is optional; `build`
 /// validates everything at once and allocates every table.
 ///
 /// # Examples
@@ -1487,7 +1575,7 @@ pub struct Capacity {
 ///     .durations(DurationPolicy::default().base(Duration::from_secs(900)).max(Duration::from_secs(86_400)))
 ///     .enforcement(Enforcement::observe_all().enforce(StrikeKind::ProxyViolation))
 ///     .ipv6_lengths(&[64, 48])
-///     .try_build()?;
+///     .build()?;
 /// # Ok::<(), bouncer_io::BouncerError>(())
 /// ```
 #[must_use]
@@ -1496,6 +1584,8 @@ pub struct BouncerBuilder {
     shards: Option<u16>,
     ban_capacity: u32,
     revocation_capacity: u32,
+    strike_capacity: u32,
+    shared_addresses: crate::sources::SharedAddresses,
     ipv4_lengths: Vec<u8>,
     ipv6_lengths: Vec<u8>,
     durations: DurationPolicy,
@@ -1535,6 +1625,8 @@ impl Default for BouncerBuilder {
             shards: None,
             ban_capacity: crate::DEFAULT_BAN_CAPACITY,
             revocation_capacity: crate::DEFAULT_REVOCATION_CAPACITY,
+            strike_capacity: crate::DEFAULT_STRIKE_CAPACITY,
+            shared_addresses: crate::sources::SharedAddresses::detect(),
             ipv4_lengths: crate::DEFAULT_IPV4_LENGTHS.to_vec(),
             ipv6_lengths: crate::DEFAULT_IPV6_LENGTHS.to_vec(),
             durations: DurationPolicy::default(),
@@ -1576,6 +1668,8 @@ impl fmt::Debug for BouncerBuilder {
             .field("shards", &self.shards)
             .field("ban_capacity", &self.ban_capacity)
             .field("revocation_capacity", &self.revocation_capacity)
+            .field("strike_capacity", &self.strike_capacity)
+            .field("shared_addresses", &self.shared_addresses)
             .field("ipv4_lengths", &self.ipv4_lengths)
             .field("ipv6_lengths", &self.ipv6_lengths)
             .field("maintainer", &self.maintainer)
@@ -1592,9 +1686,9 @@ impl BouncerBuilder {
     ///
     /// ```
     /// use bouncer_io::Bouncer;
-    /// let bouncer = Bouncer::builder().tickets(1024).try_build()?;
+    /// let bouncer = Bouncer::builder().tickets(1024).build()?;
     /// assert!(bouncer.capacity().tickets >= 1024);
-    /// assert!(Bouncer::builder().tickets(0).try_build().is_err());
+    /// assert!(Bouncer::builder().tickets(0).build().is_err());
     /// # Ok::<(), bouncer_io::BouncerError>(())
     /// ```
     pub fn tickets(mut self, capacity: u32) -> Self {
@@ -1609,10 +1703,10 @@ impl BouncerBuilder {
     ///
     /// ```
     /// use bouncer_io::Bouncer;
-    /// let bouncer = Bouncer::builder().tickets(4096).shards(8).try_build()?;
+    /// let bouncer = Bouncer::builder().tickets(4096).shards(8).build()?;
     /// assert!(bouncer.capacity().tickets >= 4096);
-    /// assert!(Bouncer::builder().shards(0).try_build().is_err());
-    /// assert!(Bouncer::builder().shards(512).try_build().is_err());   // at most 256
+    /// assert!(Bouncer::builder().shards(0).build().is_err());
+    /// assert!(Bouncer::builder().shards(512).build().is_err());   // at most 256
     /// # Ok::<(), bouncer_io::BouncerError>(())
     /// ```
     pub fn shards(mut self, count: u16) -> Self {
@@ -1626,9 +1720,9 @@ impl BouncerBuilder {
     ///
     /// ```
     /// use bouncer_io::Bouncer;
-    /// let bouncer = Bouncer::builder().ban_capacity(4096).try_build()?;
+    /// let bouncer = Bouncer::builder().ban_capacity(4096).build()?;
     /// assert_eq!(bouncer.capacity().bans, 4096);
-    /// assert!(Bouncer::builder().ban_capacity(0).try_build().is_err());
+    /// assert!(Bouncer::builder().ban_capacity(0).build().is_err());
     /// # Ok::<(), bouncer_io::BouncerError>(())
     /// ```
     pub fn ban_capacity(mut self, entries: u32) -> Self {
@@ -1642,13 +1736,51 @@ impl BouncerBuilder {
     ///
     /// ```
     /// use bouncer_io::Bouncer;
-    /// let bouncer = Bouncer::builder().revocation_capacity(1024).try_build()?;
+    /// let bouncer = Bouncer::builder().revocation_capacity(1024).build()?;
     /// assert!(bouncer.capacity().revocations >= 1024);
-    /// assert!(Bouncer::builder().revocation_capacity(0).try_build().is_err());
+    /// assert!(Bouncer::builder().revocation_capacity(0).build().is_err());
     /// # Ok::<(), bouncer_io::BouncerError>(())
     /// ```
     pub fn revocation_capacity(mut self, entries: u32) -> Self {
         self.revocation_capacity = entries;
+        self
+    }
+
+    /// Strike counter slots (default 262,144, 16 bytes each). Every source,
+    /// prefix, session, and account with a strike in its window holds one;
+    /// when a probe path is full, the counter with the fewest strikes gives
+    /// up its slot, so a flood of new keys never switches strikes off.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::Bouncer;
+    /// let bouncer = Bouncer::builder().strike_capacity(1 << 20).build()?;
+    /// assert!(bouncer.capacity().strike_counters >= 1 << 20);
+    /// assert!(Bouncer::builder().strike_capacity(0).build().is_err());
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
+    pub fn strike_capacity(mut self, entries: u32) -> Self {
+        self.strike_capacity = entries;
+        self
+    }
+
+    /// Which addresses are shared by many people (default
+    /// [`SharedAddresses::detect`](crate::SharedAddresses::detect)): see [`SharedAddresses`](crate::SharedAddresses) for what a
+    /// shared address changes and the ceilings it keeps.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, SharedAddresses};
+    /// let bouncer = Bouncer::builder()
+    ///     .shared_addresses(SharedAddresses::off())
+    ///     .build()?;
+    /// # let _ = bouncer;
+    /// # Ok::<(), bouncer_io::BouncerError>(())
+    /// ```
+    pub fn shared_addresses(mut self, policy: crate::sources::SharedAddresses) -> Self {
+        self.shared_addresses = policy;
         self
     }
 
@@ -1657,12 +1789,12 @@ impl BouncerBuilder {
     /// # Examples
     ///
     /// ```
-    /// use bouncer_io::{Actor, BanSpec, Bouncer, Cidr};
+    /// use bouncer_io::{Actor, Bouncer, Cidr, Directive};
     /// let wide: Cidr = "198.51.0.0/16".parse()?;
-    /// let bouncer = Bouncer::builder().ipv4_lengths(&[32, 24, 16]).try_build()?;
-    /// assert!(bouncer.ban(BanSpec::prefix(wide).by(Actor::Local)).is_ok());
-    /// assert!(Bouncer::new().ban(BanSpec::prefix(wide).by(Actor::Local)).is_err());   // not automatic by default
-    /// assert!(Bouncer::builder().ipv4_lengths(&[24]).try_build().is_err());            // 32 is required
+    /// let bouncer = Bouncer::builder().ipv4_lengths(&[32, 24, 16]).build()?;
+    /// assert!(bouncer.apply(Directive::ban(wide).by(Actor::Local)).is_ok());
+    /// assert!(Bouncer::new().apply(Directive::ban(wide).by(Actor::Local)).is_err());   // not automatic by default
+    /// assert!(Bouncer::builder().ipv4_lengths(&[24]).build().is_err());            // 32 is required
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn ipv4_lengths(mut self, lengths: &[u8]) -> Self {
@@ -1676,12 +1808,12 @@ impl BouncerBuilder {
     /// # Examples
     ///
     /// ```
-    /// use bouncer_io::{Actor, BanSpec, Bouncer, Cidr};
+    /// use bouncer_io::{Actor, Bouncer, Cidr, Directive};
     /// let wide: Cidr = "2001:db8::/32".parse()?;
-    /// let bouncer = Bouncer::builder().ipv6_lengths(&[64, 48, 32]).try_build()?;
-    /// assert!(bouncer.ban(BanSpec::prefix(wide).by(Actor::Local)).is_ok());
-    /// assert!(Bouncer::new().ban(BanSpec::prefix(wide).by(Actor::Local)).is_err());   // not automatic by default
-    /// assert!(Bouncer::builder().ipv6_lengths(&[128]).try_build().is_err());
+    /// let bouncer = Bouncer::builder().ipv6_lengths(&[64, 48, 32]).build()?;
+    /// assert!(bouncer.apply(Directive::ban(wide).by(Actor::Local)).is_ok());
+    /// assert!(Bouncer::new().apply(Directive::ban(wide).by(Actor::Local)).is_err());   // not automatic by default
+    /// assert!(Bouncer::builder().ipv6_lengths(&[128]).build().is_err());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn ipv6_lengths(mut self, lengths: &[u8]) -> Self {
@@ -1697,7 +1829,7 @@ impl BouncerBuilder {
     /// use bouncer_io::{Bouncer, DurationPolicy};
     /// use std::time::Duration;
     /// let policy = DurationPolicy::default().base(Duration::from_secs(900)).jitter(Duration::ZERO);
-    /// let bouncer = Bouncer::builder().durations(policy).try_build()?;
+    /// let bouncer = Bouncer::builder().durations(policy).build()?;
     /// let addr: std::net::IpAddr = "198.51.100.9".parse()?;
     /// bouncer.ban(addr)?;
     /// let ban = &bouncer.explain(addr).bans[0];
@@ -1715,7 +1847,7 @@ impl BouncerBuilder {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, EscalationPolicy};
-    /// let bouncer = Bouncer::builder().escalation(EscalationPolicy::default().off()).try_build()?;
+    /// let bouncer = Bouncer::builder().escalation(EscalationPolicy::default().off()).build()?;
     /// for i in 1..=16u8 {
     ///     bouncer.ban(std::net::IpAddr::from([198, 51, 100, i]))?;
     /// }
@@ -1735,7 +1867,7 @@ impl BouncerBuilder {
     /// use bouncer_io::{AllowKind, AllowList, Bouncer};
     /// let bouncer = Bouncer::builder()
     ///     .allow(AllowList::new().exempt_budgets("192.0.2.200".parse()?, "health checks"))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let checker: std::net::IpAddr = "192.0.2.200".parse()?;
     /// assert_eq!(bouncer.explain(checker).allow, Some(AllowKind::ExemptBudgets));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1752,7 +1884,7 @@ impl BouncerBuilder {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, BouncerError, Cidr};
-    /// let bouncer = Bouncer::builder().trusted_proxies(&["10.0.0.0/8".parse::<Cidr>()?]).try_build()?;
+    /// let bouncer = Bouncer::builder().trusted_proxies(&["10.0.0.0/8".parse::<Cidr>()?]).build()?;
     /// let proxy: std::net::IpAddr = "10.1.2.3".parse()?;
     /// assert_eq!(bouncer.ban(proxy).err(), Some(BouncerError::TrustedProxyTarget));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1768,7 +1900,7 @@ impl BouncerBuilder {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, Budgets, Refusal};
-    /// let bouncer = Bouncer::builder().budgets(Budgets::default().door_concurrency(1, 512)).try_build()?;
+    /// let bouncer = Bouncer::builder().budgets(Budgets::default().door_concurrency(1, 512)).build()?;
     /// let peer = "192.0.2.30".parse()?;
     /// let first = bouncer.door(peer)?;
     /// assert!(matches!(bouncer.door(peer), Err(Refusal::OverBudget { .. })));
@@ -1791,7 +1923,7 @@ impl BouncerBuilder {
     /// let bouncer = Bouncer::builder()
     ///     .strikes(StrikeRules::default().rule(StrikeKind::LoginFailed, 1, 2, Duration::from_secs(300)))
     ///     .enforcement(Enforcement::enforce_all())
-    ///     .try_build()?;
+    ///     .build()?;
     /// let conn = bouncer.door("198.51.100.70".parse()?)?;
     /// assert_eq!(conn.strike(StrikeKind::LoginFailed), StrikeOutcome::Counted);
     /// assert!(matches!(conn.strike(StrikeKind::LoginFailed), StrikeOutcome::Banned(_)));   // the second
@@ -1810,7 +1942,7 @@ impl BouncerBuilder {
     /// use bouncer_io::{Bouncer, Enforcement, StrikeKind, StrikeOutcome};
     /// let bouncer = Bouncer::builder()
     ///     .enforcement(Enforcement::observe_all().enforce(StrikeKind::Malformed))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let conn = bouncer.door("198.51.100.71".parse()?)?;
     /// let outcomes: Vec<StrikeOutcome> = (0..5).map(|_| conn.strike(StrikeKind::Malformed)).collect();
     /// assert!(matches!(outcomes[4], StrikeOutcome::Banned(_)));        // enforced at the default threshold
@@ -1830,7 +1962,7 @@ impl BouncerBuilder {
     /// use bouncer_io::{Bouncer, DenialCode, DenialTable, Reason, RequestId};
     /// let bouncer = Bouncer::builder()
     ///     .denials(DenialTable::new().message(DenialCode::Forbidden, "Request refused.").app_code(DenialCode::Forbidden, 4031))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let conn = bouncer.door("192.0.2.60".parse()?)?;
     /// let mut request = conn.request(RequestId(1))?;
     /// bouncer.revoke(RequestId(1), Reason::ADMIN)?;
@@ -1862,14 +1994,14 @@ impl BouncerBuilder {
     ///     }
     /// }
     /// let refusals = Arc::new(Refusals::default());
-    /// let bouncer = Bouncer::builder().event_sink(refusals.clone()).try_build()?;
+    /// let bouncer = Bouncer::builder().event_sink(refusals.clone()).build()?;
     /// bouncer.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
     /// assert!(bouncer.door("198.51.100.9".parse()?).is_err());
     /// assert_eq!(refusals.0.load(Ordering::Relaxed), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
-        self.sink = Some(sink);
+    pub fn event_sink(mut self, sink: impl EventSink + 'static) -> Self {
+        self.sink = Some(Arc::new(sink));
         self
     }
 
@@ -1879,25 +2011,25 @@ impl BouncerBuilder {
     /// # Examples
     ///
     /// ```
-    /// use bouncer_io::{Bouncer, CloseKind, Collected, ConnId, Ejector};
+    /// use bouncer_io::{Bouncer, CloseKind, Collected, ConnectionId, Ejector};
     /// use std::sync::{Arc, Mutex};
     ///
     /// #[derive(Default)]
-    /// struct Kills(Mutex<Vec<ConnId>>);
+    /// struct Kills(Mutex<Vec<ConnectionId>>);
     /// impl Ejector for Kills {
-    ///     fn eject(&self, conn: ConnId, _kind: CloseKind) {
+    ///     fn eject(&self, conn: ConnectionId, _kind: CloseKind) {
     ///         self.0.lock().unwrap().push(conn);
     ///     }
     /// }
     /// let kills = Arc::new(Kills::default());
-    /// let bouncer = Bouncer::builder().ejector(kills.clone()).try_build()?;
+    /// let bouncer = Bouncer::builder().ejector(kills.clone()).build()?;
     /// let mut conn = bouncer.door("192.0.2.70".parse()?)?;
     /// let _ = conn.deny_and_eject(&mut Collected::new());
-    /// assert_eq!(*kills.0.lock().unwrap(), vec![conn.conn()]);
+    /// assert_eq!(*kills.0.lock().unwrap(), vec![conn.connection()]);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn ejector(mut self, ejector: Arc<dyn Ejector>) -> Self {
-        self.ejector = Some(ejector);
+    pub fn ejector(mut self, ejector: impl Ejector + 'static) -> Self {
+        self.ejector = Some(Arc::new(ejector));
         self
     }
 
@@ -1916,15 +2048,15 @@ impl BouncerBuilder {
     ///         out.extend_from_slice(d.message.as_bytes()).map_err(|_| FormatError::TooLarge)
     ///     }
     /// }
-    /// let bouncer = Bouncer::builder().denial_format(Arc::new(Plain)).try_build()?;
+    /// let bouncer = Bouncer::builder().denial_format(Plain).build()?;
     /// let mut conn = bouncer.door("192.0.2.71".parse()?)?;
     /// let mut reply = Collected::new();
     /// assert!(conn.deny_and_eject(&mut reply).formatted);
     /// assert_eq!(reply.as_slice(), b"Forbidden.");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn denial_format(mut self, format: Arc<dyn crate::format::DenialFormat>) -> Self {
-        self.format = Some(format);
+    pub fn denial_format(mut self, format: impl crate::format::DenialFormat + 'static) -> Self {
+        self.format = Some(Arc::new(format));
         self
     }
 
@@ -1936,7 +2068,7 @@ impl BouncerBuilder {
     /// use bouncer_io::{AccountKey, Bouncer, Reason, RevocationEpoch};
     /// use std::sync::Arc;
     /// let epoch = Arc::new(RevocationEpoch::new());
-    /// let bouncer = Bouncer::builder().epoch(epoch.clone()).try_build()?;
+    /// let bouncer = Bouncer::builder().epoch(epoch.clone()).build()?;
     /// bouncer.revoke(AccountKey(7), Reason::ADMIN)?;
     /// assert_eq!(epoch.current(), 1);   // the bouncer moved the shared word
     /// # Ok::<(), bouncer_io::BouncerError>(())
@@ -1955,15 +2087,15 @@ impl BouncerBuilder {
     /// use clock_lib::ManualClock;
     /// use std::{sync::Arc, time::Duration};
     /// let clock = Arc::new(ManualClock::new());
-    /// let bouncer = Bouncer::builder().clock(clock.clone()).try_build()?;
+    /// let bouncer = Bouncer::builder().clock(clock.clone()).build()?;
     /// let addr: std::net::IpAddr = "198.51.100.9".parse()?;
     /// bouncer.ban(addr)?;                                  // 10 minutes, plus up to 1 minute of jitter
     /// clock.advance(Duration::from_secs(11 * 60 + 1));
     /// assert!(bouncer.door(addr).is_ok());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = Some(clock);
+    pub fn clock(mut self, clock: impl Clock + 'static) -> Self {
+        self.clock = Some(Arc::new(clock));
         self
     }
 
@@ -1975,7 +2107,7 @@ impl BouncerBuilder {
     /// ```
     /// use bouncer_io::{Bouncer, Refusal};
     /// let refused = || -> Result<Refusal, Box<dyn std::error::Error>> {
-    ///     let bouncer = Bouncer::builder().seed([9; 32]).try_build()?;
+    ///     let bouncer = Bouncer::builder().seed([9; 32]).build()?;
     ///     bouncer.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
     ///     Ok(bouncer.door("198.51.100.9".parse()?).err().ok_or("admitted")?)
     /// };
@@ -2000,13 +2132,13 @@ impl BouncerBuilder {
     /// use clock_lib::ManualClock;
     /// use std::{sync::Arc, time::Duration};
     /// let clock = Arc::new(ManualClock::new());
-    /// let bouncer = Bouncer::builder().clock(clock.clone()).max_unchecked(Duration::from_secs(5)).try_build()?;
+    /// let bouncer = Bouncer::builder().clock(clock.clone()).max_unchecked(Duration::from_secs(5)).build()?;
     /// let conn = bouncer.door("192.0.2.40".parse()?)?;    // never crosses a checkpoint
-    /// bouncer.revoke(conn.conn(), Reason::ADMIN)?;
+    /// bouncer.revoke(conn.connection(), Reason::ADMIN)?;
     /// assert_eq!(bouncer.maintain(bouncer.now()).idle_checked, 0);   // not idle long enough yet
     /// clock.advance(Duration::from_secs(6));
     /// assert_eq!(bouncer.maintain(bouncer.now()).idle_checked, 1);
-    /// assert!(Bouncer::builder().max_unchecked(Duration::ZERO).try_build().is_err());
+    /// assert!(Bouncer::builder().max_unchecked(Duration::ZERO).build().is_err());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn max_unchecked(mut self, idle: Duration) -> Self {
@@ -2021,7 +2153,7 @@ impl BouncerBuilder {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, MaintainerState};
-    /// let bouncer = Bouncer::builder().maintainer(true).try_build()?;
+    /// let bouncer = Bouncer::builder().maintainer(true).build()?;
     /// assert_ne!(bouncer.health().maintainer, MaintainerState::NotStarted);
     /// assert_eq!(Bouncer::new().health().maintainer, MaintainerState::NotStarted);
     /// # Ok::<(), bouncer_io::BouncerError>(())
@@ -2051,12 +2183,12 @@ impl BouncerBuilder {
     ///     }
     /// }
     /// let storms = Arc::new(Storms::default());
-    /// let bouncer = Bouncer::builder().revocation_rate_limit(1).event_sink(storms.clone()).try_build()?;
+    /// let bouncer = Bouncer::builder().revocation_rate_limit(1).event_sink(storms.clone()).build()?;
     /// for account in 1..=3u128 {
     ///     bouncer.apply(Directive::revoke(AccountKey(account)).by(Actor::Policy(1)))?;   // each still applies
     /// }
     /// assert!(storms.0.load(Ordering::Relaxed) >= 1);    // the excess is reported
-    /// assert!(Bouncer::builder().revocation_rate_limit(0).try_build().is_err());
+    /// assert!(Bouncer::builder().revocation_rate_limit(0).build().is_err());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn revocation_rate_limit(mut self, per_second: u32) -> Self {
@@ -2065,7 +2197,7 @@ impl BouncerBuilder {
     }
 
     /// Where bans, lift tombstones, and offender memory survive restarts.
-    /// State is loaded in `try_build`, before the first door check.
+    /// State is loaded in `build`, before the first door check.
     ///
     /// # Examples
     ///
@@ -2092,16 +2224,16 @@ impl BouncerBuilder {
     /// let store = Store::default();                        // an in-memory store kept across the restart
     /// let addr: std::net::IpAddr = "198.51.100.9".parse()?;
     /// {
-    ///     let before = Bouncer::builder().persistence(Box::new(store.clone())).try_build()?;
+    ///     let before = Bouncer::builder().persistence(store.clone()).build()?;
     ///     before.ban(addr)?;
     ///     before.flush()?;
     /// }
-    /// let after = Bouncer::builder().persistence(Box::new(store.clone())).try_build()?;
+    /// let after = Bouncer::builder().persistence(store.clone()).build()?;
     /// assert!(after.door(addr).is_err());                  // the ban survived
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn persistence(mut self, store: Box<dyn crate::persist::Persistence>) -> Self {
-        self.persistence = Some(store);
+    pub fn persistence(mut self, store: impl crate::persist::Persistence + 'static) -> Self {
+        self.persistence = Some(Box::new(store));
         self
     }
 
@@ -2131,7 +2263,7 @@ impl BouncerBuilder {
     /// # }
     /// use bouncer_io::{Bouncer, BouncerError, PersistError};
     /// let store = Store::default();                        // an in-memory store kept across restarts
-    /// let open = |key: [u8; 32]| Bouncer::builder().persistence(Box::new(store.clone())).mac_key(key).try_build();
+    /// let open = |key: [u8; 32]| Bouncer::builder().persistence(store.clone()).mac_key(key).build();
     /// open([7; 32])?.ban("198.51.100.9".parse::<std::net::IpAddr>()?)?;
     /// assert!(open([7; 32])?.door("198.51.100.9".parse()?).is_err());
     /// assert!(matches!(open([8; 32]), Err(BouncerError::Persist(PersistError::Mac))));
@@ -2173,9 +2305,9 @@ impl BouncerBuilder {
     /// let anchor = std::env::temp_dir().join(format!("bouncer-io-doc-version-{}", std::process::id()));
     /// let store = Store::default();                        // an in-memory store kept across restarts
     /// let open = || Bouncer::builder()
-    ///     .persistence(Box::new(store.clone()))
-    ///     .version_anchor(Box::new(FileAnchor::open(&anchor)))
-    ///     .try_build();
+    ///     .persistence(store.clone())
+    ///     .version_anchor(FileAnchor::open(&anchor))
+    ///     .build();
     /// let addr: std::net::IpAddr = "198.51.100.9".parse()?;
     /// open()?.ban(addr)?;
     /// let backup = store.0.lock().unwrap().clone();
@@ -2185,8 +2317,8 @@ impl BouncerBuilder {
     /// # std::fs::remove_file(&anchor).ok();
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn version_anchor(mut self, anchor: Box<dyn crate::persist::VersionAnchor>) -> Self {
-        self.version_anchor = Some(anchor);
+    pub fn version_anchor(mut self, anchor: impl crate::persist::VersionAnchor + 'static) -> Self {
+        self.version_anchor = Some(Box::new(anchor));
         self
     }
 
@@ -2206,7 +2338,7 @@ impl BouncerBuilder {
     /// #     fn replace_snapshot(&mut self, _: &[u8]) -> Result<(), PersistError> { Ok(()) }
     /// # }
     /// use bouncer_io::{Bouncer, LoadFailure};
-    /// let open = |policy: LoadFailure| Bouncer::builder().persistence(Box::new(Damaged)).on_load_failure(policy).try_build();
+    /// let open = |policy: LoadFailure| Bouncer::builder().persistence(Damaged).on_load_failure(policy).build();
     /// assert!(open(LoadFailure::Refuse).is_err());       // the default: no start without the bans
     /// assert!(open(LoadFailure::LoadEmpty).is_ok());     // starts empty and reports it
     /// ```
@@ -2252,8 +2384,8 @@ impl BouncerBuilder {
     /// use std::{sync::Arc, time::Duration};
     /// let clock = Arc::new(ManualClock::new());
     /// let open = |store: &Store, jump: Duration, sink: Arc<Jumps>| {
-    ///     Bouncer::builder().persistence(Box::new(store.clone())).clock(clock.clone())
-    ///         .max_wall_jump(jump).event_sink(sink).try_build()
+    ///     Bouncer::builder().persistence(store.clone()).clock(clock.clone())
+    ///         .max_wall_jump(jump).event_sink(sink).build()
     /// };
     /// let (a, b) = (Store::default(), Store::default());
     /// for store in [&a, &b] {
@@ -2297,17 +2429,17 @@ impl BouncerBuilder {
     /// #         Ok(())
     /// #     }
     /// # }
-    /// use bouncer_io::{BanSpec, Bouncer};
+    /// use bouncer_io::{Bouncer, Directive};
     /// use clock_lib::ManualClock;
     /// use std::{sync::Arc, time::Duration};
     /// let clock = Arc::new(ManualClock::new());
     /// let addr: std::net::IpAddr = "203.0.113.5".parse()?;
     /// let open = |store: &Store, keep: bool| {
-    ///     Bouncer::builder().persistence(Box::new(store.clone())).clock(clock.clone()).strict_wall_jump(keep).try_build()
+    ///     Bouncer::builder().persistence(store.clone()).clock(clock.clone()).strict_wall_jump(keep).build()
     /// };
     /// let (kept, expired) = (Store::default(), Store::default());
     /// for store in [&kept, &expired] {
-    ///     open(store, false)?.ban(BanSpec::address(addr).for_duration(Duration::from_secs(3600)))?;
+    ///     open(store, false)?.apply(Directive::ban(addr).for_duration(Duration::from_secs(3600)))?;
     /// }
     /// clock.step_wall_forward(Duration::from_secs(86_400));          // a day passes while stopped
     /// assert!(open(&kept, true)?.door(addr).is_err());
@@ -2330,12 +2462,12 @@ impl BouncerBuilder {
     /// use std::{sync::Arc, time::Duration};
     /// let ahead = Arc::new(ManualClock::new());
     /// ahead.step_wall_forward(Duration::from_secs(600));          // ten minutes fast
-    /// let sender = Bouncer::builder().node(NodeId(2)).clock(ahead).try_build()?;
+    /// let sender = Bouncer::builder().node(NodeId(2)).clock(ahead).build()?;
     /// sender.ban("198.51.100.67".parse::<std::net::IpAddr>()?)?;
     /// let delta = sender.export_delta(Sequence::START)?;
-    /// let default = Bouncer::builder().node(NodeId(1)).try_build()?;
+    /// let default = Bouncer::builder().node(NodeId(1)).build()?;
     /// assert!(default.import(&delta, Actor::Channel(2))?.rejected >= 1);
-    /// let lenient = Bouncer::builder().node(NodeId(1)).max_clock_skew(Duration::from_secs(900)).try_build()?;
+    /// let lenient = Bouncer::builder().node(NodeId(1)).max_clock_skew(Duration::from_secs(900)).build()?;
     /// assert_eq!(lenient.import(&delta, Actor::Channel(2))?.rejected, 0);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -2345,16 +2477,16 @@ impl BouncerBuilder {
     }
 
     /// This node's id, stamped on every record it exports; required for
-    /// `export_delta`. 0 is refused at `try_build`.
+    /// `export_delta`. 0 is refused at `build`.
     ///
     /// # Examples
     ///
     /// ```
     /// use bouncer_io::{Bouncer, BouncerError, NodeId, Sequence};
-    /// let bouncer = Bouncer::builder().node(NodeId(1)).try_build()?;
+    /// let bouncer = Bouncer::builder().node(NodeId(1)).build()?;
     /// assert!(bouncer.export_delta(Sequence::START).is_ok());
     /// assert_eq!(Bouncer::new().export_delta(Sequence::START).err(), Some(BouncerError::NodeIdUnset));
-    /// assert!(Bouncer::builder().node(NodeId(0)).try_build().is_err());
+    /// assert!(Bouncer::builder().node(NodeId(0)).build().is_err());
     /// # Ok::<(), BouncerError>(())
     /// ```
     pub fn node(mut self, id: NodeId) -> Self {
@@ -2364,7 +2496,7 @@ impl BouncerBuilder {
 
     /// How much [`Posture::Strict`] divides the door budgets by (default 2):
     /// each admission costs that many tokens and the concurrency limits
-    /// shrink by it. Zero is refused at `try_build`.
+    /// shrink by it. Zero is refused at `build`.
     ///
     /// # Examples
     ///
@@ -2373,13 +2505,13 @@ impl BouncerBuilder {
     /// let bouncer = Bouncer::builder()
     ///     .budgets(Budgets::default().door_concurrency(4, 512))
     ///     .strict_budget_divisor(4)
-    ///     .try_build()?;
+    ///     .build()?;
     /// bouncer.set_posture(Posture::Strict);
     /// let peer = "192.0.2.80".parse()?;
     /// let first = bouncer.door(peer)?;
     /// assert!(bouncer.door(peer).is_err());                // 4 / 4: one connection per address
     /// # drop(first);
-    /// assert!(Bouncer::builder().strict_budget_divisor(0).try_build().is_err());
+    /// assert!(Bouncer::builder().strict_budget_divisor(0).build().is_err());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn strict_budget_divisor(mut self, divisor: u8) -> Self {
@@ -2394,7 +2526,7 @@ impl BouncerBuilder {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, Posture, RequestId, SessionKey};
-    /// let bouncer = Bouncer::builder().strict_revokes_unauthenticated(true).try_build()?;
+    /// let bouncer = Bouncer::builder().strict_revokes_unauthenticated(true).build()?;
     /// let conn = bouncer.door("192.0.2.90".parse()?)?;
     /// let mut anonymous = conn.request(RequestId(1))?;
     /// let mut signed_in = conn.request(RequestId(2))?;
@@ -2420,10 +2552,10 @@ impl BouncerBuilder {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, BouncerError, ConfigProblem};
-    /// let err = Bouncer::builder().ipv6_lengths(&[128]).try_build().unwrap_err();
+    /// let err = Bouncer::builder().ipv6_lengths(&[128]).build().unwrap_err();
     /// assert!(matches!(err, BouncerError::Config(e) if e.problem == ConfigProblem::HostBansForbidden));
     /// ```
-    pub fn try_build(self) -> Result<Bouncer, BouncerError> {
+    pub fn build(self) -> Result<Bouncer, BouncerError> {
         check_range(
             "tickets",
             u64::from(self.tickets),
@@ -2441,6 +2573,18 @@ impl BouncerBuilder {
             u64::from(self.revocation_capacity),
             1,
             u64::from(MAX_BAN_CAPACITY),
+        )?;
+        check_range(
+            "strike_capacity",
+            u64::from(self.strike_capacity),
+            1,
+            u64::from(MAX_BAN_CAPACITY),
+        )?;
+        check_range(
+            "shared_addresses",
+            self.shared_addresses.known.len() as u64,
+            0,
+            crate::sources::MAX_KNOWN as u64,
         )?;
         check_range(
             "revocation_rate_limit",
@@ -2463,7 +2607,13 @@ impl BouncerBuilder {
         if self.ipv6_lengths.contains(&128) {
             return Err(ConfigError::new("ipv6_lengths", ConfigProblem::HostBansForbidden).into());
         }
-        if self.ipv6_lengths.is_empty() || self.ipv6_lengths.iter().any(|&l| l > 128) {
+        // An address ban is kept at the client's /64: without it, a host
+        // rotates out of its own ban (longer lengths) or bans its
+        // neighbours (shorter).
+        if self.ipv6_lengths.is_empty()
+            || self.ipv6_lengths.iter().any(|&l| l > 128)
+            || !self.ipv6_lengths.contains(&64)
+        {
             return Err(ConfigError::new("ipv6_lengths", ConfigProblem::InvalidLength).into());
         }
         self.durations.validate("durations")?;
@@ -2568,6 +2718,7 @@ impl BouncerBuilder {
                 seeds.rng,
             ),
             allow_len: AtomicU32::new(allow.len() as u32),
+            allow_writer: std::sync::Mutex::new(()),
             seen_secs: AtomicU64::new(0),
             allow: Published::new(allow),
             proxies,
@@ -2581,12 +2732,13 @@ impl BouncerBuilder {
             sources: crate::sources::Sources::new(
                 self.budgets.capacity_keys().min(65_536),
                 derived(&mut rng),
+                &self.shared_addresses,
             ),
             posture: AtomicU32::new(0),
             strict_divisor: u32::from(self.strict_budget_divisor.max(1)),
             strict_revokes_unauthenticated: self.strict_revokes_unauthenticated,
             strikes: self.strikes.clone(),
-            counters: Counters::new(65_536, derived(&mut rng)),
+            counters: Counters::new(self.strike_capacity, derived(&mut rng)),
             enforcement: self.enforcement,
             denials: self.denials.clone(),
             sink: self.sink.clone(),
@@ -2614,6 +2766,7 @@ impl BouncerBuilder {
             bans: shared.bans.capacity(),
             revocations: shared.revocations.capacity(),
             budget_keys: shared.budgets.capacity(),
+            strike_counters: shared.counters.len() as u32,
             table_bytes: 0,
             total_bytes: 0,
         };
@@ -2675,7 +2828,7 @@ mod tests {
         let b = Bouncer::builder()
             .epoch(Arc::clone(&epoch))
             .budgets(crate::Budgets::off())
-            .try_build()
+            .build()
             .unwrap();
         let conn = b.door("192.0.2.1".parse().unwrap()).unwrap();
         let mut watched = conn.request(crate::RequestId(1)).unwrap();
@@ -2733,7 +2886,7 @@ mod tests {
             ),
         ];
         for (b, field) in cases {
-            match b.try_build() {
+            match b.build() {
                 Err(BouncerError::Config(e)) => assert_eq!(e.field, field),
                 other => panic!("{field}: {other:?}"),
             }
@@ -2741,7 +2894,7 @@ mod tests {
         assert!(matches!(
             Bouncer::builder()
                 .durations(DurationPolicy::default().factor(0))
-                .try_build(),
+                .build(),
             Err(BouncerError::Config(ConfigError {
                 problem: ConfigProblem::InvalidFactor,
                 ..
@@ -2751,7 +2904,7 @@ mod tests {
         assert!(matches!(
             Bouncer::builder()
                 .denials(DenialTable::new().message(DenialCode::Forbidden, long))
-                .try_build(),
+                .build(),
             Err(BouncerError::Config(ConfigError {
                 problem: ConfigProblem::MessageTooLong,
                 ..
@@ -2761,11 +2914,7 @@ mod tests {
 
     #[test]
     fn test_builder_shards_never_exceed_tickets() {
-        let b = Bouncer::builder()
-            .tickets(3)
-            .shards(64)
-            .try_build()
-            .unwrap();
+        let b = Bouncer::builder().tickets(3).shards(64).build().unwrap();
         assert_eq!(b.inner.shards.len(), 2);
         assert!(b.capacity().tickets >= 3);
     }

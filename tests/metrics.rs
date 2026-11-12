@@ -11,10 +11,7 @@ fn ip(s: &str) -> IpAddr {
 
 #[test]
 fn test_metrics_count_door_checkpoints_bans_and_revocations() {
-    let b = Bouncer::builder()
-        .budgets(Budgets::off())
-        .try_build()
-        .unwrap();
+    let b = Bouncer::builder().budgets(Budgets::off()).build().unwrap();
     let mut conn = b.door(ip("192.0.2.1")).unwrap();
     for _ in 0..10 {
         assert!(conn.checkpoint().is_pass());

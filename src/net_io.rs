@@ -8,12 +8,12 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::OnceLock;
 
 use net_io::{
-    AdmitStage, Admitted, CloseReason, ConnectionId, ConnectionInfo, Denial, Gate, GateTag,
-    KillReason, ServerHandle, WriteCheck,
+    AdmitStage, Admitted, CloseReason, ConnectionId as NetConnectionId, ConnectionInfo, Denial,
+    Gate, GateTag, KillReason, ServerHandle, WriteCheck,
 };
 
 use crate::{
-    Bouncer, CloseKind, ConnId, Ejector, Provenance, Ticket, TicketTag, Verdict, keys::Cidr,
+    Bouncer, CloseKind, ConnectionId, Ejector, Provenance, Ticket, TicketTag, Verdict, keys::Cidr,
     strikes::StrikeKind,
 };
 
@@ -42,7 +42,7 @@ pub const LOCAL_PEER: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// let bouncer = Bouncer::new();
 /// let info = ConnectionInfo::for_testing("192.0.2.40:5000".parse()?);
 /// let mut admitted = bouncer.admit(&info, AdmitStage::Accept).unwrap();
-/// assert_eq!(admitted.ticket.ticket().conn().0, info.id.get());
+/// assert_eq!(admitted.ticket.ticket().connection().0, info.id.get());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug)]
@@ -108,7 +108,7 @@ impl Gate for Bouncer {
             None => (LOCAL_PEER, Provenance::Local),
         };
         let now = self.now_at(info.accepted_at);
-        match self.door_at(ConnId::from(info.id), peer, provenance, now) {
+        match self.door_at(ConnectionId::from(info.id), peer, provenance, now) {
             Ok(ticket) => {
                 let tag = ticket.tag();
                 Ok(Admitted {
@@ -182,9 +182,9 @@ fn strike_for(reason: CloseReason) -> Option<StrikeKind> {
     }
 }
 
-impl From<ConnectionId> for ConnId {
-    fn from(id: ConnectionId) -> ConnId {
-        ConnId(id.get())
+impl From<NetConnectionId> for ConnectionId {
+    fn from(id: NetConnectionId) -> ConnectionId {
+        ConnectionId(id.get())
     }
 }
 
@@ -225,7 +225,7 @@ impl From<net_io::Cidr> for Cidr {
 /// use net_io::{ListenerSpec, ServerBuilder};
 ///
 /// let ejector = Arc::new(NetIoEjector::new());
-/// let bouncer = Bouncer::builder().ejector(ejector.clone()).try_build()?;
+/// let bouncer = Bouncer::builder().ejector(ejector.clone()).build()?;
 /// let server = ServerBuilder::new()
 ///     .listener(ListenerSpec::tcp("127.0.0.1:0"))
 ///     .handler(|_conn: &mut net_io::TcpConnection| Ok(()))
@@ -264,7 +264,7 @@ impl NetIoEjector {
     /// use net_io::{ListenerSpec, ServerBuilder};
     ///
     /// let ejector = Arc::new(NetIoEjector::new());
-    /// let bouncer = Bouncer::builder().ejector(ejector.clone()).try_build()?;
+    /// let bouncer = Bouncer::builder().ejector(ejector.clone()).build()?;
     /// let server = ServerBuilder::new()
     ///     .listener(ListenerSpec::tcp("127.0.0.1:0"))
     ///     .handler(|_conn: &mut net_io::TcpConnection| Ok(()))
@@ -289,8 +289,8 @@ impl core::fmt::Debug for NetIoEjector {
 }
 
 impl Ejector for NetIoEjector {
-    fn eject(&self, conn: ConnId, _kind: CloseKind) {
-        if let (Some(server), Some(id)) = (self.server.get(), ConnectionId::new(conn.0)) {
+    fn eject(&self, conn: ConnectionId, _kind: CloseKind) {
+        if let (Some(server), Some(id)) = (self.server.get(), NetConnectionId::new(conn.0)) {
             let _ = server.kill(id, EJECTED);
         }
     }

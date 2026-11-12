@@ -298,8 +298,9 @@ fn put_target(w: &mut Writer<'_>, t: &Target) -> bool {
             w.u8(5);
             put_digest(w, f.words());
         }
-        // Connection and request ids mean nothing on another node.
-        Target::Connection(_) | Target::Request(_) => return false,
+        // Connection and request ids mean nothing on another node, and a
+        // compound ban key is never a revocation.
+        Target::Connection(_) | Target::Request(_) | Target::FingerprintIn(..) => return false,
     }
     true
 }
@@ -646,7 +647,7 @@ mod tests {
             origin: 1,
             seq: 1,
             rec: Rec::Revoke {
-                target: Target::Connection(crate::keys::ConnId(3)),
+                target: Target::Connection(crate::keys::ConnectionId(3)),
                 code: 5,
                 keep_connection: false,
                 eject_now: false,

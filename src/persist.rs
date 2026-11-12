@@ -77,7 +77,7 @@ const FLUSH_EVERY: Duration = Duration::from_secs(1);
 ///         Ok(())
 ///     }
 /// }
-/// let bouncer = bouncer_io::Bouncer::builder().persistence(Box::new(InMemory::default())).try_build()?;
+/// let bouncer = bouncer_io::Bouncer::builder().persistence(InMemory::default()).build()?;
 /// # let _ = bouncer;
 /// # Ok::<(), bouncer_io::BouncerError>(())
 /// ```
@@ -119,6 +119,25 @@ pub trait Persistence: Send {
     fn replace_snapshot(&mut self, snapshot: &[u8]) -> Result<(), PersistError>;
 }
 
+/// A boxed store, for code that already holds one.
+impl<T: Persistence + ?Sized> Persistence for Box<T> {
+    fn load(&mut self) -> Result<Option<Vec<u8>>, PersistError> {
+        (**self).load()
+    }
+    fn journal(&mut self) -> Result<Vec<u8>, PersistError> {
+        (**self).journal()
+    }
+    fn append(&mut self, records: &[u8]) -> Result<(), PersistError> {
+        (**self).append(records)
+    }
+    fn sync(&mut self) -> Result<(), PersistError> {
+        (**self).sync()
+    }
+    fn replace_snapshot(&mut self, snapshot: &[u8]) -> Result<(), PersistError> {
+        (**self).replace_snapshot(snapshot)
+    }
+}
+
 /// What to do when persisted state is corrupt or tampered with.
 ///
 /// # Examples
@@ -129,7 +148,7 @@ pub trait Persistence: Send {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LoadFailure {
-    /// Fail closed: `try_build` returns `Persist(..)` and the service does
+    /// Fail closed: `build` returns `Persist(..)` and the service does
     /// not start without its bans.
     #[default]
     Refuse,
@@ -273,6 +292,16 @@ pub trait VersionAnchor: Send {
     fn write(&mut self, version: StoreVersion) -> Result<(), PersistError>;
 }
 
+/// A boxed anchor, for code that already holds one.
+impl<T: VersionAnchor + ?Sized> VersionAnchor for Box<T> {
+    fn read(&mut self) -> Result<Option<StoreVersion>, PersistError> {
+        (**self).read()
+    }
+    fn write(&mut self, version: StoreVersion) -> Result<(), PersistError> {
+        (**self).write(version)
+    }
+}
+
 /// The anchor's file: magic, the version, and a CRC32C.
 const ANCHOR_MAGIC: [u8; 4] = *b"BNCV";
 const ANCHOR_LEN: usize = 4 + 16 + 4;
@@ -370,8 +399,8 @@ impl VersionAnchor for FileAnchor {
 /// ```no_run
 /// use bouncer_io::{Bouncer, FilePersistence};
 /// let bouncer = Bouncer::builder()
-///     .persistence(Box::new(FilePersistence::open("/var/lib/gate".as_ref(), "bans")?))
-///     .try_build()?;
+///     .persistence(FilePersistence::open("/var/lib/gate".as_ref(), "bans")?)
+///     .build()?;
 /// # let _ = bouncer;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```

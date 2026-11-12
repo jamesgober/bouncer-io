@@ -20,7 +20,7 @@ use std::{
     time::Instant,
 };
 
-use bouncer_io::{Bouncer, Budgets, ConnId, Provenance, Rate, RequestId};
+use bouncer_io::{Bouncer, Budgets, ConnectionId, Provenance, Rate, RequestId};
 use compose::{EqualJob, LookupOnly};
 use fixture::Mix;
 
@@ -100,7 +100,7 @@ fn main() {
             &format!("door_at/{name}"),
             measure(|i| {
                 let t = f.bouncer.door_at(
-                    ConnId(i as u64),
+                    ConnectionId(i as u64),
                     black_box(probes[i % n]),
                     Provenance::Socket,
                     now,
@@ -140,7 +140,7 @@ fn main() {
         .budgets(Budgets::off())
         .tickets(4096)
         .ban_capacity(1024)
-        .try_build()
+        .build()
         .unwrap();
     let conn = f.bouncer.door(f.admitted[0]).unwrap();
     let mut req = conn.request(RequestId(1)).unwrap();
@@ -165,7 +165,7 @@ fn main() {
         "door_at, no rate budget, admitted",
         measure(|i| {
             let t = no_rate.bouncer.door_at(
-                ConnId(i as u64),
+                ConnectionId(i as u64),
                 black_box(no_rate.admitted[i & 4095]),
                 Provenance::Socket,
                 now,
@@ -177,7 +177,7 @@ fn main() {
         "door_at, no rate budget, random",
         measure(|i| {
             let t = no_rate.bouncer.door_at(
-                ConnId(i as u64),
+                ConnectionId(i as u64),
                 black_box(random[i & 0xffff]),
                 Provenance::Socket,
                 now,
@@ -211,7 +211,7 @@ fn main() {
         "door_at, no rate, no admin set, admitted",
         measure(|i| {
             let t = no_admin.bouncer.door_at(
-                ConnId(i as u64),
+                ConnectionId(i as u64),
                 black_box(no_admin.admitted[i & 4095]),
                 Provenance::Socket,
                 now,
@@ -223,7 +223,7 @@ fn main() {
         "door_at, no rate, no admin set, random",
         measure(|i| {
             let t = no_admin.bouncer.door_at(
-                ConnId(i as u64),
+                ConnectionId(i as u64),
                 black_box(random[i & 0xffff]),
                 Provenance::Socket,
                 now,
@@ -252,7 +252,7 @@ fn main() {
                 .fold(bouncer_io::AllowList::new(), |l, c| l.immune(c, "bench")),
         )
         .trusted_proxies(&fixture::cidrs(&fixture::PROXIES))
-        .try_build()
+        .build()
         .unwrap();
     row(
         "judge only: allow list and proxies",
@@ -272,7 +272,7 @@ fn main() {
             black_box(
                 empty
                     .door_at(
-                        ConnId(i as u64),
+                        ConnectionId(i as u64),
                         black_box(f.admitted[i & 4095]),
                         Provenance::Socket,
                         now,
@@ -352,7 +352,7 @@ fn main() {
         .ban_capacity(1 << 21)
         .revocation_capacity(1 << 21)
         .escalation(bouncer_io::EscalationPolicy::default().off())
-        .try_build()
+        .build()
         .unwrap();
     let mut n = 0u32;
     row(
@@ -386,7 +386,7 @@ fn main() {
     let swept = Bouncer::builder()
         .budgets(Budgets::off())
         .tickets(65_536)
-        .try_build()
+        .build()
         .unwrap();
     let held: Vec<_> = (0..65_535u32)
         .map(|i| {

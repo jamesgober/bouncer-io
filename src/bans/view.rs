@@ -220,7 +220,7 @@ impl BanMemory {
         }
         let before = w.admin.len();
         let mut lifted_admin = Vec::new();
-        w.admin.retain(|(c, a)| {
+        w.admin.retain(|c, a| {
             let lift = covered(c);
             if lift {
                 lifted_admin.push(admin_held(c, a));

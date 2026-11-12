@@ -11,7 +11,7 @@
 use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
 
 use bouncer_io::{
-    Actor, Bouncer, Budgets, Delta, EscalationPolicy, Filter, LiftSpec, NodeId, Page, Sequence,
+    Actor, Bouncer, Budgets, Delta, Directive, EscalationPolicy, Filter, NodeId, Page, Sequence,
 };
 use clock_lib::ManualClock;
 
@@ -96,7 +96,7 @@ fn run(seed: u64, steps: usize, escalate: bool) {
                 builder = builder.escalation(EscalationPolicy::default().off());
             }
             Node {
-                b: builder.try_build().unwrap(),
+                b: builder.build().unwrap(),
                 clock,
                 since: [Sequence::START; NODES],
                 admin_since: Sequence::START,
@@ -109,7 +109,7 @@ fn run(seed: u64, steps: usize, escalate: bool) {
 
     let export = |n: &mut Node, to: usize, wire: &mut Vec<InFlight>, from: usize| {
         let d = n.b.export_delta(n.since[to]).unwrap();
-        n.since[to] = d.last();
+        n.since[to] = d.last_sequence();
         wire.push(InFlight {
             from,
             to,
@@ -128,12 +128,16 @@ fn run(seed: u64, steps: usize, escalate: bool) {
                     0 => {
                         // An administrator's lift: here at once, and to every
                         // other node through the administration channel.
-                        let r = nodes[n].b.lift(LiftSpec::key(a).by(Actor::Admin(7)));
+                        let r = nodes[n].b.apply(Directive::lift(a).by(Actor::Admin(7)));
                         if trace {
-                            println!("node {} admin lift {a}: {:?}", n + 1, r.map(|l| l.removed));
+                            println!(
+                                "node {} admin lift {a}: {:?}",
+                                n + 1,
+                                r.map(|l| l.lifted.map(|x| x.removed))
+                            );
                         }
                         let d = nodes[n].b.export_delta(nodes[n].admin_since).unwrap();
-                        nodes[n].admin_since = d.last();
+                        nodes[n].admin_since = d.last_sequence();
                         for to in (0..NODES).filter(|&to| to != n) {
                             wire.push(InFlight {
                                 from: n,
@@ -145,9 +149,13 @@ fn run(seed: u64, steps: usize, escalate: bool) {
                     }
                     1 => {
                         // An automated lift: this node's own ban only.
-                        let r = nodes[n].b.lift(LiftSpec::key(a).by(Actor::Gate));
+                        let r = nodes[n].b.apply(Directive::lift(a).by(Actor::Gate));
                         if trace {
-                            println!("node {} gate lift {a}: {:?}", n + 1, r.map(|l| l.removed));
+                            println!(
+                                "node {} gate lift {a}: {:?}",
+                                n + 1,
+                                r.map(|l| l.lifted.map(|x| x.removed))
+                            );
                         }
                     }
                     _ => {

@@ -234,7 +234,7 @@ fn test_serve_net_revoked_session_is_refused_on_its_next_request() {
 fn test_serve_net_keep_alive_requests_each_reach_the_connection_ticket() {
     // serve-net hands the gate's tag to every request of a connection, so a
     // later request on a kept-alive connection is judged like the first, and
-    // a revocation between them is seen by the second.
+    // a revocation between them reaches the next.
     let bouncer = Bouncer::new();
     let (running, addr, _) = serve(&bouncer, false);
     let mut c = client(addr);
@@ -260,10 +260,14 @@ fn test_serve_net_keep_alive_requests_each_reach_the_connection_ticket() {
         eventually(|| bouncer.health().tickets_live == 1),
         "one connection, no requests left"
     );
+    // The revocation takes the session's latest request, and with it the
+    // idle connection: the next request is refused (403 or 503) or finds the
+    // connection closed, never served.
     bouncer.revoke(session(6), Reason::ADMIN).expect("revoke");
-    c.write_all(&keep(6)).expect("write");
+    let _ = c.write_all(&keep(6));
     let page = response(&mut c);
-    assert!(page.starts_with("HTTP/1.1 403"), "{page}");
+    assert!(!page.starts_with("HTTP/1.1 200"), "{page}");
+    assert!(!page.contains("balance"), "nothing of the page: {page}");
     drop(running);
 }
 
@@ -318,7 +322,7 @@ fn test_serve_net_credential_stuffing_behind_a_proxy_bans_the_48() {
         .enforcement(
             bouncer_io::Enforcement::observe_all().enforce(bouncer_io::StrikeKind::LoginFailed),
         )
-        .try_build()
+        .build()
         .expect("bouncer");
     let trusted = serve_net::net_io::TrustedProxies::parse("127.0.0.1").expect("proxies");
     let running = Server::builder()

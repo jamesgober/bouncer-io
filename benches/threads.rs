@@ -22,7 +22,7 @@ mod fixture;
 
 use std::{hint::black_box, net::IpAddr, sync::Barrier, time::Instant};
 
-use bouncer_io::{Bouncer, Budgets, ConnId, Provenance, Rate};
+use bouncer_io::{Bouncer, Budgets, ConnectionId, Provenance, Rate};
 
 /// Operations per timed batch, and batches per thread.
 const BATCH: usize = 2_000;
@@ -85,13 +85,17 @@ fn main() {
         let bouncer = Bouncer::builder()
             .budgets(Budgets::off())
             .tickets(65_536)
-            .try_build()
+            .build()
             .unwrap();
         let now = bouncer.now();
         let (median, p99, rate) = run(threads, &|t, i| {
             let peer = IpAddr::from([192, 0, 2, t as u8]);
-            let ticket =
-                bouncer.door_at(ConnId(i as u64), black_box(peer), Provenance::Socket, now);
+            let ticket = bouncer.door_at(
+                ConnectionId(i as u64),
+                black_box(peer),
+                Provenance::Socket,
+                now,
+            );
             black_box(ticket.is_ok());
         });
         println!("{threads:<10} {median:>12.1} {p99:>12.1} {rate:>14.1}");
@@ -118,7 +122,7 @@ fn main() {
     for threads in counts() {
         let (median, p99, rate) = run(threads, &|t, i| {
             let ticket = f.bouncer.door_at(
-                ConnId(((t as u64) << 40) | i as u64),
+                ConnectionId(((t as u64) << 40) | i as u64),
                 black_box(peer(t, i)),
                 Provenance::Socket,
                 now,

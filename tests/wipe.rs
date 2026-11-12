@@ -18,9 +18,9 @@ use std::{
 };
 
 use bouncer_io::{
-    Bouncer, Budgets, CloseKind, Collected, ConnId, Denial, DenialCode, DenialFormat, Directive,
-    Ejector, Enforcement, Event, EventSink, EvidenceValue, FormatError, Reason, RequestId,
-    StrikeKind, signals,
+    Bouncer, Budgets, CloseKind, Collected, ConnectionId, Denial, DenialCode, DenialFormat,
+    Directive, Ejector, Enforcement, Event, EventSink, EvidenceValue, FormatError, Reason,
+    RequestId, StrikeKind, signals,
 };
 
 /// Block sizes that only the tests' `Collected` buffers use: a small buffer
@@ -141,9 +141,9 @@ impl EventSink for Noted {
 }
 
 #[derive(Default)]
-struct Kills(Mutex<Vec<(ConnId, CloseKind)>>);
+struct Kills(Mutex<Vec<(ConnectionId, CloseKind)>>);
 impl Ejector for Kills {
-    fn eject(&self, conn: ConnId, kind: CloseKind) {
+    fn eject(&self, conn: ConnectionId, kind: CloseKind) {
         self.0.lock().unwrap().push((conn, kind));
     }
 }
@@ -188,12 +188,12 @@ fn test_wipe_replace_eject() {
     let kills = Arc::new(Kills::default());
     let b = Bouncer::builder()
         .budgets(Budgets::off())
-        .denial_format(Arc::new(Http))
+        .denial_format(Http)
         .ejector(kills.clone())
-        .try_build()
+        .build()
         .unwrap();
     let conn = b.door(ip("192.0.2.1")).unwrap();
-    let conn_id = conn.conn();
+    let conn_id = conn.connection();
     let mut req = conn.request(RequestId(1)).unwrap();
     let mut reply = Collected::new();
     reply
@@ -238,9 +238,9 @@ fn test_wipe_replace_eject() {
     );
     let banned = Bouncer::builder()
         .budgets(Budgets::off())
-        .denial_format(Arc::new(Http))
+        .denial_format(Http)
         .enforcement(Enforcement::enforce_all())
-        .try_build()
+        .build()
         .unwrap();
     let c3 = banned.door(ip("198.51.100.3")).unwrap();
     let mut r3 = c3.request(RequestId(3)).unwrap();
@@ -263,7 +263,7 @@ fn test_wipe_replace_eject() {
             .budgets(Budgets::off())
             .denial_format(format)
             .ejector(kills.clone())
-            .try_build()
+            .build()
             .unwrap();
         let conn = b.door(ip("192.0.2.9")).unwrap();
         let mut req = conn.request(RequestId(9)).unwrap();
@@ -285,7 +285,7 @@ fn test_wipe_replace_eject() {
     let b = Bouncer::builder()
         .budgets(Budgets::off())
         .event_sink(noted.clone())
-        .try_build()
+        .build()
         .unwrap();
     let conn = b.door(ip("192.0.2.10")).unwrap();
     let mut req = conn.request(RequestId(10)).unwrap();
@@ -305,7 +305,7 @@ fn test_wipe_replace_eject() {
     let b = Bouncer::builder()
         .budgets(Budgets::off())
         .ejector(kills.clone())
-        .try_build()
+        .build()
         .unwrap();
     let conn = b.door(ip("192.0.2.45")).unwrap();
     let mut req = conn.request(RequestId(45)).unwrap();
@@ -330,7 +330,7 @@ fn test_wipe_replace_eject() {
         .budgets(Budgets::off())
         .event_sink(noted.clone())
         .ejector(kills.clone())
-        .try_build()
+        .build()
         .unwrap();
     let conn = b.door(ip("192.0.2.30")).unwrap();
     let mut req = conn.request(RequestId(30)).unwrap();
@@ -364,9 +364,9 @@ fn test_wipe_replace_eject() {
     // ---- keep_connection: the denial is formatted, the connection stays ----
     let b = Bouncer::builder()
         .budgets(Budgets::off())
-        .denial_format(Arc::new(Http))
+        .denial_format(Http)
         .ejector(kills.clone())
-        .try_build()
+        .build()
         .unwrap();
     let mut conn = b.door(ip("192.0.2.11")).unwrap();
     let mut req = conn.request(RequestId(11)).unwrap();

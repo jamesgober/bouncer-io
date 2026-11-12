@@ -26,7 +26,7 @@ fuzz_target!(|data: &[u8]| {
             .revocation_capacity(64)
             .tickets(64)
             .budgets(bouncer_io::Budgets::off())
-            .try_build()
+            .build()
             .unwrap();
         let _ = b.import(&delta, Actor::Channel(1));
         let _ = b.door("192.0.2.1".parse().unwrap());

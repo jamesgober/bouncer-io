@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "bouncer-io"
-version = "0.9.3"
+version = "0.10.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"

@@ -132,7 +132,7 @@ impl Rate {
     /// use bouncer_io::{Bouncer, Budgets, Rate};
     /// let bouncer = Bouncer::builder()
     ///     .budgets(Budgets::off().door_rate(Rate::per_minute(1).burst(3), Rate::per_minute(1_000)))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let addr: std::net::IpAddr = "192.0.2.80".parse()?;
     /// // One a minute, but three may arrive at once.
     /// let admitted = (0..5).filter(|_| bouncer.door(addr).is_ok()).count();
@@ -213,7 +213,7 @@ impl Rate {
 ///             .tenant_plan(TenantKey(7), Rate::per_second(2_000).burst(4_000))
 ///             .tenant_in_flight(64),
 ///     )
-///     .try_build()?;
+///     .build()?;
 /// # let _ = bouncer;
 /// # Ok::<(), bouncer_io::BouncerError>(())
 /// ```
@@ -252,7 +252,7 @@ impl Budgets {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, Budgets};
-    /// let bouncer = Bouncer::builder().budgets(Budgets::off()).try_build()?;
+    /// let bouncer = Bouncer::builder().budgets(Budgets::off()).build()?;
     /// let addr: std::net::IpAddr = "192.0.2.81".parse()?;
     /// // The default holds one address to a burst of 40; with no budgets all 100 get in.
     /// let held = (0..100).map(|_| bouncer.door(addr)).collect::<Result<Vec<_>, _>>()?;
@@ -280,7 +280,7 @@ impl Budgets {
     /// use bouncer_io::{Bouncer, Budgets, Rate, Refusal};
     /// let bouncer = Bouncer::builder()
     ///     .budgets(Budgets::off().door_rate(Rate::per_minute(2), Rate::per_minute(100)))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let addr: std::net::IpAddr = "192.0.2.82".parse()?;
     /// assert!(bouncer.door(addr).is_ok() && bouncer.door(addr).is_ok());
     /// assert!(matches!(bouncer.door(addr), Err(Refusal::OverBudget { .. })));
@@ -299,7 +299,7 @@ impl Budgets {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, Budgets, Refusal};
-    /// let bouncer = Bouncer::builder().budgets(Budgets::off().door_concurrency(2, 100)).try_build()?;
+    /// let bouncer = Bouncer::builder().budgets(Budgets::off().door_concurrency(2, 100)).build()?;
     /// let addr: std::net::IpAddr = "192.0.2.84".parse()?;
     /// let first = bouncer.door(addr)?;
     /// let _second = bouncer.door(addr)?;
@@ -323,7 +323,7 @@ impl Budgets {
     /// use bouncer_io::{Bouncer, Budgets, LaneClass, Rate, RequestId};
     /// let bouncer = Bouncer::builder()
     ///     .budgets(Budgets::off().lane_rate(LaneClass::Auth, Rate::per_minute(1)))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let conn = bouncer.door("192.0.2.85".parse()?)?;
     /// assert!(conn.request(RequestId(1))?.bind_lane(LaneClass::Auth).is_pass());
     /// assert!(conn.request(RequestId(2))?.bind_lane(LaneClass::Auth).is_deny());
@@ -345,7 +345,7 @@ impl Budgets {
     /// use bouncer_io::{Bouncer, Budgets, Rate, RequestId, TenantKey};
     /// let bouncer = Bouncer::builder()
     ///     .budgets(Budgets::off().tenant_rate(Rate::per_minute(1)))
-    ///     .try_build()?;
+    ///     .build()?;
     /// let conn = bouncer.door("192.0.2.86".parse()?)?;
     /// assert!(conn.request(RequestId(1))?.bind_tenant(TenantKey(3)).is_pass());
     /// assert!(conn.request(RequestId(2))?.bind_tenant(TenantKey(3)).is_deny());
@@ -371,7 +371,7 @@ impl Budgets {
     ///             .tenant_rate(Rate::per_minute(1))
     ///             .tenant_plan(TenantKey(7), Rate::per_minute(3)),
     ///     )
-    ///     .try_build()?;
+    ///     .build()?;
     /// let conn = bouncer.door("192.0.2.87".parse()?)?;
     /// let bind = |id: u128, tenant: u64| -> Result<bool, BouncerError> {
     ///     Ok(conn.request(RequestId(id))?.bind_tenant(TenantKey(tenant)).is_pass())
@@ -395,7 +395,7 @@ impl Budgets {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, Budgets, RequestId, TenantKey};
-    /// let bouncer = Bouncer::builder().budgets(Budgets::off().tenant_in_flight(1)).try_build()?;
+    /// let bouncer = Bouncer::builder().budgets(Budgets::off().tenant_in_flight(1)).build()?;
     /// let conn = bouncer.door("192.0.2.88".parse()?)?;
     /// let mut first = conn.request(RequestId(1))?;
     /// assert!(first.bind_tenant(TenantKey(5)).is_pass());
@@ -418,9 +418,9 @@ impl Budgets {
     ///
     /// ```
     /// use bouncer_io::{Bouncer, Budgets};
-    /// let bouncer = Bouncer::builder().budgets(Budgets::default().capacity(4_096)).try_build()?;
+    /// let bouncer = Bouncer::builder().budgets(Budgets::default().capacity(4_096)).build()?;
     /// assert_eq!(bouncer.capacity().budget_keys, 4_096);
-    /// assert!(Bouncer::builder().budgets(Budgets::default().capacity(0)).try_build().is_err());
+    /// assert!(Bouncer::builder().budgets(Budgets::default().capacity(0)).build().is_err());
     /// # Ok::<(), bouncer_io::BouncerError>(())
     /// ```
     #[must_use]
@@ -610,7 +610,10 @@ impl DoorBudgets {
     /// connection always fit (a held key is never reclaimed).
     pub(crate) fn new(cfg: &Budgets, key: HashKey, tickets: u32) -> DoorBudgets {
         let cap = cfg.capacity.clamp(1, 1 << 24);
-        let conc_cap = cap.max(tickets.saturating_mul(2)).min(1 << 24);
+        // Every live connection holds at most one key per tier, so at four
+        // times the tickets a tier is at most a quarter full, and a probe
+        // path with every slot held (refused, D-144) is vanishingly rare.
+        let conc_cap = cap.max(tickets.saturating_mul(4)).min(1 << 24);
         let rate = cfg.door_rate.and_then(|(addr, prefix)| {
             let tier = |r: Rate| -> Option<RateTier> {
                 let q = r.quota("budgets").ok()?;
@@ -759,16 +762,25 @@ impl DoorBudgets {
         // refused with a handful of strikes. The prefix tier still holds.
         let gives_way = &shared_source;
         if let Some(tiers) = &self.rate {
+            // A throttle on a shared address must still slow it: when its
+            // address tier gives way, the throttle's factor goes with it to
+            // the prefix tier, where the door holds it (F-2).
+            let mut carried = 1u32;
             for (i, (tier, &key)) in tiers.iter().zip(keys.iter()).enumerate() {
-                let n = self.factor(key, now_secs).saturating_mul(divisor);
+                let factor = self.factor(key, now_secs).max(carried);
+                let n = factor.saturating_mul(divisor);
                 // A full table charges the next tier instead (hierarchical
                 // fallback), and past the prefix tier the global cell: a
                 // flood of new keys cannot reset anyone's limit, and is
                 // never unlimited.
-                match self.charge(tier, i + 1 == tiers.len(), key, n, now_d) {
-                    Err(_) if i == 0 && gives_way() => {}
-                    r => r?,
+                let charged = self.charge(tier, i + 1 == tiers.len(), key, n, now_d);
+                // Asked only when the address tier refuses or is throttled,
+                // so the common path never looks the address up.
+                if i == 0 && (charged.is_err() || factor > 1) && gives_way() {
+                    carried = factor;
+                    continue;
                 }
+                charged?;
             }
         }
         let mut charged = 0u8;
@@ -780,10 +792,10 @@ impl DoorBudgets {
                 // limit.
                 match tier.counts.acquire(key, limit, || i == 0 && gives_way()) {
                     Ok(true) => charged |= 1 << i,
-                    // Every slot on the path held: not counted, so not
-                    // returned either.
-                    Ok(false) => {}
-                    Err(()) => {
+                    // Every slot on the path held by a live count, or over
+                    // the limit: refused. Admitting uncounted would let this
+                    // key past its limit (D-144).
+                    Ok(false) | Err(()) => {
                         for (j, &k) in keys.iter().enumerate().take(i) {
                             if charged & (1 << j) != 0 {
                                 tiers[j].counts.release(k);
@@ -1181,11 +1193,12 @@ impl IdentityBudgets {
         let Some(c) = &self.in_flight else {
             return Ok(false);
         };
-        // `Ok(false)`: every slot on the path held, not counted (and so
-        // not returned).
-        c.counts
-            .acquire(self.flight_key(tenant), c.limit, || false)
-            .map_err(|()| OverBudget(Duration::ZERO))
+        // Every slot on the path held by a live count: refused rather than
+        // admitted uncounted, past the tenant's limit (D-144).
+        match c.counts.acquire(self.flight_key(tenant), c.limit, || false) {
+            Ok(true) => Ok(true),
+            Ok(false) | Err(()) => Err(OverBudget(Duration::ZERO)),
+        }
     }
 
     fn flight_key(&self, tenant: u64) -> u64 {
@@ -1365,38 +1378,34 @@ mod tests {
     }
 
     #[test]
-    fn test_uncounted_connection_returns_nothing() {
-        // A connection admitted without a slot (every slot on its path held)
-        // must not take a count from the slot its key gets later.
+    fn test_a_full_probe_path_refuses_rather_than_admitting_uncounted() {
+        // D-144: with every slot on a key's path held by a live count, the
+        // connection is refused; admitted uncounted, it would be past its
+        // limit. Once a slot is idle the key is counted again.
         let cfg = Budgets::off().door_concurrency(10, 1_000_000).capacity(16);
         let b = DoorBudgets::new(&cfg, HashKey::new(1, 2), 1);
         let now = Now::default();
         let mut held = Vec::new();
-        let mut uncounted = None;
+        let mut refused = None;
         for i in 0..64u8 {
             let a = IpAddr::from([10, 9, 0, i]);
-            let c = b.admit(a, now, 1, || false).unwrap();
-            if c.client() {
-                held.push((a, c));
-            } else if uncounted.is_none() {
-                uncounted = Some((a, c));
+            match b.admit(a, now, 1, || false) {
+                Ok(c) => {
+                    assert!(c.client(), "every admission is counted");
+                    held.push((a, c));
+                }
+                Err(_) => {
+                    refused.get_or_insert(a);
+                }
             }
         }
-        let (a, c) = uncounted.expect("a full table leaves some connection uncounted");
-        assert!(!c.client());
-        // Its key gets a slot once one is idle, with another connection.
+        let a = refused.expect("a full table refuses some connection");
         for (h, hc) in held.drain(..) {
             b.release_connection(Some(h), hc);
         }
         let later = b.admit(a, now, 1, || false).unwrap();
         assert!(later.client());
         assert_eq!(b.concurrent(a), 1);
-        b.release_connection(Some(a), c);
-        assert_eq!(
-            b.concurrent(a),
-            1,
-            "the uncounted release took a live count"
-        );
         b.release_connection(Some(a), later);
         assert_eq!(b.concurrent(a), 0);
     }
