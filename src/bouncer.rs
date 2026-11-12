@@ -506,7 +506,7 @@ impl Bouncer {
     /// report what they would ban and ban nothing until a deployment turns
     /// enforcement on), shared addresses detected by their accounts, no event
     /// sink, no ejector, and no maintainer thread (a full revocation table
-    /// reclaims what it can inline). Its tables take about 78 MB, reserved at
+    /// reclaims what it can inline). Its tables take about 81 MB, reserved at
     /// once; [`capacity`](Self::capacity) reports the exact figure, and the
     /// builder sizes each table.
     ///

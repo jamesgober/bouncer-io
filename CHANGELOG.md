@@ -23,6 +23,7 @@ The API simplified after an audit against the simple-API rule (D-136, `dev/API-A
 - An unverified datagram earns no exemption from the allow list or the trusted proxies (D-140).
 - Concurrent allow-list replacements can no longer leave the door skipping the list (D-143).
 - `Collected::clear` and `truncate` also wipe bytes written through `spare` and not committed (D-143).
+- A connection whose concurrency probe path is full is refused instead of admitted uncounted, and the concurrency tables are sized at four times the tickets; the tenant in-flight limit likewise (D-144).
 - An automated actor's throttle of an allow-listed source is refused, as its bans are.
 
 ### Added

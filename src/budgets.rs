@@ -610,7 +610,10 @@ impl DoorBudgets {
     /// connection always fit (a held key is never reclaimed).
     pub(crate) fn new(cfg: &Budgets, key: HashKey, tickets: u32) -> DoorBudgets {
         let cap = cfg.capacity.clamp(1, 1 << 24);
-        let conc_cap = cap.max(tickets.saturating_mul(2)).min(1 << 24);
+        // Every live connection holds at most one key per tier, so at four
+        // times the tickets a tier is at most a quarter full, and a probe
+        // path with every slot held (refused, D-144) is vanishingly rare.
+        let conc_cap = cap.max(tickets.saturating_mul(4)).min(1 << 24);
         let rate = cfg.door_rate.and_then(|(addr, prefix)| {
             let tier = |r: Rate| -> Option<RateTier> {
                 let q = r.quota("budgets").ok()?;
@@ -789,10 +792,10 @@ impl DoorBudgets {
                 // limit.
                 match tier.counts.acquire(key, limit, || i == 0 && gives_way()) {
                     Ok(true) => charged |= 1 << i,
-                    // Every slot on the path held: not counted, so not
-                    // returned either.
-                    Ok(false) => {}
-                    Err(()) => {
+                    // Every slot on the path held by a live count, or over
+                    // the limit: refused. Admitting uncounted would let this
+                    // key past its limit (D-144).
+                    Ok(false) | Err(()) => {
                         for (j, &k) in keys.iter().enumerate().take(i) {
                             if charged & (1 << j) != 0 {
                                 tiers[j].counts.release(k);
@@ -1190,11 +1193,12 @@ impl IdentityBudgets {
         let Some(c) = &self.in_flight else {
             return Ok(false);
         };
-        // `Ok(false)`: every slot on the path held, not counted (and so
-        // not returned).
-        c.counts
-            .acquire(self.flight_key(tenant), c.limit, || false)
-            .map_err(|()| OverBudget(Duration::ZERO))
+        // Every slot on the path held by a live count: refused rather than
+        // admitted uncounted, past the tenant's limit (D-144).
+        match c.counts.acquire(self.flight_key(tenant), c.limit, || false) {
+            Ok(true) => Ok(true),
+            Ok(false) | Err(()) => Err(OverBudget(Duration::ZERO)),
+        }
     }
 
     fn flight_key(&self, tenant: u64) -> u64 {
@@ -1374,38 +1378,34 @@ mod tests {
     }
 
     #[test]
-    fn test_uncounted_connection_returns_nothing() {
-        // A connection admitted without a slot (every slot on its path held)
-        // must not take a count from the slot its key gets later.
+    fn test_a_full_probe_path_refuses_rather_than_admitting_uncounted() {
+        // D-144: with every slot on a key's path held by a live count, the
+        // connection is refused; admitted uncounted, it would be past its
+        // limit. Once a slot is idle the key is counted again.
         let cfg = Budgets::off().door_concurrency(10, 1_000_000).capacity(16);
         let b = DoorBudgets::new(&cfg, HashKey::new(1, 2), 1);
         let now = Now::default();
         let mut held = Vec::new();
-        let mut uncounted = None;
+        let mut refused = None;
         for i in 0..64u8 {
             let a = IpAddr::from([10, 9, 0, i]);
-            let c = b.admit(a, now, 1, || false).unwrap();
-            if c.client() {
-                held.push((a, c));
-            } else if uncounted.is_none() {
-                uncounted = Some((a, c));
+            match b.admit(a, now, 1, || false) {
+                Ok(c) => {
+                    assert!(c.client(), "every admission is counted");
+                    held.push((a, c));
+                }
+                Err(_) => {
+                    refused.get_or_insert(a);
+                }
             }
         }
-        let (a, c) = uncounted.expect("a full table leaves some connection uncounted");
-        assert!(!c.client());
-        // Its key gets a slot once one is idle, with another connection.
+        let a = refused.expect("a full table refuses some connection");
         for (h, hc) in held.drain(..) {
             b.release_connection(Some(h), hc);
         }
         let later = b.admit(a, now, 1, || false).unwrap();
         assert!(later.client());
         assert_eq!(b.concurrent(a), 1);
-        b.release_connection(Some(a), c);
-        assert_eq!(
-            b.concurrent(a),
-            1,
-            "the uncounted release took a live count"
-        );
         b.release_connection(Some(a), later);
         assert_eq!(b.concurrent(a), 0);
     }
