@@ -7,7 +7,7 @@ Date: 2026-11-11. Scope: every public item of 0.9.3 (117 items, 227 inherent met
 3. One way to do each thing.
 4. `docs/API.md` lists every public item, in the reference format: nested contents, description, parameters, errors, examples.
 
-The 0.9 freeze does not protect an API that is hard to use, so breaks are allowed. They ship as 0.10.0 with a migration note. The one dependent in the stack is gateway-io (`wasp-collection/gateway-io`, on bouncer-io 0.9.2). Nothing on crates.io depends on bouncer-io.
+The 0.9 freeze does not protect an API that is hard to use, so breaks are allowed. They ship as 0.10.0 with a migration note. The one dependent in the stack is a private gateway (on bouncer-io 0.9.2). Nothing on crates.io depends on bouncer-io.
 
 ## The common path, as a newcomer writes it
 
@@ -33,7 +33,7 @@ Every call is one line and takes one or two arguments. Tier 1 passes on length. 
 | 3 | names | `BouncerBuilder::try_build` suggests that a panicking `build` exists, and it does not. Every other builder in the stack ends in `build()`. | Renamed: `build()`, which returns `Result`. |
 | 4 | one way | Two option builders do the same job. `ban(BanSpec::address(a).for_duration(d).by(x).because(r))` and `apply(Directive::ban(a).for_duration(d).by(x).because(r))` set the same fields, and so do `LiftSpec` and `Directive::lift`. `Directive` is the one every other layer of the stack sends, and it also carries confidence, eject mode, ban keys and denial code. | `BanSpec` and `LiftSpec` leave the public API. `ban(key)` and `lift(key)` stay as the Tier 1 one-liners, taking the key with the defaults. Anything more goes through `apply(Directive::...)`. `Target` gains `FingerprintIn`, so a fingerprint-within-prefix ban keeps its actor, reason and duration. |
 | 5 | one way | `Ticket::is_cancelled()` is `checkpoint().is_deny()` under another name. | Removed. Loops call `request.checkpoint().is_deny()`. |
-| 6 | Tier 2 | The builder's plug-ins mix `Arc<dyn _>` (event sink, ejector, denial format, clock) with `Box<dyn _>` (persistence, version anchor). The caller has to know which to wrap in. | Each takes `impl Trait + 'static`, and bouncer wraps it. Blanket impls for `Arc<T>` (and `Box<T>` for the stores) keep a shared handle working, such as gateway-io's `Arc<NetIoEjector>`. The revocation epoch stays `Arc<RevocationEpoch>`, since sharing it between bouncers is its purpose. |
+| 6 | Tier 2 | The builder's plug-ins mix `Arc<dyn _>` (event sink, ejector, denial format, clock) with `Box<dyn _>` (persistence, version anchor). The caller has to know which to wrap in. | Each takes `impl Trait + 'static`, and bouncer wraps it. Blanket impls for `Arc<T>` (and `Box<T>` for the stores) keep a shared handle working, such as a gateway's `Arc<NetIoEjector>`. The revocation epoch stays `Arc<RevocationEpoch>`, since sharing it between bouncers is its purpose. |
 | 7 | names | `Delta::last()` reads as "the last entry". It returns the delta's last sequence number. | Renamed: `last_sequence()`. |
 | 8 | docs | The crate-level rustdoc still says that revocation, strikes and budgets arrive in 0.4, and persistence and sharing in 0.5. | Rewritten for what the crate is now, Tier 1 first. |
 | 9 | docs | `docs/API.md` against every public item. | Checked by a script against rustdoc's JSON. Missing items were added, and the renamed and removed items were updated. |
@@ -53,4 +53,4 @@ Every call is one line and takes one or two arguments. Tier 1 passes on length. 
 
 ## Cost
 
-None at run time. The door, the ticket and the checkpoint compile to the same code, and the instruction-count gate in CI checks that. The breaks are confined to option builders, names and builder arguments. The migration for gateway-io is about ten lines and is listed in `docs/release/v0.10.0.md`.
+None at run time. The door, the ticket and the checkpoint compile to the same code, and the instruction-count gate in CI checks that. The breaks are confined to option builders, names and builder arguments. The migration for the one dependent is about ten lines and is listed in `docs/release/v0.10.0.md`.

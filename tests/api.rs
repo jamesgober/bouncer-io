@@ -179,7 +179,7 @@ fn test_builder_takes_plug_ins_by_value() {
 
 #[test]
 fn test_builder_keeps_a_shared_handle_working() {
-    // gateway-io keeps an `Arc` of its ejector to attach the transport later,
+    // A gateway keeps an `Arc` of its ejector to attach the transport later,
     // and reads its sink's counters: the builder takes a clone of each.
     let sink = Arc::new(Count::default());
     let kills = Arc::new(Kills::default());
