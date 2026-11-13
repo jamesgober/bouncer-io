@@ -102,16 +102,22 @@ jobs:
       - name: Install Valgrind
         run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
       - name: Build the gate
-        run: cargo bench --bench gate --no-run
+        # Take the bench binary's path from Cargo itself: newer Cargo places
+        # it outside target/release/deps, so a glob there finds nothing.
+        run: |
+          cargo bench --bench gate --no-run --message-format=json-render-diagnostics > build.json
+          exe=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "gate" and .executable != null) | .executable' build.json | tail -1)
+          test -x "$exe" || { echo "gate binary not found in Cargo's output"; exit 1; }
+          echo "GATE_EXE=$exe" >> "$GITHUB_ENV"
       - name: Count instructions
         run: |
-          exe=$(ls -t target/release/deps/gate-* | grep -v '\.d$' | head -1)
-          valgrind --tool=callgrind --callgrind-out-file=callgrind.out "$exe" --bench
+          command -v valgrind || { echo "valgrind is not installed"; exit 1; }
+          valgrind --tool=callgrind --callgrind-out-file=callgrind.out "${GATE_EXE:?}" --bench
       - name: Compare with the baseline (5% limit)
         run: python3 scripts/gate.py callgrind.out
       - name: Profile the door by source line (for tuning; not a gate)
         run: |
-          exe=$(ls -t target/release/deps/gate-* | grep -v '\.d$' | head -1)
+          exe="${GATE_EXE:?}"
           for f in gate_door_admitted gate_door_banned; do
             valgrind --tool=callgrind --toggle-collect="*$f*" --callgrind-out-file="$f.out" "$exe" --bench 2>/dev/null
             echo "== $f: instructions per source line (10,000 operations) =="
