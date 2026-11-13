@@ -216,7 +216,7 @@ Status at 0.9.3:
 | Item | Status |
 |---|---|
 | serve-net's envelope tag | Done (D-134): serve-net 0.7's `Envelope::gate_tag()`; the example and tests need no map, and keep-alive requests are each judged against their connection's ticket |
-| net-io 0.7 | Not adopted (D-135): serve-net is on net-io 0.6 and the two must match; the feature moves to net-io 0.8 with serve-net 0.8 |
+| net-io 0.7 | Adopted in 0.11.0 (D-146): serve-net 0.6 and 0.7 were yanked for security defects, and serve-net 0.8 is on net-io 0.7 |
 | net-io 0.8's soft close and `close_after_flush` | Waiting for net-io 0.8 and a serve-net on it (D-135): closes the Windows denial lost to an abortive close and `NetIoEjector`'s aborts |
 
 Status at 0.10.0 (the simplicity audit James asked for, 2026-11-11):
@@ -227,6 +227,15 @@ Status at 0.10.0 (the simplicity audit James asked for, 2026-11-11):
 | `docs/API.md` lists every public item | Done: checked by a script against rustdoc's JSON output |
 | Independent security and performance review | Done (D-137 to D-143): one high, six medium, five low, three notes, every one fixed with a test that failed first; loom models and two fuzz targets re-run |
 | Release candidates | The count of release candidates with no API change starts again at 0.10.0 |
+
+Status at 0.11.0 (the transport move):
+
+| Item | Status |
+|---|---|
+| net-io 0.7.2 and serve-net 0.8.1 | Done (D-146): the feature's gate, ids and ejector are net-io 0.7's; no change to bouncer's own API |
+| Toolchain 1.100 | Done (D-145): clippy's new lint met; the instruction-count gate finds the bench binary through Cargo |
+| net-io 0.8's soft close and `close_after_flush` | Still waiting for net-io 0.8 and a serve-net on it (D-135), as its own release |
+| Release candidates | The transport move changes the `net-io` feature's types, so the count starts again at 0.11.0 |
 
 Exit:
 - [ ] No API change needed by either consumer for two release candidates.

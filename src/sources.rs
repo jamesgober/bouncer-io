@@ -220,18 +220,14 @@ impl Sources {
             return false;
         }
         let until = now_secs.saturating_add(FLAG_SECS).min(u64::from(u32::MAX));
-        if meta[slot]
+        meta[slot]
             .compare_exchange(
                 m,
                 (m & !0xffff_ffff) | until,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_err()
-        {
-            return false;
-        }
-        true
+            .is_ok()
     }
 
     /// Whether `addr` is shared now: named, or flagged by detection.

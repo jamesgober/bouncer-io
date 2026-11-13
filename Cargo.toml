@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "bouncer-io"
-version = "0.10.0"
+version = "0.11.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -71,7 +71,7 @@ better-bucket = { version = "1.1", default-features = false }
 crypt-io = { version = "1.2", default-features = false, features = ["zeroize", "mac-blake3"] }
 # The transport the `net-io` feature plugs into (first-party, no dependencies
 # of its own). Optional: bouncer works with any transport.
-net-io = { version = "0.6.2", optional = true }
+net-io = { version = "0.7.2", optional = true }
 
 
 # DEV DEPENDENCIES
@@ -80,7 +80,7 @@ net-io = { version = "0.6.2", optional = true }
 criterion = { version = "0.7", default-features = false }
 proptest = { version = "1", default-features = false, features = ["std"] }
 # A real HTTP server for the net-io tests and the guarded_http example.
-serve-net = "0.7.1"
+serve-net = "0.8.1"
 # Comparison benchmarks only (benches/comparison.rs): never in the library.
 dashmap = "6"
 governor = "0.10"

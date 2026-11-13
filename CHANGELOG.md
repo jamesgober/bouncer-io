@@ -11,6 +11,19 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-13
+
+The `net-io` feature moves to net-io 0.7.2, and the tests and example to serve-net 0.8.1. Every serve-net from 0.4.0 to 0.7.1 is yanked for security defects, and serve-net 0.8 is built on net-io 0.7. bouncer's own API is unchanged. `docs/release/v0.11.0.md` has the upgrade steps.
+
+### Changed
+
+- The `net-io` feature requires net-io 0.7.2 or later (from 0.6.2). The `Gate` impl, the id and tag conversions and `NetIoEjector` use net-io 0.7's types, so a server must be built on net-io 0.7 too, such as serve-net 0.8 (D-146).
+- The tests and `examples/guarded_http.rs` run on serve-net 0.8.1.
+
+### Fixed
+
+- Builds clean under clippy 1.100. The instruction-count gate in CI finds the bench binary through Cargo's output, since Cargo 1.100 no longer builds it in `target/release/deps` (D-145).
+
 ## [0.10.0] - 2026-11-11
 
 The API simplified after an audit against the simple-API rule (D-136, `dev/API-AUDIT-0.10.md`), and every finding of an independent security and performance review fixed (D-137 to D-143). A breaking release: `docs/release/v0.10.0.md` has the migration.
@@ -445,7 +458,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/jamesgober/bouncer-io/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/jamesgober/bouncer-io/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/jamesgober/bouncer-io/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/jamesgober/bouncer-io/compare/v0.9.1...v0.9.2
