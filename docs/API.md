@@ -18,7 +18,7 @@
 
 The complete public API of `bouncer-io`. Every item lists its tier, its grade, the version that brought it, and what it costs. The rustdoc on [docs.rs](https://docs.rs/bouncer-io) has a runnable example for every public item; this file is the reference by topic. 0.10 simplified the API after an audit (`dev/API-AUDIT-0.10.md`); the migration from 0.9 is in `docs/release/v0.10.0.md`.
 
-> **Status: `0.10.0` (alpha).** Built and tested: the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance, persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, datagrams, and the net-io gate.
+> **Status: `0.11.0` (alpha).** Built and tested: the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance, persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, datagrams, and the net-io gate.
 
 **Reading the item headers.** *Tier 1* is the simple surface (one-line constructors, no builder), *Tier 2* is configuration, *Tier 3* is the full surface for integrations and other libraries. *P0* is required for the crate's job, *P1* is what users of the best existing tools expect, *P2* is high value for serious deployments, *P3* comes after 1.0. Costs are targets, marked `[est.]` until they are measured at 0.6.
 
@@ -2485,7 +2485,7 @@ Tier 2 · P1 · 0.5 · counters are per shard, relaxed, on the shard's own cache
 
 ## net-io integration
 
-Feature `net-io`, version 0.8 (net-io 0.6 from bouncer 0.9; 0.8 used net-io 0.3). net-io defines the `Gate` trait and calls it; bouncer implements it; net-io never depends on bouncer. The shape follows net-io's 0.2 design lock (decision D-015), with the changes of PLAN D-107.
+Feature `net-io`, version 0.8 (net-io 0.7.2 from bouncer 0.11; net-io 0.6 from 0.9; 0.8 used net-io 0.3). net-io defines the `Gate` trait and calls it; bouncer implements it; net-io never depends on bouncer. The shape follows net-io's 0.2 design lock (decision D-015), with the changes of PLAN D-107.
 
 ```rust
 #[cfg(feature = "net-io")] impl net_io::Gate for Bouncer { type Ticket = ConnectionGate; }
