@@ -234,7 +234,7 @@ fn test_serve_net_revoked_session_is_refused_on_its_next_request() {
 fn test_serve_net_keep_alive_requests_each_reach_the_connection_ticket() {
     // serve-net hands the gate's tag to every request of a connection, so a
     // later request on a kept-alive connection is judged like the first, and
-    // a revocation between them reaches the next.
+    // a ban between them reaches the next.
     let bouncer = Bouncer::new();
     let (running, addr, _) = serve(&bouncer, false);
     let mut c = client(addr);
@@ -260,10 +260,10 @@ fn test_serve_net_keep_alive_requests_each_reach_the_connection_ticket() {
         eventually(|| bouncer.health().tickets_live == 1),
         "one connection, no requests left"
     );
-    // The revocation takes the session's latest request, and with it the
-    // idle connection: the next request is refused (403 or 503) or finds the
+    // No request of the session is running, so a revocation would reach
+    // nothing (D-147); a ban refuses the next request's bind: 403, or the
     // connection closed, never served.
-    bouncer.revoke(session(6), Reason::ADMIN).expect("revoke");
+    bouncer.ban(session(6)).expect("ban");
     let _ = c.write_all(&keep(6));
     let page = response(&mut c);
     assert!(!page.starts_with("HTTP/1.1 200"), "{page}");
@@ -373,5 +373,95 @@ fn test_serve_net_credential_stuffing_behind_a_proxy_bans_the_48() {
             .is_err()
     );
     assert!(attempt("2001:db8:78::2", "right").starts_with("HTTP/1.1 200"));
+    drop(running);
+}
+
+/// Counts strike events.
+#[derive(Default)]
+struct Strikes(std::sync::atomic::AtomicUsize);
+
+impl bouncer_io::EventSink for Strikes {
+    fn event(&self, e: &bouncer_io::Event<'_>) {
+        if e.signal == bouncer_io::signals::STRIKE {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// A server whose head deadline (7 s) is past net-io's 5 s rate grace, so
+/// the deadline and the rate check can be told apart.
+fn serve_counting_strikes() -> (Running, SocketAddr, std::sync::Arc<Strikes>) {
+    let strikes = std::sync::Arc::new(Strikes::default());
+    let bouncer = Bouncer::builder()
+        .event_sink(strikes.clone())
+        .build()
+        .unwrap();
+    let running = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .limits(serve_net::Limits::new().head_timeout(Duration::from_secs(7)))
+        .gate(bouncer.clone())
+        .serve(App {
+            bouncer,
+            requests: Mutex::default(),
+            hold: None,
+        })
+        .expect("serve");
+    let addr = running.local_addr().expect("address");
+    (running, addr, strikes)
+}
+
+/// Reads until the server closes the connection; how long that took.
+fn until_closed(c: &mut TcpStream, started: Instant) -> Duration {
+    c.set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("timeout");
+    let mut buf = [0u8; 256];
+    while matches!(c.read(&mut buf), Ok(n) if n > 0) {}
+    started.elapsed()
+}
+
+#[test]
+fn test_serve_net_a_silent_connection_is_not_a_strike() {
+    // A browser's spare preconnect sends nothing. It ends at the head
+    // deadline, never as a slow peer, so it is no strike (serve-net 0.8.4).
+    let (running, addr, strikes) = serve_counting_strikes();
+    let started = Instant::now();
+    let mut c = TcpStream::connect(addr).expect("connect");
+    let took = until_closed(&mut c, started);
+    assert!(
+        took >= Duration::from_secs(6),
+        "closed by the head deadline: {took:?}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(strikes.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+    drop(running);
+}
+
+#[test]
+fn test_serve_net_a_trickled_head_is_still_a_slow_peer_strike() {
+    // A slowloris sends its head a byte a second: under the minimum rate
+    // once the grace is over, before the head deadline.
+    let (running, addr, strikes) = serve_counting_strikes();
+    let started = Instant::now();
+    let mut c = TcpStream::connect(addr).expect("connect");
+    let mut w = c.try_clone().expect("clone");
+    let writer = std::thread::spawn(move || {
+        for b in b"GET /account HTTP/1.1\r\nHost: localhost\r\n".iter() {
+            if w.write_all(&[*b]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+    let took = until_closed(&mut c, started);
+    assert!(
+        took < Duration::from_secs(7),
+        "closed by the rate: {took:?}"
+    );
+    assert!(
+        eventually(|| strikes.0.load(std::sync::atomic::Ordering::Relaxed) == 1),
+        "one slow-peer strike"
+    );
+    drop(c);
+    let _ = writer.join();
     drop(running);
 }

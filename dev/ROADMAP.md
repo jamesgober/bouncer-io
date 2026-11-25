@@ -237,6 +237,16 @@ Status at 0.11.0 (the transport move):
 | net-io 0.8's soft close and `close_after_flush` | Still waiting for net-io 0.8 and a serve-net on it (D-135), as its own release |
 | Release candidates | The transport move changes the `net-io` feature's types, so the count starts again at 0.11.0 |
 
+Status at 0.12.0 (the gateway's two requests, and serve-net 0.9):
+
+| Item | Status |
+|---|---|
+| Revocations reach only the tickets that existed when they were made | Done (D-147): binds follow the checkpoints' rule; a ban keeps a key out |
+| Per-account budgets for long-lived connections | Done (D-148): budget classes, charged per unit of work |
+| serve-net 0.9.0 | Done: tests and example; net-io stays 0.7.2 |
+| A silent connection striking as a slow peer | Fixed in serve-net 0.8.4; bouncer's regression pair through serve-net 0.9: a silent connection is no strike, a trickled head still is |
+| Release candidates | The bind rule and the new API start the count again at 0.12.0 |
+
 Exit:
 - [ ] No API change needed by either consumer for two release candidates.
 

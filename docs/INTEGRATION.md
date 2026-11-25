@@ -122,6 +122,29 @@ A revocation stops running work. Keeping a logged-out token out of future reques
 
 Failed logins and authorization denials are strikes (`StrikeKind::LoginFailed`, `AuthzDenied`); reuse of a revoked token is `TombstoneReuse`; a decoy token is `DecoyTouched` (definitive).
 
+A revocation reaches the tickets that existed when it was made, including one that binds the revoked key afterwards (a request that arrived before the logout and authenticates after it). A ticket issued after it is not reached, so the account's next login, upgrade, or API call binds as usual.
+
+## Metering a long-lived connection
+
+A WebSocket, a stream, or any connection that carries many units of work after one admission charges a budget class per unit. The class is keyed by the account (else the session, else the client), so all of one account's sockets share it:
+
+```rust
+use bouncer_io::{BudgetClass, Budgets, Rate, Ticket};
+
+const WS_MESSAGES: BudgetClass = BudgetClass(1);
+
+fn budgets() -> Budgets {
+    Budgets::default().class_rate(WS_MESSAGES, Rate::per_second(50).burst(100))
+}
+
+fn on_message(socket: &mut Ticket) -> bool {
+    // false: over budget, drop this message (or close with 1008)
+    socket.charge(WS_MESSAGES).is_pass()
+}
+```
+
+Over budget is a refusal of that one message; the socket's ticket stays live. A revoked ticket's charge returns its revocation, so the same check also ends a socket whose session was revoked.
+
 ## The security signal bridge
 
 Every action is an event through the `EventSink` (`BouncerBuilder::event_sink`), with a stable signal id (generator `GENERATOR`, the catalog in `docs/API.md`), category, severity, actor, reason, subject, reference, and bounded evidence. The sink is called on the acting thread and must not block: copy and hand off.

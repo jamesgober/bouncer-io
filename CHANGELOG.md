@@ -11,6 +11,19 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-25
+
+A revocation no longer refuses binds on tickets issued after it, budget classes meter work on long-lived connections, and the tests run on serve-net 0.9. `docs/release/v0.12.0.md` has the upgrade notes.
+
+### Added
+
+- `BudgetClass`, `Budgets::class_rate`, `Ticket::charge` and `Ticket::charge_n`: a budget the application names and charges as often as the work it meters happens, such as once per WebSocket message. Keyed by account, else session, else client. Over budget refuses that one charge and leaves the ticket live (D-148).
+
+### Changed
+
+- A bind is judged by the revocations made during its ticket's life, the same rule as every checkpoint. Before, a bind was checked against every revocation still in the table, so revoking a session or account also refused that key on new requests and upgrades until cleanup removed the entry. A ticket issued before a revocation that binds the key afterwards is still refused. To keep a key out of new tickets, ban it (`Directive::revoke_and_ban`) (D-147).
+- The tests and `examples/guarded_http.rs` run on serve-net 0.9.0. The `net-io` feature stays on net-io 0.7.2, the version serve-net 0.9 uses.
+
 ## [0.11.0] - 2026-11-13
 
 The `net-io` feature moves to net-io 0.7.2, and the tests and example to serve-net 0.8.1. Every serve-net from 0.4.0 to 0.7.1 is yanked for security defects, and serve-net 0.8 is built on net-io 0.7. bouncer's own API is unchanged. `docs/release/v0.11.0.md` has the upgrade steps.
@@ -458,7 +471,8 @@ specification, and the move to the portfolio template. No functional code yet.
 - Initial repository scaffold: README, REPS specification stub, CI workflow,
   planning structure.
 
-[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bouncer-io/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/jamesgober/bouncer-io/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/jamesgober/bouncer-io/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/jamesgober/bouncer-io/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/jamesgober/bouncer-io/compare/v0.9.2...v0.9.3

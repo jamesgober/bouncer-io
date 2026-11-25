@@ -32,6 +32,26 @@ use crate::{
 /// Most tenant plans one bouncer holds.
 const MAX_PLANS: usize = 65_536;
 
+/// Most budget classes one bouncer holds.
+pub(crate) const MAX_CLASSES: usize = 64;
+
+/// A budget class the application names, charged with
+/// [`Ticket::charge`](crate::Ticket::charge) as often as the work it meters
+/// happens: a WebSocket's messages, an API's calls, a stream's frames.
+///
+/// The number is the application's own; give each metered kind of work one.
+///
+/// # Examples
+///
+/// ```
+/// use bouncer_io::{BudgetClass, Budgets, Rate};
+/// const WS_MESSAGES: BudgetClass = BudgetClass(1);
+/// let budgets = Budgets::default().class_rate(WS_MESSAGES, Rate::per_second(50).burst(100));
+/// # let _ = budgets;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BudgetClass(pub u16);
+
 /// A rate: `limit` events per `period`, with a burst.
 ///
 /// bouncer's own type, converted to rate-net's internally, so a new major
@@ -225,6 +245,7 @@ pub struct Budgets {
     tenant_rate: Option<Rate>,
     tenant_plans: Vec<(TenantKey, Rate)>,
     tenant_in_flight: Option<u32>,
+    classes: Vec<(BudgetClass, Rate)>,
     capacity: u32,
 }
 
@@ -240,6 +261,7 @@ impl Default for Budgets {
             tenant_rate: None,
             tenant_plans: Vec::new(),
             tenant_in_flight: None,
+            classes: Vec::new(),
             capacity: 65_536,
         }
     }
@@ -268,6 +290,7 @@ impl Budgets {
             tenant_rate: None,
             tenant_plans: Vec::new(),
             tenant_in_flight: None,
+            classes: Vec::new(),
             capacity: 16,
         }
     }
@@ -333,6 +356,39 @@ impl Budgets {
     #[must_use]
     pub fn lane_rate(mut self, lane: LaneClass, per_key: Rate) -> Budgets {
         self.lanes[lane.index()] = Some(per_key);
+        self
+    }
+
+    /// The rate of one budget class, per account (or per session when no
+    /// account is bound, or per client when neither is), charged each time
+    /// [`Ticket::charge`](crate::Ticket::charge) or
+    /// [`charge_n`](crate::Ticket::charge_n) is called with it. A ticket that
+    /// lives long, such as a WebSocket's connection ticket, charges it once
+    /// per message. Setting a class again replaces its rate; at most 64
+    /// classes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{AccountKey, Bouncer, BudgetClass, Budgets, Rate};
+    /// const WS_MESSAGES: BudgetClass = BudgetClass(1);
+    /// let bouncer = Bouncer::builder()
+    ///     .budgets(Budgets::off().class_rate(WS_MESSAGES, Rate::per_minute(2)))
+    ///     .build()?;
+    /// let mut socket = bouncer.door("192.0.2.87".parse()?)?;
+    /// assert!(socket.bind_account(AccountKey(7)).is_pass());
+    /// assert!(socket.charge(WS_MESSAGES).is_pass());
+    /// assert!(socket.charge(WS_MESSAGES).is_pass());
+    /// assert!(socket.charge(WS_MESSAGES).is_deny());     // over: drop this message
+    /// assert!(socket.checkpoint().is_pass(), "the socket stays open");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn class_rate(mut self, class: BudgetClass, per_key: Rate) -> Budgets {
+        match self.classes.iter_mut().find(|(c, _)| *c == class) {
+            Some(entry) => entry.1 = per_key,
+            None => self.classes.push((class, per_key)),
+        }
         self
     }
 
@@ -474,6 +530,17 @@ impl Budgets {
                 "budgets",
                 ConfigProblem::TooSmall { min: 1 },
             ));
+        }
+        if self.classes.len() > MAX_CLASSES {
+            return Err(ConfigError::new(
+                "budgets",
+                ConfigProblem::TooLarge {
+                    max: MAX_CLASSES as u64,
+                },
+            ));
+        }
+        for (_, r) in &self.classes {
+            r.quota("budgets")?;
         }
         Ok(())
     }
@@ -1020,6 +1087,8 @@ struct TenantTier {
 pub(crate) struct IdentityBudgets {
     key: HashKey,
     lanes: [Option<RateTier>; LaneClass::COUNT],
+    /// (class, tier), sorted by class.
+    classes: Box<[(u16, RateTier)]>,
     tenant: Option<TenantTier>,
     in_flight: Option<ConcurrencyTier>,
     throttles: Throttles,
@@ -1076,9 +1145,26 @@ impl IdentityBudgets {
                 counts: Counts::new(cap),
                 limit,
             });
+        let mut classes: Vec<(u16, RateTier)> = cfg
+            .classes
+            .iter()
+            .filter_map(|(c, r)| {
+                let q = r.quota("budgets").ok()?;
+                Some((
+                    c.0,
+                    RateTier {
+                        claims: Claims::new(cap),
+                        pace: GcraParams::new(q),
+                        burst: r.burst,
+                    },
+                ))
+            })
+            .collect();
+        classes.sort_unstable_by_key(|(c, _)| *c);
         IdentityBudgets {
             key,
             lanes,
+            classes: classes.into_boxed_slice(),
             tenant,
             in_flight,
             throttles: Throttles::new(cap.min(16_384)),
@@ -1086,7 +1172,17 @@ impl IdentityBudgets {
     }
 
     pub(crate) fn bytes(&self) -> u64 {
-        let lanes: u64 = self.lanes.iter().flatten().map(|r| r.claims.bytes()).sum();
+        let lanes: u64 = self
+            .lanes
+            .iter()
+            .flatten()
+            .map(|r| r.claims.bytes())
+            .sum::<u64>()
+            + self
+                .classes
+                .iter()
+                .map(|(_, r)| r.claims.bytes())
+                .sum::<u64>();
         let tenant = self.tenant.as_ref().map_or(0, |t| {
             t.claims.bytes()
                 + ((t.cells.len() + t.plans.len()) * core::mem::size_of::<BucketCore>()) as u64
@@ -1098,6 +1194,41 @@ impl IdentityBudgets {
     /// Whether any lane budget is configured.
     pub(crate) fn has_lanes(&self) -> bool {
         self.lanes.iter().any(Option::is_some)
+    }
+
+    /// Whether any budget class is configured.
+    pub(crate) fn has_classes(&self) -> bool {
+        !self.classes.is_empty()
+    }
+
+    /// Charges `n` units of a budget class under `who`. A class with no
+    /// rate passes. A path whose every slot holds a key that has not
+    /// recovered refuses rather than admits uncounted (as D-144).
+    pub(crate) fn class(
+        &self,
+        class: u16,
+        who: IdentityKey,
+        n: u32,
+        now: Now,
+    ) -> Result<(), OverBudget> {
+        let Ok(i) = self.classes.binary_search_by_key(&class, |(c, _)| *c) else {
+            return Ok(());
+        };
+        let tier = &self.classes[i].1;
+        let key = self.hashed(0x1_0000 | u64::from(class), who);
+        let now_d = Duration::from_nanos(now.as_nanos());
+        let claims = &tier.claims;
+        let Some((slot, _)) = claims.find_or_claim(
+            key,
+            |slot| tier.pace.peek_at(claims.val(slot), now_d).remaining() >= tier.burst,
+            |slot| tier.pace.reset(claims.val(slot)),
+        ) else {
+            return Err(OverBudget(Duration::ZERO));
+        };
+        match tier.pace.check_n_at(claims.val(slot), n.max(1), now_d) {
+            Decision::Deny { retry_after } => Err(OverBudget(retry_after)),
+            _ => Ok(()),
+        }
     }
 
     /// Whether `bind_tenant` charges anything.

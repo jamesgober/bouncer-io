@@ -13,7 +13,7 @@ use std::{
 use crate::{
     bans::table::{self, Probe, TableKey},
     bouncer::Shared,
-    budgets::{IdentityKey, IdentityKind},
+    budgets::{BudgetClass, IdentityKey, IdentityKind},
     collected::Collected,
     door::{Judgement, Provenance, Refusal},
     error::BouncerError,
@@ -957,46 +957,95 @@ impl Ticket {
             return verdict;
         }
         let cell = shared.registry.cell(self.index);
-        let present = cell.present();
         let now = shared.now();
-        let secs = now.secs();
-        let word = |i: usize| cell.keys[i].load(Ordering::Relaxed);
-        let id = |kind: IdentityKind, k0: u64, k1: u64| IdentityKey { kind, k0, k1 };
-        let source = source_of(cell);
-        let who = if present & P_SESSION != 0 {
-            id(IdentityKind::Session, word(K_SESSION), word(K_SESSION + 1))
-        } else if let Some(a) = source {
-            IdentityKey::client(a)
-        } else {
+        let Some((who, factor)) = metered_key(shared, cell, false, now.secs()) else {
             return verdict;
         };
-        let mut factor = shared.identity.factor(who, secs);
-        if let Some(a) = source {
-            factor = factor.max(shared.budgets.source_factor(a, secs));
-        }
-        let others = [
-            (
-                P_ACCOUNT,
-                id(IdentityKind::Account, word(K_ACCOUNT), word(K_ACCOUNT + 1)),
-            ),
-            (P_TENANT, id(IdentityKind::Tenant, 0, word(K_TENANT))),
-            (
-                P_FINGERPRINT,
-                id(
-                    IdentityKind::Fingerprint,
-                    word(K_FINGERPRINT),
-                    word(K_FINGERPRINT + 1),
-                ),
-            ),
-        ];
-        for (bit, key) in others {
-            if present & bit != 0 {
-                factor = factor.max(shared.identity.factor(key, secs));
-            }
-        }
         match shared.identity.lane(lane, who, factor, now) {
             Ok(()) => verdict,
             Err(_) => self.over_budget(shared),
+        }
+    }
+
+    /// Charges one unit of a budget class
+    /// ([`Budgets::class_rate`](crate::Budgets::class_rate)); see
+    /// [`charge_n`](Self::charge_n).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{Bouncer, BudgetClass, Budgets, Rate, SessionKey};
+    /// const API_CALLS: BudgetClass = BudgetClass(2);
+    /// let bouncer = Bouncer::builder()
+    ///     .budgets(Budgets::off().class_rate(API_CALLS, Rate::per_minute(1)))
+    ///     .build()?;
+    /// let mut conn = bouncer.door("192.0.2.88".parse()?)?;
+    /// assert!(conn.bind_session(SessionKey::from_digest([4; 16])).is_pass());
+    /// assert!(conn.charge(API_CALLS).is_pass());
+    /// assert!(conn.charge(API_CALLS).is_deny());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn charge(&mut self, class: BudgetClass) -> Verdict {
+        self.charge_n(class, 1)
+    }
+
+    /// Charges `units` of a budget class, as often as the work it meters
+    /// happens: once per WebSocket message, per API call, per stream frame.
+    /// The key is the ticket's account when one is bound, else its session,
+    /// else its client (IPv4 address, IPv6 /64).
+    ///
+    /// The ticket is judged first, as by [`checkpoint`](Self::checkpoint): a
+    /// revoked ticket gets its own denial. Over budget, this charge is a
+    /// `Deny` with `TooManyRequests` and the ticket stays live, so the caller
+    /// drops, delays, or answers that one unit of work and goes on (or ends
+    /// the connection, if that is its policy). Throttles on the ticket's
+    /// keys multiply the cost, as at [`bind_lane`](Self::bind_lane). More
+    /// units than the class's burst are always refused. Allow-listed
+    /// sources, classes with no rate, and tickets with no key pass. A full
+    /// table refuses rather than lets a key through uncounted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bouncer_io::{AccountKey, Bouncer, BudgetClass, Budgets, DenialCode, Rate, Verdict};
+    /// const WS_BYTES: BudgetClass = BudgetClass(3);
+    /// let bouncer = Bouncer::builder()
+    ///     .budgets(Budgets::off().class_rate(WS_BYTES, Rate::per_second(1_000)))
+    ///     .build()?;
+    /// let mut socket = bouncer.door("192.0.2.89".parse()?)?;
+    /// assert!(socket.bind_account(AccountKey(9)).is_pass());
+    /// assert!(socket.charge_n(WS_BYTES, 600).is_pass());
+    /// let Verdict::Deny(d) = socket.charge_n(WS_BYTES, 600) else { unreachable!() };
+    /// assert_eq!(d.code, DenialCode::TooManyRequests);
+    /// assert!(socket.checkpoint().is_pass());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn charge_n(&mut self, class: BudgetClass, units: u32) -> Verdict {
+        let verdict = self.checkpoint();
+        if verdict.is_deny() {
+            return verdict;
+        }
+        let shard = Arc::clone(&self.shard);
+        let shared = &shard.shared;
+        if !shared.identity.has_classes() || self.exempt(shared) {
+            return verdict;
+        }
+        let cell = shared.registry.cell(self.index);
+        let now = shared.now();
+        let Some((who, factor)) = metered_key(shared, cell, true, now.secs()) else {
+            return verdict;
+        };
+        let n = units.max(1).saturating_mul(factor.max(1));
+        match shared.identity.class(class.0, who, n, now) {
+            Ok(()) => verdict,
+            Err(_) => {
+                meter!(self.shard.meters, budget_refused);
+                let verdict = self.deny(DenialCode::TooManyRequests);
+                if let Verdict::Deny(d) = &verdict {
+                    events::emit_ticket(shared, events::signals::BUDGET_REFUSED, cell, d.reference);
+                }
+                verdict
+            }
         }
     }
 
@@ -1115,7 +1164,8 @@ impl Ticket {
             k0: hi.unwrap_or(0),
             k1: lo,
         };
-        if let Some(hit) = shared.revocations.matches_key(&key) {
+        let since = cell.seen.load(Ordering::Acquire);
+        if let Some(hit) = shared.revocations.matches_key(&key, since) {
             mark_revoked(cell, self.generation, hit.code);
             if self.kind == TicketKind::Request && !hit.keep_connection {
                 revoke_parent(shared, cell, hit.code);
@@ -1520,6 +1570,54 @@ pub(crate) fn check_cell(
     }
     cell.seen.store(epoch, Ordering::Release);
     Ok(())
+}
+
+/// The key an identity budget is charged under, and the throttle factor in
+/// force on the ticket's keys and source. `account_first` puts the account
+/// ahead of the session (budget classes); lanes go by session, then client.
+/// `None` when the ticket has no key to charge.
+fn metered_key(
+    shared: &Shared,
+    cell: &Cell,
+    account_first: bool,
+    secs: u64,
+) -> Option<(IdentityKey, u32)> {
+    let present = cell.present();
+    let word = |i: usize| cell.keys[i].load(Ordering::Relaxed);
+    let id = |kind: IdentityKind, k0: u64, k1: u64| IdentityKey { kind, k0, k1 };
+    let account = id(IdentityKind::Account, word(K_ACCOUNT), word(K_ACCOUNT + 1));
+    let session = id(IdentityKind::Session, word(K_SESSION), word(K_SESSION + 1));
+    let source = source_of(cell);
+    let (who, who_bit) = if account_first && present & P_ACCOUNT != 0 {
+        (account, P_ACCOUNT)
+    } else if present & P_SESSION != 0 {
+        (session, P_SESSION)
+    } else {
+        (IdentityKey::client(source?), 0)
+    };
+    let mut factor = shared.identity.factor(who, secs);
+    if let Some(a) = source {
+        factor = factor.max(shared.budgets.source_factor(a, secs));
+    }
+    let keys = [
+        (P_SESSION, session),
+        (P_ACCOUNT, account),
+        (P_TENANT, id(IdentityKind::Tenant, 0, word(K_TENANT))),
+        (
+            P_FINGERPRINT,
+            id(
+                IdentityKind::Fingerprint,
+                word(K_FINGERPRINT),
+                word(K_FINGERPRINT + 1),
+            ),
+        ),
+    ];
+    for (bit, key) in keys {
+        if present & bit != 0 && bit != who_bit {
+            factor = factor.max(shared.identity.factor(key, secs));
+        }
+    }
+    Some((who, factor))
 }
 
 /// Revokes the connection a request cell belongs to.
