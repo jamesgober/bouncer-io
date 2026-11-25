@@ -592,7 +592,7 @@ impl Revocations {
 
     /// The first revocation matching any key bound on `cell` that the cell
     /// has not been checked against. A key bound later was checked by its
-    /// bind, against every entry.
+    /// bind, against the entries born after the cell's epoch.
     pub(crate) fn matches(&self, cell: &Cell) -> Option<Hit> {
         let kinds = self.kinds.load(Ordering::Acquire);
         if kinds == 0 {
@@ -690,11 +690,14 @@ impl Revocations {
         None
     }
 
-    /// The revocation of one key, for binds: every entry, however old.
-    pub(crate) fn matches_key(&self, key: &TableKey) -> Option<Hit> {
+    /// The revocation of one key, for a bind on a cell that has reached
+    /// epoch `since`: only entries born after it, the ones the cell's next
+    /// checkpoint would also be judged by. A ticket issued after a revocation
+    /// is never reached by it (D-112, D-147).
+    pub(crate) fn matches_key(&self, key: &TableKey, since: u64) -> Option<Hit> {
         if !self.has_kind(self.kinds.load(Ordering::Acquire), key.kind) {
             return None;
         }
-        self.probe(key, 0)
+        self.probe(key, since)
     }
 }

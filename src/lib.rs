@@ -125,7 +125,7 @@ pub use crate::{
     allow::{AllowKind, AllowList},
     bans::{BanDuration, BanId, DurationPolicy, Lifted, escalate::EscalationPolicy},
     bouncer::{Bouncer, BouncerBuilder, Capacity},
-    budgets::{Budgets, Rate},
+    budgets::{BudgetClass, Budgets, Rate},
     collected::Collected,
     directive::{
         Action, Actor, ActorKind, Applied, BanKeys, Directive, Evidence, EvidenceValue, Reason,

@@ -297,20 +297,22 @@ fn test_bind_twice_denied_first_kept() {
 
 #[test]
 fn test_bind_after_revoke_and_ban_checks() {
+    // A revocation alone stops what runs (D-147); the ban is what refuses
+    // the session's later binds.
     let b = plain();
     let s = SessionKey::from_digest([3; 16]);
-    b.revoke(s, Reason::LOGOUT).unwrap();
+    b.apply(Directive::revoke_and_ban(s).by(Actor::Admin(1)))
+        .unwrap();
     let conn = b.door(ip("192.0.2.1")).unwrap();
     let mut r = conn.request(RequestId(1)).unwrap();
     assert!(
         r.bind_session(s).is_deny(),
-        "a revoked session is denied at bind"
+        "a banned session is denied at bind"
     );
-    // The denied bind took its connection with it; a new connection.
-    assert_eq!(
-        conn.request(RequestId(2)).err(),
-        Some(BouncerError::Revoked)
-    );
+    // The ban keeps refusing it on every later connection.
+    let again = b.door(ip("192.0.2.3")).unwrap();
+    let mut r3 = again.request(RequestId(3)).unwrap();
+    assert!(r3.bind_session(s).is_deny());
     b.ban(AccountKey(8)).unwrap();
     let conn2 = b.door(ip("192.0.2.2")).unwrap();
     let mut r2 = conn2.request(RequestId(2)).unwrap();
@@ -979,16 +981,19 @@ fn test_revoked_session_bound_on_one_stream_stops_its_siblings() {
     // A request binding a revoked session revokes its connection (unless the
     // revocation keeps it); the connection's other requests, already past
     // their checks, and the connection itself must notice at once.
+    // The stream was issued before the revocation and authenticates after
+    // it, so its bind is reached by it (D-147).
     let b = plain();
     let session = SessionKey::from_digest([0x5e; 16]);
-    b.revoke(session, Reason::LOGOUT).unwrap();
     let conn = b.door(ip("192.0.2.80")).unwrap();
     let tag = conn.into_tag();
     let mut sibling = b.request(tag, RequestId(1)).unwrap();
+    let mut stream = b.request(tag, RequestId(2)).unwrap();
+    b.revoke(session, Reason::LOGOUT).unwrap();
+    assert!(sibling.checkpoint().is_pass(), "it carries no session");
     assert!(sibling.checkpoint().is_pass(), "on its fast path");
     let sibling_tag = sibling.tag();
     assert!(b.egress(sibling_tag).is_pass());
-    let mut stream = b.request(tag, RequestId(2)).unwrap();
     assert!(stream.bind_session(session).is_deny());
     assert!(sibling.checkpoint().is_deny(), "the sibling is stopped");
     assert!(b.egress(sibling_tag).is_deny(), "nothing more leaves");
@@ -1035,15 +1040,49 @@ fn test_lift_after_revoke_and_ban_lets_the_address_back_in() {
 }
 
 #[test]
-fn test_new_binds_of_a_revoked_session_are_still_refused() {
-    // Identity keys are bound after the ticket is issued: the bind's own
-    // check refuses them, however new the ticket.
+fn test_a_ticket_issued_before_a_revocation_is_refused_when_it_binds_the_key() {
+    // A request that arrived before a logout and authenticates after it is
+    // still part of what was running.
     let b = Bouncer::new();
     let session = SessionKey::from_digest([0x5a; 16]);
     let conn = b.door(ip("198.51.100.33")).unwrap();
-    b.revoke(session, Reason::LOGOUT).unwrap();
     let mut request = conn.request(RequestId(1)).unwrap();
+    b.revoke(session, Reason::LOGOUT).unwrap();
     assert!(request.bind_session(session).is_deny());
+}
+
+#[test]
+fn test_a_revocation_does_not_refuse_binds_on_tickets_issued_after_it() {
+    // D-147: a revocation stops what ran when it was made. A request issued
+    // after it binds the same session or account and passes; only a ban
+    // keeps a key out. Before 0.12 a bind checked every entry, so revoking
+    // a session refused the account's next requests and upgrades until the
+    // maintainer cleaned the entry up.
+    let b = Bouncer::new();
+    let session = SessionKey::from_digest([0x5b; 16]);
+    let account = AccountKey(77);
+    let conn = b.door(ip("198.51.100.34")).unwrap();
+    let mut running = conn.request(RequestId(1)).unwrap();
+    assert!(running.bind_session(session).is_pass());
+    assert!(running.bind_account(account).is_pass());
+    b.revoke(session, Reason::LOGOUT).unwrap();
+    b.revoke(account, Reason::PASSWORD_CHANGED).unwrap();
+    assert!(running.checkpoint().is_deny(), "what was running stops");
+    drop(running);
+
+    let conn = b.door(ip("198.51.100.34")).unwrap();
+    let mut next = conn.request(RequestId(2)).unwrap();
+    assert!(
+        next.bind_account(account).is_pass(),
+        "the account logs in again"
+    );
+    assert!(next.bind_session(session).is_pass());
+    assert!(next.checkpoint().is_pass());
+    assert!(b.egress(next.tag()).is_pass());
+    // Later epochs do not bring the old revocations back.
+    b.revoke(SessionKey::from_digest([0x5c; 16]), Reason::LOGOUT)
+        .unwrap();
+    assert!(next.checkpoint().is_pass());
 }
 
 #[test]
@@ -1058,6 +1097,8 @@ fn test_revocation_storm_applies_every_revocation_and_reports_the_excess() {
         .build()
         .unwrap();
     let conn = b.door(ip("192.0.2.5")).unwrap();
+    // Issued before the storm, bound after it: the last revocation reaches it.
+    let mut last = conn.request(RequestId(1)).unwrap();
     for i in 0..10_050u128 {
         b.apply(Directive::revoke(AccountKey(i)).by(Actor::Policy(1)))
             .unwrap();
@@ -1072,7 +1113,6 @@ fn test_revocation_storm_applies_every_revocation_and_reports_the_excess() {
         })
         .count();
     assert!(excess >= 1, "the storm is reported");
-    let mut last = conn.request(RequestId(1)).unwrap();
     assert!(
         last.bind_account(AccountKey(10_049)).is_deny(),
         "the last revocation took effect"

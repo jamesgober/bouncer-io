@@ -18,7 +18,7 @@
 
 The complete public API of `bouncer-io`. Every item lists its tier, its grade, the version that brought it, and what it costs. The rustdoc on [docs.rs](https://docs.rs/bouncer-io) has a runnable example for every public item; this file is the reference by topic. 0.10 simplified the API after an audit (`dev/API-AUDIT-0.10.md`); the migration from 0.9 is in `docs/release/v0.10.0.md`.
 
-> **Status: `0.11.0` (alpha).** Built and tested: the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance, persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, datagrams, and the net-io gate.
+> **Status: `0.12.0` (alpha).** Built and tested: the door, ban memory, tickets, in-flight revocation, wipe-replace-eject, strikes, door budgets, events, maintenance, persistence, sharing across nodes, escalation, offender memory, shared-address detection, lane and tenant budgets, posture, administration (`explain`, `list`, `replace_allow`, `health`), metrics, datagrams, and the net-io gate.
 
 **Reading the item headers.** *Tier 1* is the simple surface (one-line constructors, no builder), *Tier 2* is configuration, *Tier 3* is the full surface for integrations and other libraries. *P0* is required for the crate's job, *P1* is what users of the best existing tools expect, *P2* is high value for serious deployments, *P3* comes after 1.0. Costs are targets, marked `[est.]` until they are measured at 0.6.
 
@@ -46,7 +46,7 @@ The complete public API of `bouncer-io`. Every item lists its tier, its grade, t
   - [`Refusal`](#refusal) · [`Provenance`](#provenance) · [`DatagramVerdict`](#datagramverdict)
 - [`Ticket`](#ticket)
   - [Accessors](#ticket-accessors) · [`request`](#ticketrequest) · [`checkpoint`](#ticketcheckpoint) · [`before_commit`](#ticketbefore_commit)
-  - [`bind_client`](#ticketbind_client) · [`bind_fingerprint`](#ticketbind_fingerprint) · [`bind_session`, `bind_account`, `bind_tenant`](#ticketbind_session-bind_account-bind_tenant) · [`bind_lane`](#ticketbind_lane)
+  - [`bind_client`](#ticketbind_client) · [`bind_fingerprint`](#ticketbind_fingerprint) · [`bind_session`, `bind_account`, `bind_tenant`](#ticketbind_session-bind_account-bind_tenant) · [`bind_lane`](#ticketbind_lane) · [`charge`, `charge_n`](#ticketcharge-charge_n)
   - [`strike`](#ticketstrike) · [`deny_and_eject`](#ticketdeny_and_eject) · [`tag` and `into_tag`](#tickettag-and-into_tag) · [Release on drop](#release-on-drop)
   - [`TicketId`, `TicketKind`, `TicketTag`, `LaneClass`](#ticketid-ticketkind-tickettag-laneclass)
 - [Verdicts and denials](#verdicts-and-denials)
@@ -64,7 +64,7 @@ The complete public API of `bouncer-io`. Every item lists its tier, its grade, t
 - [Strikes and enforcement](#strikes-and-enforcement)
   - [`StrikeKind`](#strikekind) · [`StrikeOutcome`](#strikeoutcome) · [`StrikeRules`](#strikerules) · [`Enforcement` and `Mode`](#enforcement-and-mode)
 - [Budgets](#budgets)
-  - [`Budgets`](#budgets-1) · [`Rate`](#rate)
+  - [`Budgets`](#budgets-1) · [`BudgetClass`](#budgetclass) · [`Rate`](#rate)
 - [Administration](#administration)
   - [`Explanation`](#explanation) · [`Filter`, `Page`, `Listing`](#filter-page-listing)
 - [Events](#events)
@@ -387,7 +387,7 @@ pub fn revoke(&self, target: impl Into<Target>, reason: Reason) -> Result<Revoca
 
 Tier 1 · P0 · 0.4 · under 1 µs [est.]; visible to every core within the hardware coherence time (tens of nanoseconds)
 
-Stops what is running now. Every ticket that carries the target key is denied at its next checkpoint; a checkpoint that begins after `revoke` has returned on any thread cannot miss it. A revocation is not a ban: a connection admitted after it is not reached (a key bound after it is refused by the bind), so use [`Directive::revoke_and_ban`](#directive) to keep a source out. The target converts from a [`ConnectionId`](#connectionid-requestid-accountkey-tenantkey), `RequestId`, `SessionKey`, `AccountKey`, `TenantKey`, `FingerprintKey`, `Cidr`, or address. The actor is [`Actor::App`](#actor), the mode is `AtCheckpoint`, a revoked request takes its connection with it, and no ban is added. For any other choice use [`apply`](#apply).
+Stops what is running now. Every ticket that carries the target key is denied at its next checkpoint; a checkpoint that begins after `revoke` has returned on any thread cannot miss it. A revocation is not a ban: a ticket issued after it is not reached, and neither is its bind of the revoked key, so use [`Directive::revoke_and_ban`](#directive) to keep a source or a key out. A ticket issued before it that binds the key afterwards (a request that arrived before a logout and authenticates after it) is refused at that bind. The target converts from a [`ConnectionId`](#connectionid-requestid-accountkey-tenantkey), `RequestId`, `SessionKey`, `AccountKey`, `TenantKey`, `FingerprintKey`, `Cidr`, or address. The actor is [`Actor::App`](#actor), the mode is `AtCheckpoint`, a revoked request takes its connection with it, and no ban is added. For any other choice use [`apply`](#apply).
 
 A revocation is not a ban: it ends running work. A connection that comes back is judged at the door as usual unless a ban was also set.
 
@@ -1228,6 +1228,32 @@ Tier 2 · P2 · 0.5 · about 20 ns [est.]
 
 Selects the lane budget (`Budgets::lane_rate`) this request is charged against, keyed by session when one is bound, else by source.
 
+### `Ticket::charge`, `charge_n`
+
+```rust
+pub fn charge(&mut self, class: BudgetClass) -> Verdict;
+pub fn charge_n(&mut self, class: BudgetClass, units: u32) -> Verdict;
+```
+
+Tier 2 · P1 · 0.12 · about 30 ns [est.]: the checkpoint, one keyed probe, one GCRA update
+
+Charges a budget class (`Budgets::class_rate`) as often as the work it meters happens: once per WebSocket message, per API call, per stream frame, or `units` at a time (bytes, cost). The key is the ticket's account when one is bound, else its session, else its client. The ticket is judged first: a revoked ticket gets its own denial. Over budget, that one charge is a `Deny` with `TooManyRequests` and the ticket stays live, so the caller drops or answers that unit of work and goes on. Throttles on the ticket's keys multiply the cost. More units than the class's burst are always refused. Allow-listed sources, classes with no rate, and tickets with no key pass. When every slot on the key's path holds a key that has not recovered, the charge is refused rather than let through uncounted. Refusals are the sampled `bouncer.budget.refused` event.
+
+```rust
+use bouncer_io::{AccountKey, Bouncer, BudgetClass, Budgets, Rate};
+const WS_MESSAGES: BudgetClass = BudgetClass(1);
+let bouncer = Bouncer::builder()
+    .budgets(Budgets::default().class_rate(WS_MESSAGES, Rate::per_second(50).burst(100)))
+    .build()?;
+let mut socket = bouncer.door("198.51.100.67".parse()?)?;
+assert!(socket.bind_account(AccountKey(7)).is_pass());
+// For each message:
+if socket.charge(WS_MESSAGES).is_deny() {
+    // drop it, or close with 1008 if that is the policy
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ### `Ticket::strike`
 
 ```rust
@@ -1986,7 +2012,7 @@ Budgets answer "is this source over its allowance". They are one input to the do
 
 ```rust
 #[derive(Clone, Debug)]
-pub struct Budgets { /* door rate, door concurrency, lane rates, tenant rate and plans, tenant in-flight, capacity */ }
+pub struct Budgets { /* door rate, door concurrency, lane rates, tenant rate and plans, tenant in-flight, class rates, capacity */ }
 impl Budgets {
     pub fn off() -> Budgets;
     pub fn door_rate(self, per_address: Rate, per_prefix: Rate) -> Budgets;
@@ -1995,6 +2021,7 @@ impl Budgets {
     pub fn tenant_rate(self, default: Rate) -> Budgets;
     pub fn tenant_plan(self, tenant: TenantKey, rate: Rate) -> Budgets;
     pub fn tenant_in_flight(self, default: u32) -> Budgets;
+    pub fn class_rate(self, class: BudgetClass, per_key: Rate) -> Budgets;
     pub fn capacity(self, keys: u32) -> Budgets;
 }
 impl Default for Budgets;   // door: 20/s burst 40 and 64 concurrent per client; 200/s and 512 concurrent per prefix
@@ -2010,6 +2037,7 @@ Tier 2 · P1 (lanes and tenants P2) · 0.4 / 0.5 · door share 20-30 ns [est.]
 | lane rate | session or source, per lane | `bind_lane` | GCRA |
 | tenant rate | tenant | `bind_tenant` | token bucket (better-bucket) |
 | tenant in-flight | tenant | `bind_tenant`; returned on release | atomic counter |
+| class rate | account, else session, else client, per class | each `charge` / `charge_n` | GCRA |
 | throttle | any key | where the key's class is checked | divides the key's quota |
 
 **Eviction never resets a limit.** The budget table evicts only keys that have fully recovered. When it is full and nothing has recovered, a new key is charged against its parent prefix, then the global budget: a flood of new addresses cannot lock everyone out, and a key cannot reset itself by flooding.
@@ -2028,6 +2056,24 @@ let bouncer = Bouncer::builder()
     )
     .build()?;
 # Ok::<(), bouncer_io::BouncerError>(())
+```
+
+### `BudgetClass`
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BudgetClass(pub u16);
+```
+
+Tier 2 · P1 · 0.12
+
+A budget class the application names and charges with [`Ticket::charge`](#ticketcharge-charge_n): a WebSocket's messages, an API's calls, a stream's frames. `Budgets::class_rate(class, rate)` sets its rate per key; setting a class again replaces it, and a bouncer holds at most 64 classes (`Config(TooLarge)` past that). Each class takes a keyed table of `capacity` slots, 16 B each (1 MiB at the default 65,536). A class charged with no rate set passes.
+
+```rust
+use bouncer_io::{BudgetClass, Budgets, Rate};
+const API_CALLS: BudgetClass = BudgetClass(2);
+let budgets = Budgets::default().class_rate(API_CALLS, Rate::per_minute(600).burst(60));
+# let _ = budgets;
 ```
 
 ### `Rate`
